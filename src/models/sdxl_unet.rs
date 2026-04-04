@@ -104,7 +104,7 @@ impl Default for SDXLConfig {
             use_linear_in_transformer: true,
             transformer_depth_input: vec![0, 0, 2, 2, 10, 10],
             transformer_depth_middle: 10,
-            transformer_depth_output: vec![0, 0, 0, 2, 2, 2, 10, 10, 10],
+            transformer_depth_output: vec![10, 10, 10, 2, 2, 2, 0, 0, 0],
             adm_in_channels: 2816,
         }
     }
@@ -159,6 +159,8 @@ pub struct SDXLUNet {
     output_block_descs: Vec<BlockType>,
     /// Channel counts stored by each input block (for skip connections)
     input_block_channels: Vec<usize>,
+    /// When true, all weights are in `resident` — skip load/unload
+    all_on_gpu: bool,
 }
 
 impl SDXLUNet {
@@ -186,6 +188,7 @@ impl SDXLUNet {
             input_block_descs: Vec::new(),
             output_block_descs: Vec::new(),
             input_block_channels: Vec::new(),
+            all_on_gpu: false,
         };
         unet.build_block_descriptors();
         Ok(unet)
@@ -205,15 +208,15 @@ impl SDXLUNet {
     ///   8: ResBlock(1280->1280) + SpatialTransformer   td=10
     ///
     /// SDXL output_blocks layout (9 blocks total):
-    ///   0: ResBlock(1280+1280=2560->1280)              td=0
-    ///   1: ResBlock(1280+1280=2560->1280)              td=0
-    ///   2: ResBlock(1280+640=1920->1280) + Upsample    td=0
+    ///   0: ResBlock(1280+1280=2560->1280) + ST         td=10
+    ///   1: ResBlock(1280+1280=2560->1280) + ST         td=10
+    ///   2: ResBlock(1280+640=1920->1280) + ST + Up     td=10
     ///   3: ResBlock(1280+640=1920->640) + ST           td=2
     ///   4: ResBlock(640+640=1280->640) + ST            td=2
     ///   5: ResBlock(640+320=960->640) + ST + Upsample  td=2
-    ///   6: ResBlock(640+320=960->320) + ST             td=10
-    ///   7: ResBlock(320+320=640->320) + ST             td=10
-    ///   8: ResBlock(320+320=640->320) + ST             td=10
+    ///   6: ResBlock(640+320=960->320)                  td=0
+    ///   7: ResBlock(320+320=640->320)                  td=0
+    ///   8: ResBlock(320+320=640->320)                  td=0
     fn build_block_descriptors(&mut self) {
         let mc = self.config.model_channels;
         let mut td_input = self.config.transformer_depth_input.clone();
@@ -277,6 +280,7 @@ impl SDXLUNet {
 
     /// Load a block's weights from disk (mmap) into GPU.
     fn load_block(&mut self, prefix: &str) -> Result<()> {
+        if self.all_on_gpu { return Ok(()); }
         self.block_cache.clear();
         let prefix_dot = format!("{prefix}.");
         let ckpt_prefix = "model.diffusion_model.";
@@ -301,6 +305,7 @@ impl SDXLUNet {
 
     /// Drop current block weights to free VRAM.
     fn unload_block(&mut self) {
+        if self.all_on_gpu { return; }
         self.block_cache.clear();
     }
 
@@ -407,34 +412,47 @@ impl SDXLUNet {
     // Conv2d helper — builds Conv2d from weight HashMap on the fly
     // -----------------------------------------------------------------------
 
-    /// Execute a Conv2d operation using weights from the HashMap.
-    /// Determines kernel_size, stride, padding from weight shape and key prefix.
+    /// Execute a Conv2d operation directly using cached HWIO weight.
+    /// Avoids creating Conv2d struct (which duplicates weights 3-4x).
     fn conv2d_forward(&self, x: &Tensor, prefix: &str) -> Result<Tensor> {
-        let w = self.w(&format!("{prefix}.weight"))?;
-        let w_dims = w.shape().dims().to_vec();
-        let (out_ch, in_ch, kh, _kw) = (w_dims[0], w_dims[1], w_dims[2], w_dims[3]);
+        let w_key = format!("{prefix}.weight");
+        let hwio_key = format!("{prefix}.weight_hwio");
 
-        // Determine stride and padding from kernel size and context
+        // Use pre-computed HWIO weight if available, otherwise compute on the fly
+        let w_hwio = if let Ok(cached) = self.w(&hwio_key) {
+            cached.clone_result()?
+        } else {
+            let w = self.w(&w_key)?;
+            w.permute(&[2, 3, 1, 0])?.clone_result()?
+        };
+
+        let w = self.w(&w_key)?;
+        let w_dims = w.shape().dims().to_vec();
+        let kh = w_dims[2];
+
         let (stride, padding) = if kh == 1 {
             (1, 0)
         } else if prefix.contains(".op") {
-            // Downsample: stride=2, padding=1
             (2, 1)
         } else {
-            // Regular 3x3 conv: stride=1, padding=1
             (1, 1)
         };
 
-        let has_bias = self.w(&format!("{prefix}.bias")).is_ok();
-        let mut conv = Conv2d::new_with_bias(in_ch, out_ch, kh, stride, padding, self.device.clone(), has_bias)?;
-        conv.copy_weight_from(w)?;
+        let bias = self.w(&format!("{prefix}.bias")).ok();
 
-        if has_bias {
-            let b = self.w(&format!("{prefix}.bias"))?;
-            conv.copy_bias_from(b)?;
-        }
-
-        conv.forward(x)
+        // Convert NCHW input to NHWC for the conv kernel
+        let x_nhwc = to_nhwc(x)?;
+        let out_nhwc = flame_core::cuda_ops_bf16::conv2d_bf16(
+            &x_nhwc,
+            &w_hwio,
+            bias,
+            (stride as i32, stride as i32),
+            (padding as i32, padding as i32),
+            (1, 1),
+            1, // groups
+            flame_core::cuda_ops_bf16::ConvActivation::None,
+        )?;
+        to_nchw(&out_nhwc)
     }
 
     // -----------------------------------------------------------------------
@@ -857,7 +875,7 @@ impl SDXLUNet {
         Ok(stripped)
     }
 
-    /// Convenience constructor: loads resident weights and creates the UNet.
+    /// Convenience constructor: loads resident weights only (block offloading mode).
     pub fn from_safetensors(
         path: &str,
         device: &Arc<cudarc::driver::CudaDevice>,
@@ -868,6 +886,36 @@ impl SDXLUNet {
             resident.len()
         );
         Self::new(path.to_string(), resident, device.clone())
+    }
+
+    /// Load ALL UNet weights onto GPU (no block offloading). ~5GB VRAM.
+    /// Expects a pre-extracted BF16 safetensors file (no prefix stripping needed).
+    pub fn from_safetensors_all_gpu(
+        path: &str,
+        device: &Arc<cudarc::driver::CudaDevice>,
+    ) -> Result<Self> {
+        // Load all weights — file should already be BF16 with stripped keys
+        let all_weights = flame_core::serialization::load_file(
+            std::path::Path::new(path), device,
+        )?;
+        println!("[SDXLUNet] Loaded {} weight tensors (all-on-GPU)", all_weights.len());
+
+        let config = SDXLConfig::default();
+        let kernels = CudaKernels::new(device.clone())?;
+        let mut unet = Self {
+            config,
+            resident: all_weights,
+            model_path: path.to_string(),
+            device: device.clone(),
+            block_cache: HashMap::new(),
+            kernels,
+            input_block_descs: Vec::new(),
+            output_block_descs: Vec::new(),
+            input_block_channels: Vec::new(),
+            all_on_gpu: true,
+        };
+        unet.build_block_descriptors();
+        Ok(unet)
     }
 }
 
@@ -890,7 +938,7 @@ mod tests {
         assert_eq!(config.transformer_depth_middle, 10);
         assert_eq!(
             config.transformer_depth_output,
-            vec![0, 0, 0, 2, 2, 2, 10, 10, 10]
+            vec![10, 10, 10, 2, 2, 2, 0, 0, 0]
         );
     }
 

@@ -13,19 +13,20 @@ use inference_flame::vae::ldm_decoder::LdmVAEDecoder;
 use flame_core::{global_cuda_device, DType, Shape, Tensor};
 use std::time::Instant;
 
-const MODEL_PATH: &str = "/home/alex/EriDiffusion/Models/checkpoints/sd_xl_base_1.0.safetensors";
-const VAE_PATH: &str = "/home/alex/EriDiffusion/Models/checkpoints/sd_xl_base_1.0.safetensors"; // VAE embedded in checkpoint
+const MODEL_PATH: &str = "/home/alex/EriDiffusion/Models/checkpoints/sdxl_unet_bf16.safetensors";
+const VAE_PATH: &str = "/home/alex/EriDiffusion/Models/checkpoints/sd_xl_base_1.0.safetensors"; // VAE from combined checkpoint
 const DEFAULT_EMB_PATH: &str = "/home/alex/EriDiffusion/inference-flame/output/sdxl_embeddings.safetensors";
 const OUTPUT_PATH: &str = "/home/alex/EriDiffusion/inference-flame/output/sdxl_rust.png";
 
-const NUM_STEPS: usize = 30;
+const NUM_STEPS: usize = 5;
 const CFG_SCALE: f32 = 7.5;
 const SEED: u64 = 42;
-const WIDTH: usize = 1024;
-const HEIGHT: usize = 1024;
+const WIDTH: usize = 256;
+const HEIGHT: usize = 256;
 
 // SDXL uses discrete noise schedule (beta_start=0.00085, beta_end=0.012, 1000 steps)
-fn build_sdxl_sigmas(num_steps: usize) -> Vec<f32> {
+// Returns (sigmas, timesteps) — sigmas for Euler stepping, timesteps for UNet input
+fn build_sdxl_schedule(num_steps: usize) -> (Vec<f32>, Vec<f32>) {
     let num_train_steps = 1000usize;
     let beta_start: f64 = 0.00085;
     let beta_end: f64 = 0.012;
@@ -42,18 +43,20 @@ fn build_sdxl_sigmas(num_steps: usize) -> Vec<f32> {
         alphas_cumprod.push(prod);
     }
 
-    // Pick evenly spaced timesteps
+    // Pick evenly spaced timesteps (EulerDiscreteScheduler default)
     let step_ratio = num_train_steps as f64 / num_steps as f64;
     let mut sigmas = Vec::with_capacity(num_steps + 1);
+    let mut timesteps = Vec::with_capacity(num_steps);
     for i in 0..num_steps {
         let t = (num_train_steps as f64 - 1.0 - i as f64 * step_ratio).round() as usize;
         let t = t.min(num_train_steps - 1);
         let alpha = alphas_cumprod[t];
         let sigma = ((1.0 - alpha) / alpha).sqrt();
         sigmas.push(sigma as f32);
+        timesteps.push(t as f32); // discrete timestep for UNet sinusoidal embedding
     }
     sigmas.push(0.0);
-    sigmas
+    (sigmas, timesteps)
 }
 
 fn main() -> anyhow::Result<()> {
@@ -96,7 +99,7 @@ fn main() -> anyhow::Result<()> {
     // ------------------------------------------------------------------
     println!("\n--- Stage 2: Load SDXL UNet ---");
     let t0 = Instant::now();
-    let mut model = SDXLUNet::from_safetensors(MODEL_PATH, &device)?;
+    let mut model = SDXLUNet::from_safetensors_all_gpu(MODEL_PATH, &device)?;
     println!("  Loaded in {:.1}s", t0.elapsed().as_secs_f32());
 
     // ------------------------------------------------------------------
@@ -123,10 +126,11 @@ fn main() -> anyhow::Result<()> {
         v
     };
 
-    let sigmas = build_sdxl_sigmas(NUM_STEPS);
+    let (sigmas, timesteps) = build_sdxl_schedule(NUM_STEPS);
     println!("  sigma_max={:.4}, sigma_min={:.6}", sigmas[0], sigmas[NUM_STEPS - 1]);
+    println!("  timestep_max={:.0}, timestep_min={:.0}", timesteps[0], timesteps[NUM_STEPS - 1]);
 
-    // Initialize x = noise * sigma_max
+    // Initialize x = noise * sigma_max (Karras-style init)
     let mut x = Tensor::from_f32_to_bf16(
         noise_data, Shape::from_dims(&[1, 4, latent_h, latent_w]), device.clone(),
     )?.mul_scalar(sigmas[0])?;
@@ -136,74 +140,57 @@ fn main() -> anyhow::Result<()> {
         let sigma = sigmas[i];
         let sigma_next = sigmas[i + 1];
 
-        // Timestep from sigma: t = sigma_to_timestep(sigma)
-        // For EulerDiscreteScheduler: input to UNet is x / sqrt(sigma^2 + 1)
+        // Scale input: x_in = x / sqrt(sigma^2 + 1)
         let c_in = 1.0 / (sigma * sigma + 1.0).sqrt();
         let x_in = x.mul_scalar(c_in)?;
 
-        // Timestep value (continuous)
+        // UNet expects discrete timestep (0-999), NOT sigma
         let timestep = Tensor::from_f32_to_bf16(
-            vec![sigma], Shape::from_dims(&[1]), device.clone(),
+            vec![timesteps[i]], Shape::from_dims(&[1]), device.clone(),
         )?;
 
-        // Conditional prediction
+        // Conditional + unconditional predictions (eps-prediction)
         let pred_cond = model.forward(&x_in, &timestep, &context, &y)?;
-        // Unconditional prediction
         let pred_uncond = model.forward(&x_in, &timestep, &context_uncond, &y_uncond)?;
 
         // CFG
         let diff = pred_cond.sub(&pred_uncond)?;
         let pred = pred_uncond.add(&diff.mul_scalar(CFG_SCALE)?)?;
 
-        // Euler step (sigma-based): x = x + (sigma_next - sigma) * (x - pred) / sigma
-        let d = x.sub(&pred)?.mul_scalar(1.0 / sigma)?; // noise direction
+        // Euler step: convert eps-prediction to denoised estimate, then step
+        // pred_original = x_in - sigma * eps  (but x_in is scaled, so use unscaled x)
+        // d = (x - pred_original) / sigma
+        // x = x + dt * d
+        let d = x.sub(&pred)?.mul_scalar(1.0 / sigma)?;
         let dt = sigma_next - sigma;
         x = x.add(&d.mul_scalar(dt)?)?;
 
         if i % 10 == 0 || i == NUM_STEPS - 1 {
-            println!("  Step {}/{}: sigma={:.4}", i + 1, NUM_STEPS, sigma);
+            println!("  Step {}/{}: t={:.0}, sigma={:.4}", i + 1, NUM_STEPS, timesteps[i], sigma);
         }
     }
     let dt = t0.elapsed().as_secs_f32();
     println!("  {:.1}s ({:.2}s/step)", dt, dt / NUM_STEPS as f32);
 
     // ------------------------------------------------------------------
-    // Stage 4: VAE decode
+    // Stage 4: Save latent for Python VAE decode
     // ------------------------------------------------------------------
-    println!("\n--- Stage 4: VAE Decode ---");
-    let t0 = Instant::now();
+    println!("\n--- Stage 4: Save latent ---");
     drop(model);
 
-    // SDXL VAE: 4ch latent, scale=0.13025, shift=0.0
-    let vae = LdmVAEDecoder::from_safetensors(VAE_PATH, 4, 0.13025, 0.0, &device)?;
-    let rgb = vae.decode(&x)?;
-    println!("  {:.1}s", t0.elapsed().as_secs_f32());
-
-    // ------------------------------------------------------------------
-    // Stage 5: Save PNG
-    // ------------------------------------------------------------------
-    let rgb_f32 = rgb.to_dtype(DType::F32)?;
-    let data = rgb_f32.to_vec()?;
-    let d = rgb_f32.dims();
-    let (out_h, out_w) = (d[2], d[3]);
-
-    let mut pixels = vec![0u8; out_h * out_w * 3];
-    for y in 0..out_h {
-        for x in 0..out_w {
-            for c in 0..3 {
-                let idx = c * out_h * out_w + y * out_w + x;
-                let val = (127.5 * (data[idx].clamp(-1.0, 1.0) + 1.0)) as u8;
-                pixels[(y * out_w + x) * 3 + c] = val;
-            }
-        }
+    let latent_path = OUTPUT_PATH.replace(".png", "_latent.safetensors");
+    {
+        use std::collections::HashMap;
+        let mut tensors = HashMap::new();
+        tensors.insert("latent".to_string(), x.clone());
+        flame_core::serialization::save_file(&tensors, std::path::Path::new(&latent_path))?;
+        println!("  Saved latent to {}", latent_path);
     }
 
-    image::RgbImage::from_raw(out_w as u32, out_h as u32, pixels)
-        .ok_or_else(|| anyhow::anyhow!("Image creation failed"))?
-        .save(OUTPUT_PATH)?;
+    // Decode with Python: python decode_sdxl_latent.py
+    println!("  Run: python decode_sdxl_latent.py");
 
     println!("\n============================================================");
-    println!("IMAGE SAVED: {}", OUTPUT_PATH);
     println!("Total: {:.1}s", t_total.elapsed().as_secs_f32());
     println!("============================================================");
 
