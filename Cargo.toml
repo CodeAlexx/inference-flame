@@ -49,6 +49,10 @@ name = "debug_encoder"
 path = "src/bin/debug_encoder.rs"
 
 [[bin]]
+name = "anima_infer"
+path = "src/bin/anima_infer.rs"
+
+[[bin]]
 name = "klein9b_encode"
 path = "src/bin/klein9b_encode.rs"
 
