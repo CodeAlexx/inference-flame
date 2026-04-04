@@ -13,7 +13,7 @@ Pure Rust diffusion model inference using [flame-core](https://github.com/CodeAl
 |---|---|---|
 | Text Encode (Qwen3 8B) | 62s | 20s |
 | Model Load | 62s | 19s |
-| Denoise (50 steps) | 193s (5.51s/step) | 247s (4.94s/step) |
+| Denoise (50 steps) | 193s (3.86s/step) | 247s (4.94s/step) |
 | VAE Decode | 1.9s | 7.7s |
 | **Total** | **322s** | **295s** |
 
