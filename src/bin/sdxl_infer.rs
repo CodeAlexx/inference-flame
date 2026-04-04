@@ -18,11 +18,11 @@ const VAE_PATH: &str = "/home/alex/EriDiffusion/Models/checkpoints/sd_xl_base_1.
 const DEFAULT_EMB_PATH: &str = "/home/alex/EriDiffusion/inference-flame/output/sdxl_embeddings.safetensors";
 const OUTPUT_PATH: &str = "/home/alex/EriDiffusion/inference-flame/output/sdxl_rust.png";
 
-const NUM_STEPS: usize = 5;
+const NUM_STEPS: usize = 2;
 const CFG_SCALE: f32 = 7.5;
 const SEED: u64 = 42;
-const WIDTH: usize = 256;
-const HEIGHT: usize = 256;
+const WIDTH: usize = 128;
+const HEIGHT: usize = 128;
 
 // SDXL uses discrete noise schedule (beta_start=0.00085, beta_end=0.012, 1000 steps)
 // Returns (sigmas, timesteps) — sigmas for Euler stepping, timesteps for UNet input
@@ -157,16 +157,21 @@ fn main() -> anyhow::Result<()> {
         let diff = pred_cond.sub(&pred_uncond)?;
         let pred = pred_uncond.add(&diff.mul_scalar(CFG_SCALE)?)?;
 
-        // Euler step: convert eps-prediction to denoised estimate, then step
-        // pred_original = x_in - sigma * eps  (but x_in is scaled, so use unscaled x)
-        // d = (x - pred_original) / sigma
-        // x = x + dt * d
-        let d = x.sub(&pred)?.mul_scalar(1.0 / sigma)?;
+        // Euler step for eps-prediction:
+        // derivative = eps (for epsilon prediction, d(x)/d(sigma) = eps)
+        // x_next = x + eps * (sigma_next - sigma)
         let dt = sigma_next - sigma;
-        x = x.add(&d.mul_scalar(dt)?)?;
+        x = x.add(&pred.mul_scalar(dt)?)?;
 
-        if i % 10 == 0 || i == NUM_STEPS - 1 {
-            println!("  Step {}/{}: t={:.0}, sigma={:.4}", i + 1, NUM_STEPS, timesteps[i], sigma);
+        {
+            let pred_f32 = pred.to_dtype(DType::F32)?;
+            let data = pred_f32.to_vec()?;
+            let mean_abs: f32 = data.iter().map(|v| v.abs()).sum::<f32>() / data.len() as f32;
+            let x_f32 = x.to_dtype(DType::F32)?;
+            let xd = x_f32.to_vec()?;
+            let x_abs: f32 = xd.iter().map(|v| v.abs()).sum::<f32>() / xd.len() as f32;
+            println!("  Step {}/{}: t={:.0}, sigma={:.4}, pred_abs={:.4}, x_abs={:.4}, dt={:.4}",
+                i + 1, NUM_STEPS, timesteps[i], sigma, mean_abs, x_abs, dt);
         }
     }
     let dt = t0.elapsed().as_secs_f32();

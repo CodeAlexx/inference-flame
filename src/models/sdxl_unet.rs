@@ -889,12 +889,11 @@ impl SDXLUNet {
     }
 
     /// Load ALL UNet weights onto GPU (no block offloading). ~5GB VRAM.
-    /// Expects a pre-extracted BF16 safetensors file (no prefix stripping needed).
+    /// Expects a pre-extracted BF16 safetensors file with stripped keys.
     pub fn from_safetensors_all_gpu(
         path: &str,
         device: &Arc<cudarc::driver::CudaDevice>,
     ) -> Result<Self> {
-        // Load all weights — file should already be BF16 with stripped keys
         let all_weights = flame_core::serialization::load_file(
             std::path::Path::new(path), device,
         )?;
