@@ -99,8 +99,9 @@ impl CausalConv3d {
             true,
             device.clone(),
         )?;
-        conv.weight = get_bf16(weights, &format!("{prefix}.weight"))?;
-        conv.bias_tensor = Some(get_bf16(weights, &format!("{prefix}.bias"))?);
+        // Conv3d kernel uses F32 internally — store weights as F32
+        conv.weight = get(weights, &format!("{prefix}.weight"))?.to_dtype(DType::F32)?;
+        conv.bias_tensor = Some(get(weights, &format!("{prefix}.bias"))?.to_dtype(DType::F32)?);
         Ok(Self { conv, time_pad })
     }
 
@@ -112,7 +113,11 @@ impl CausalConv3d {
         } else {
             x.clone()
         };
-        self.conv.forward(&x_padded)
+        // Conv3d kernel uses F32 internally — convert BF16 if needed
+        let is_bf16 = x_padded.dtype() == DType::BF16;
+        let input = if is_bf16 { x_padded.to_dtype(DType::F32)? } else { x_padded };
+        let out = self.conv.forward(&input)?;
+        if is_bf16 { out.to_dtype(DType::BF16) } else { Ok(out) }
     }
 }
 
@@ -282,11 +287,11 @@ impl AttentionBlock {
     ) -> Result<Self> {
         let norm = RmsNorm4d::load(weights, &format!("{prefix}.norm"), dim)?;
 
-        let mut to_qkv = Conv2d::new(dim, dim * 3, 1, 1, 0, device.clone())?;
+        let mut to_qkv = Conv2d::new_with_bias(dim, dim * 3, 1, 1, 0, device.clone(), true)?;
         to_qkv.copy_weight_from(&get_bf16(weights, &format!("{prefix}.to_qkv.weight"))?)?;
         to_qkv.copy_bias_from(&get_bf16(weights, &format!("{prefix}.to_qkv.bias"))?)?;
 
-        let mut proj = Conv2d::new(dim, dim, 1, 1, 0, device.clone())?;
+        let mut proj = Conv2d::new_with_bias(dim, dim, 1, 1, 0, device.clone(), true)?;
         proj.copy_weight_from(&get_bf16(weights, &format!("{prefix}.proj.weight"))?)?;
         proj.copy_bias_from(&get_bf16(weights, &format!("{prefix}.proj.bias"))?)?;
 
@@ -372,7 +377,7 @@ impl UpsampleBlock {
         device: &Arc<cudarc::driver::CudaDevice>,
     ) -> Result<Self> {
         // resample.0 = Upsample (no weights), resample.1 = Conv2d(dim, dim//2, 3, pad=1)
-        let mut conv = Conv2d::new(dim, dim / 2, 3, 1, 1, device.clone())?;
+        let mut conv = Conv2d::new_with_bias(dim, dim / 2, 3, 1, 1, device.clone(), true)?;
         conv.copy_weight_from(&get_bf16(weights, &format!("{prefix}.resample.1.weight"))?)?;
         conv.copy_bias_from(&get_bf16(weights, &format!("{prefix}.resample.1.bias"))?)?;
         Ok(UpsampleBlock::Upsample2d { conv })
@@ -384,7 +389,7 @@ impl UpsampleBlock {
         dim: usize,
         device: &Arc<cudarc::driver::CudaDevice>,
     ) -> Result<Self> {
-        let mut conv = Conv2d::new(dim, dim / 2, 3, 1, 1, device.clone())?;
+        let mut conv = Conv2d::new_with_bias(dim, dim / 2, 3, 1, 1, device.clone(), true)?;
         conv.copy_weight_from(&get_bf16(weights, &format!("{prefix}.resample.1.weight"))?)?;
         conv.copy_bias_from(&get_bf16(weights, &format!("{prefix}.resample.1.bias"))?)?;
 
@@ -415,7 +420,10 @@ impl UpsampleBlock {
                 let (b, c, t, h, w) = (dims[0], dims[1], dims[2], dims[3], dims[4]);
 
                 let x_4d = x.permute(&[0, 2, 1, 3, 4])?.reshape(&[b * t, c, h, w])?;
-                let x_up = GpuOps::upsample2d_nearest(&x_4d, (h * 2, w * 2))?;
+                // upsample2d_nearest kernel expects F32
+                let x_f32 = x_4d.to_dtype(DType::F32)?;
+                let x_up = GpuOps::upsample2d_nearest(&x_f32, (h * 2, w * 2))?;
+                let x_up = x_up.to_dtype(DType::BF16)?;
                 let x_conv = conv.forward(&x_up)?;
                 let c_out = x_conv.shape().dims()[1];
                 x_conv
@@ -446,7 +454,9 @@ impl UpsampleBlock {
                 // Spatial upsample: [B*T*2, C, H, W] -> nearest 2x -> Conv2d -> [B, C/2, T*2, H*2, W*2]
                 let t2 = t * 2;
                 let x_4d = x_t.permute(&[0, 2, 1, 3, 4])?.reshape(&[b * t2, c, h, w])?;
-                let x_up = GpuOps::upsample2d_nearest(&x_4d, (h * 2, w * 2))?;
+                let x_f32 = x_4d.to_dtype(DType::F32)?;
+                let x_up = GpuOps::upsample2d_nearest(&x_f32, (h * 2, w * 2))?;
+                let x_up = x_up.to_dtype(DType::BF16)?;
                 let x_conv = conv.forward(&x_up)?;
                 let c_out = x_conv.shape().dims()[1];
                 x_conv
@@ -612,29 +622,31 @@ impl Wan21VaeDecoder {
             // After block 2 (idx=3): upsample2d(384)
             // After block 6 (idx=7): upsample3d(384)
             // After block 10 (idx=11): upsample3d(192)
-            if idx == 3 {
-                blocks.push(DecoderBlock::Upsample(UpsampleBlock::load_2d(
-                    weights,
-                    &format!("decoder.upsamples.{idx}"),
-                    384,
-                    device,
-                )?));
-                idx += 1;
-            } else if idx == 7 {
-                blocks.push(DecoderBlock::Upsample(UpsampleBlock::load_3d(
-                    weights,
-                    &format!("decoder.upsamples.{idx}"),
-                    384,
-                    device,
-                )?));
-                idx += 1;
-            } else if idx == 11 {
-                blocks.push(DecoderBlock::Upsample(UpsampleBlock::load_3d(
-                    weights,
-                    &format!("decoder.upsamples.{idx}"),
-                    192,
-                    device,
-                )?));
+            if idx == 3 || idx == 7 || idx == 11 {
+                let dim = match idx {
+                    3 | 7 => 384,
+                    11 => 192,
+                    _ => unreachable!(),
+                };
+                // Auto-detect 2d vs 3d: check if time_conv weights exist
+                let has_time_conv = weights.contains_key(
+                    &format!("decoder.upsamples.{idx}.time_conv.weight"),
+                );
+                if has_time_conv {
+                    blocks.push(DecoderBlock::Upsample(UpsampleBlock::load_3d(
+                        weights,
+                        &format!("decoder.upsamples.{idx}"),
+                        dim,
+                        device,
+                    )?));
+                } else {
+                    blocks.push(DecoderBlock::Upsample(UpsampleBlock::load_2d(
+                        weights,
+                        &format!("decoder.upsamples.{idx}"),
+                        dim,
+                        device,
+                    )?));
+                }
                 idx += 1;
             }
         }

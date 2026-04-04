@@ -3,8 +3,10 @@
 //! Usage: anima_infer [path_to_cached_embeddings.safetensors]
 //!
 //! Cached embeddings contain Qwen3 0.6B hidden states + token IDs.
+//! Model is 3.9GB — loads entirely to GPU (no block offloading).
 
-use inference_flame::models::anima::{Anima, load_resident_weights, count_blocks_from_file};
+use inference_flame::models::anima::{Anima, load_all_weights};
+use inference_flame::vae::Wan21VaeDecoder;
 use flame_core::{global_cuda_device, DType, Shape, Tensor};
 use std::time::Instant;
 
@@ -14,16 +16,15 @@ const VAE_PATH: &str = "/home/alex/EriDiffusion/Models/anima/split_files/vae/qwe
 const OUTPUT_PATH: &str = "/home/alex/EriDiffusion/inference-flame/output/anima_rust.png";
 
 // Cosmos RFLOW sampling with shift=3.0
-const NUM_STEPS: usize = 30;
+const NUM_STEPS: usize = 20;
 const CFG_SCALE: f32 = 7.0;
 const SHIFT: f32 = 3.0;
 const SEED: u64 = 42;
-const WIDTH: usize = 1024;
-const HEIGHT: usize = 1024;
+const WIDTH: usize = 512;
+const HEIGHT: usize = 512;
 
-/// Cosmos RFLOW sigma schedule.
+/// Cosmos RFLOW sigma schedule with time shifting.
 fn build_cosmos_schedule(num_steps: usize, shift: f32) -> Vec<f32> {
-    // Linear timesteps from 1→0, then shift
     let mut t: Vec<f32> = (0..=num_steps)
         .map(|i| 1.0 - i as f32 / num_steps as f32)
         .collect();
@@ -44,7 +45,7 @@ fn main() -> anyhow::Result<()> {
     let emb_path = std::env::args().nth(1).unwrap_or_else(|| DEFAULT_EMB_PATH.to_string());
 
     println!("============================================================");
-    println!("Anima — Pure Rust Inference");
+    println!("Anima — Pure Rust Inference (all-on-GPU)");
     println!("  {}x{}, {} steps, CFG {}, seed {}", WIDTH, HEIGHT, NUM_STEPS, CFG_SCALE, SEED);
     println!("============================================================");
 
@@ -65,20 +66,28 @@ fn main() -> anyhow::Result<()> {
     println!("  Loaded in {:.1}s", t0.elapsed().as_secs_f32());
 
     // ------------------------------------------------------------------
-    // Stage 2: Load Anima model (block offloading)
+    // Stage 2: Load Anima model — ALL weights on GPU (3.9GB fits easily)
     // ------------------------------------------------------------------
-    println!("\n--- Stage 2: Load Anima model ---");
+    println!("\n--- Stage 2: Load Anima model (all-on-GPU) ---");
     let t0 = Instant::now();
-    let resident = load_resident_weights(MODEL_PATH, &device)?;
-    let num_blocks = count_blocks_from_file(MODEL_PATH, &device)?;
-    println!("  {} blocks, {} resident keys", num_blocks, resident.len());
-    let mut model = Anima::new(MODEL_PATH.to_string(), resident, device.clone());
+    let all_weights = load_all_weights(MODEL_PATH, &device)?;
+    println!("  {} weight tensors loaded", all_weights.len());
+    let mut model = Anima::new_all_on_gpu(MODEL_PATH.to_string(), all_weights, device.clone());
     println!("  Loaded in {:.1}s", t0.elapsed().as_secs_f32());
+
+    // ------------------------------------------------------------------
+    // Stage 2b: Pre-compute LLM adapter context (run once, reuse every step)
+    // ------------------------------------------------------------------
+    println!("\n--- Stage 2b: Encode text context (cached) ---");
+    let t0 = Instant::now();
+    let context_cond = model.encode_context(&token_ids, &llm_hidden)?;
+    let context_uncond = model.encode_context(&neg_token_ids, &neg_llm_hidden)?;
+    println!("  Context: {:?}", context_cond.dims());
+    println!("  Encoded in {:.1}s", t0.elapsed().as_secs_f32());
 
     // ------------------------------------------------------------------
     // Stage 3: Create noise + denoise
     // ------------------------------------------------------------------
-    // Anima latent: [B, T, H/8, W/8, 16] — for images T=1
     let latent_h = HEIGHT / 8;
     let latent_w = WIDTH / 8;
     let t_frames = 1usize;
@@ -102,9 +111,8 @@ fn main() -> anyhow::Result<()> {
     let timesteps = build_cosmos_schedule(NUM_STEPS, SHIFT);
 
     println!("\n--- Stage 3: Denoise ({} steps, CFG={}) ---", NUM_STEPS, CFG_SCALE);
-    println!("  t[0]={:.4}, t[-2]={:.4}", timesteps[0], timesteps[NUM_STEPS - 1]);
+    println!("  Latent: [1, {}, {}, {}, 16]", t_frames, latent_h, latent_w);
 
-    // x = noise (Cosmos RFLOW initial state)
     let mut x = Tensor::from_f32_to_bf16(
         noise_data,
         Shape::from_dims(&[1, t_frames, latent_h, latent_w, 16]),
@@ -113,8 +121,13 @@ fn main() -> anyhow::Result<()> {
 
     let t0 = Instant::now();
     for i in 0..NUM_STEPS {
+        let step_t = Instant::now();
         let t_curr = timesteps[i];
         let t_prev = timesteps[i + 1];
+
+        let t_vec = Tensor::from_f32_to_bf16(
+            vec![t_curr], Shape::from_dims(&[1]), device.clone(),
+        )?;
 
         // Cosmos RFLOW: s = sigma / (sigma + 1)
         let s = t_curr / (t_curr + 1.0);
@@ -122,93 +135,76 @@ fn main() -> anyhow::Result<()> {
         // Model input: x * (1 - s)
         let x_in = x.mul_scalar(1.0 - s)?;
 
-        let t_vec = Tensor::from_f32_to_bf16(
-            vec![t_curr], Shape::from_dims(&[1]), device.clone(),
-        )?;
+        // Conditional + unconditional predictions (context is pre-cached)
+        let pred_cond = model.forward_with_context(&x_in, &t_vec, &context_cond)?;
+        let pred_uncond = model.forward_with_context(&x_in, &t_vec, &context_uncond)?;
 
-        // Conditional
-        let pred_cond = model.forward(&x_in, &t_vec, &token_ids, &llm_hidden)?;
-        // Unconditional
-        let pred_uncond = model.forward(&x_in, &t_vec, &neg_token_ids, &neg_llm_hidden)?;
-
-        // CFG
+        // CFG: pred = uncond + scale * (cond - uncond)
         let diff = pred_cond.sub(&pred_uncond)?;
         let pred = pred_uncond.add(&diff.mul_scalar(CFG_SCALE)?)?;
 
         // Cosmos RFLOW denoised: x_in * (1-s) - pred * s
         let denoised = x_in.mul_scalar(1.0 - s)?.sub(&pred.mul_scalar(s)?)?;
 
-        // Euler step: x = x + (t_prev - t_curr) / t_curr * (denoised - x)
-        // Actually for RFLOW: x_next = x + dt * velocity
-        // where velocity = (denoised - x) / t_curr
+        // Euler step: x = x + dt/t_curr * (x - denoised)
         let dt = t_prev - t_curr;
         let d = x.sub(&denoised)?.mul_scalar(1.0 / t_curr)?;
         x = x.add(&d.mul_scalar(dt)?)?;
 
-        if i % 5 == 0 || i == NUM_STEPS - 1 {
-            println!("  Step {}/{}: t={:.4}", i + 1, NUM_STEPS, t_curr);
+        let step_ms = step_t.elapsed().as_millis();
+        if i == 0 || i % 5 == 4 || i == NUM_STEPS - 1 {
+            println!("  Step {}/{}: t={:.4} ({:.0}ms)", i + 1, NUM_STEPS, t_curr, step_ms);
         }
     }
 
     let dt = t0.elapsed().as_secs_f32();
-    println!("  {:.1}s ({:.2}s/step)", dt, dt / NUM_STEPS as f32);
-    println!("  Output: {:?}", x.dims());
+    println!("  Denoise: {:.1}s ({:.2}s/step)", dt, dt / NUM_STEPS as f32);
 
     // ------------------------------------------------------------------
-    // Stage 4: VAE decode
+    // Stage 4: VAE decode (Wan21 3D causal VAE)
     // ------------------------------------------------------------------
-    println!("\n--- Stage 4: VAE Decode ---");
+    println!("\n--- Stage 4: VAE Decode (Wan21 VAE) ---");
     let t0 = Instant::now();
-    drop(model);
+    drop(model); // Free DiT VRAM
 
-    // Anima latent is [B, T=1, H, W, 16] → need [B, 16, H, W] for VAE
-    // Permute: [1, 1, H, W, 16] → squeeze T → [1, H, W, 16] → [1, 16, H, W]
-    let latent = x.reshape(&[1, latent_h, latent_w, 16])?
-        .permute(&[0, 3, 1, 2])?;
+    // Anima latent is [B, T=1, H, W, 16] → need [B, 16, T, H, W] for Wan VAE
+    let latent = x.permute(&[0, 4, 1, 2, 3])?; // [1, 16, 1, H/8, W/8]
     println!("  Latent for VAE: {:?}", latent.dims());
 
-    // Load Wan21 VAE - TODO: use wan21_vae.rs once tested
-    // For now, try LDM VAE format
-    let vae_weights = flame_core::serialization::load_file(
-        std::path::Path::new(VAE_PATH), &device
-    )?;
-    println!("  VAE weights: {} keys", vae_weights.len());
+    let vae = Wan21VaeDecoder::load(VAE_PATH, &device)?;
+    let rgb = vae.decode(&latent)?;
+    println!("  Decoded: {:?}", rgb.dims());
+    println!("  VAE in {:.1}s", t0.elapsed().as_secs_f32());
 
-    // Check if this is LDM format or Wan format
-    let has_decoder = vae_weights.keys().any(|k| k.starts_with("decoder."));
-    if has_decoder {
-        println!("  Using LDM VAE decoder");
-        let vae = inference_flame::vae::ldm_decoder::LdmVAEDecoder::from_weights(
-            vae_weights, 16, 1.0, 0.0, &device
-        )?;
-        let rgb = vae.decode(&latent)?;
-        println!("  Decoded: {:?}", rgb.dims());
-        println!("  VAE in {:.1}s", t0.elapsed().as_secs_f32());
+    // Extract first frame: [B, 3, T_out, H, W]
+    let rgb_dims = rgb.dims().to_vec();
+    let (out_t, out_h, out_w) = (rgb_dims[2], rgb_dims[3], rgb_dims[4]);
 
-        // Save
-        let rgb_f32 = rgb.to_dtype(DType::F32)?;
-        let data = rgb_f32.to_vec()?;
-        let d = rgb_f32.dims();
-        let (out_h, out_w) = (d[2], d[3]);
+    // Take first temporal frame
+    let frame = if out_t > 1 {
+        rgb.narrow(2, 0, 1)?.reshape(&[1, 3, out_h, out_w])?
+    } else {
+        rgb.reshape(&[1, 3, out_h, out_w])?
+    };
 
-        let mut pixels = vec![0u8; out_h * out_w * 3];
-        for y in 0..out_h {
-            for px in 0..out_w {
-                for c in 0..3 {
-                    let idx = c * out_h * out_w + y * out_w + px;
-                    let val = (127.5 * (data[idx].clamp(-1.0, 1.0) + 1.0)) as u8;
-                    pixels[(y * out_w + px) * 3 + c] = val;
-                }
+    // Convert to [0, 255] image: output is clamped [-1, 1]
+    let frame_f32 = frame.to_dtype(DType::F32)?;
+    let data = frame_f32.to_vec()?;
+
+    let mut pixels = vec![0u8; out_h * out_w * 3];
+    for y in 0..out_h {
+        for px in 0..out_w {
+            for c in 0..3 {
+                let idx = c * out_h * out_w + y * out_w + px;
+                let val = ((data[idx] + 1.0) * 127.5).clamp(0.0, 255.0) as u8;
+                pixels[(y * out_w + px) * 3 + c] = val;
             }
         }
-
-        image::RgbImage::from_raw(out_w as u32, out_h as u32, pixels)
-            .ok_or_else(|| anyhow::anyhow!("Image creation failed"))?
-            .save(OUTPUT_PATH)?;
-    } else {
-        println!("  VAE format not recognized — skipping decode");
-        println!("  Latent saved but no image output");
     }
+
+    image::RgbImage::from_raw(out_w as u32, out_h as u32, pixels)
+        .ok_or_else(|| anyhow::anyhow!("Image creation failed"))?
+        .save(OUTPUT_PATH)?;
 
     println!("\n============================================================");
     println!("IMAGE SAVED: {}", OUTPUT_PATH);

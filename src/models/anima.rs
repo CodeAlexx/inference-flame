@@ -15,8 +15,8 @@
 //! Weight keys prefixed with `net.`
 
 use flame_core::attention::sdpa;
-use flame_core::layer_norm::layer_norm;
-use flame_core::norm::RMSNorm;
+use flame_core::bf16_ops::modulate_pre_fused_bf16;
+use flame_core::cuda_ops_bf16;
 use flame_core::serialization::load_file_filtered;
 use flame_core::{DType, Result, Shape, Tensor};
 use std::collections::HashMap;
@@ -84,6 +84,8 @@ pub struct Anima {
     resident: HashMap<String, Tensor>,
     /// Block loader for on-demand weight streaming via mmap
     loader: BlockLoader,
+    /// When true, all weights are in `resident` — skip load_block/unload_block
+    all_on_gpu: bool,
     device: Arc<cudarc::driver::CudaDevice>,
 }
 
@@ -98,6 +100,24 @@ impl Anima {
             config: AnimaConfig::default(),
             resident,
             loader,
+            all_on_gpu: false,
+            device,
+        }
+    }
+
+    /// Create with ALL weights already on GPU (no block offloading).
+    /// Use when model fits in VRAM (e.g. Anima at 3.9GB on 24GB GPU).
+    pub fn new_all_on_gpu(
+        model_path: String,
+        all_weights: HashMap<String, Tensor>,
+        device: Arc<cudarc::driver::CudaDevice>,
+    ) -> Self {
+        let loader = BlockLoader::new(model_path, device.clone());
+        Self {
+            config: AnimaConfig::default(),
+            resident: all_weights,
+            loader,
+            all_on_gpu: true,
             device,
         }
     }
@@ -128,7 +148,8 @@ impl Anima {
         let out_features = weight.shape().dims()[0];
 
         let x_2d = x.reshape(&[batch, in_features])?;
-        let wt = transpose_2d(weight)?;
+        // weight is [out, in], need [in, out] for x @ weight_t
+        let wt = weight.permute(&[1, 0])?;
         let out_2d = x_2d.matmul(&wt)?;
 
         let mut out_shape = x_dims[..x_dims.len() - 1].to_vec();
@@ -149,14 +170,16 @@ impl Anima {
         result_2d.reshape(&out_dims)
     }
 
-    // -- RMSNorm (functional, using weight from HashMap) ---------------------
+    // -- RMSNorm (using fused CUDA kernel) -----------------------------------
 
     fn rms_norm(&self, x: &Tensor, weight_key: &str, eps: f32) -> Result<Tensor> {
         let weight = self.w(weight_key)?;
-        let norm_dim = weight.shape().dims()[0];
-        let mut norm = RMSNorm::new(vec![norm_dim], eps, true, self.device.clone())?;
-        norm.copy_weight_from(weight)?;
-        norm.forward(x)
+        let x_dims = x.shape().dims().to_vec();
+        let last_dim = *x_dims.last().unwrap();
+        let batch: usize = x_dims[..x_dims.len() - 1].iter().product();
+        let flat = x.reshape(&[batch, last_dim])?;
+        let normed = cuda_ops_bf16::rms_norm_bf16(&flat, Some(weight), eps)?;
+        normed.reshape(&x_dims)
     }
 
     /// Apply RMSNorm per head: input [B, S, H, D], norm weight [D]
@@ -164,12 +187,19 @@ impl Anima {
         let weight = self.w(weight_key)?;
         let dims = x.shape().dims().to_vec();
         let (b, s, h, d) = (dims[0], dims[1], dims[2], dims[3]);
-
         let flat = x.reshape(&[b * s * h, d])?;
-        let mut norm = RMSNorm::new(vec![d], 1e-6, true, self.device.clone())?;
-        norm.copy_weight_from(weight)?;
-        let normed = norm.forward(&flat)?;
+        let normed = cuda_ops_bf16::rms_norm_bf16(&flat, Some(weight), 1e-6)?;
         normed.reshape(&[b, s, h, d])
+    }
+
+    /// Apply RMSNorm per head: input [B, H, S, D], norm weight [D]
+    fn rms_norm_per_head_bhsd(&self, x: &Tensor, weight_key: &str) -> Result<Tensor> {
+        let weight = self.w(weight_key)?;
+        let dims = x.shape().dims().to_vec();
+        let (b, h, s, d) = (dims[0], dims[1], dims[2], dims[3]);
+        let flat = x.reshape(&[b * h * s, d])?;
+        let normed = cuda_ops_bf16::rms_norm_bf16(&flat, Some(weight), 1e-6)?;
+        normed.reshape(&[b, h, s, d])
     }
 
     // ========================================================================
@@ -272,37 +302,15 @@ impl Anima {
         Ok((shift, scale))
     }
 
-    /// Apply adaLN: LayerNorm(no affine) -> scale * x + shift
+    /// Apply adaLN: (1 + scale) * LayerNorm(x) + shift — fused kernel.
+    /// shift, scale: [B, D], x: [B, S, D]
     fn apply_adaln(
         &self,
         x: &Tensor,
         shift: &Tensor,
         scale: &Tensor,
     ) -> Result<Tensor> {
-        let dim = *x.shape().dims().last().unwrap();
-        // LayerNorm without affine parameters
-        let x_norm = layer_norm(x, &[dim], None, None, 1e-6)?;
-
-        // Broadcast shift/scale from [B, D] to [B, 1, D] or [B, 1, 1, D] etc.
-        let x_rank = x.shape().dims().len();
-        let mut s_shift = shift.clone();
-        let mut s_scale = scale.clone();
-        // shift/scale are [B, D], x might be [B, S, D]
-        for _ in 0..(x_rank - 2) {
-            s_shift = s_shift.unsqueeze(1)?;
-            s_scale = s_scale.unsqueeze(1)?;
-        }
-
-        // x_out = x_norm * (1 + scale) + shift
-        let ones = Tensor::from_vec_dtype(
-            vec![1.0f32],
-            Shape::from_dims(&[1, 1]),
-            self.device.clone(),
-            DType::BF16,
-        )?;
-        let factor = ones.add(&s_scale)?;
-        let modulated = x_norm.mul(&factor)?;
-        modulated.add(&s_shift)
+        modulate_pre_fused_bf16(x, shift, scale, 1e-6)
     }
 
     // ========================================================================
@@ -312,8 +320,9 @@ impl Anima {
     fn self_attention(
         &self,
         x: &Tensor,
-        rope_rot: &Tensor, // [S, D/2, 2, 2] rotation matrices
-        prefix: &str,      // e.g. "net.blocks.0.self_attn"
+        rope_cos: &Tensor, // [1, 1, S, D/2]
+        rope_sin: &Tensor, // [1, 1, S, D/2]
+        prefix: &str,
     ) -> Result<Tensor> {
         let dims = x.shape().dims().to_vec();
         let b = dims[0];
@@ -326,23 +335,18 @@ impl Anima {
         let k = self.linear_no_bias(x, &format!("{prefix}.k_proj.weight"))?;
         let v = self.linear_no_bias(x, &format!("{prefix}.v_proj.weight"))?;
 
-        // Reshape to [B, S, H, D]
-        let q = q.reshape(&[b, seq, num_heads, head_dim])?;
-        let k = k.reshape(&[b, seq, num_heads, head_dim])?;
-        let v = v.reshape(&[b, seq, num_heads, head_dim])?;
+        // Reshape [B, S, H*D] -> [B, S, H, D] -> [B, H, S, D]
+        let q = q.reshape(&[b, seq, num_heads, head_dim])?.permute(&[0, 2, 1, 3])?;
+        let k = k.reshape(&[b, seq, num_heads, head_dim])?.permute(&[0, 2, 1, 3])?;
+        let v = v.reshape(&[b, seq, num_heads, head_dim])?.permute(&[0, 2, 1, 3])?;
 
-        // QK RMSNorm per-head
-        let q = self.rms_norm_per_head(&q, &format!("{prefix}.q_norm.weight"))?;
-        let k = self.rms_norm_per_head(&k, &format!("{prefix}.k_norm.weight"))?;
+        // QK RMSNorm per-head ([B, H, S, D] format)
+        let q = self.rms_norm_per_head_bhsd(&q, &format!("{prefix}.q_norm.weight"))?;
+        let k = self.rms_norm_per_head_bhsd(&k, &format!("{prefix}.k_norm.weight"))?;
 
-        // Apply 3D RoPE (rotation-matrix format)
-        let q = apply_rope_rotation_matrix(&q, rope_rot)?;
-        let k = apply_rope_rotation_matrix(&k, rope_rot)?;
-
-        // Transpose to [B, H, S, D] for SDPA
-        let q = q.permute(&[0, 2, 1, 3])?;
-        let k = k.permute(&[0, 2, 1, 3])?;
-        let v = v.permute(&[0, 2, 1, 3])?;
+        // Apply 3D RoPE using fused CUDA kernel (interleaved pairs)
+        let q = flame_core::bf16_ops::rope_fused_bf16(&q, rope_cos, rope_sin)?;
+        let k = flame_core::bf16_ops::rope_fused_bf16(&k, rope_cos, rope_sin)?;
 
         // Scaled dot-product attention
         let out = sdpa(&q, &k, &v, None)?;
@@ -426,7 +430,8 @@ impl Anima {
         context: &Tensor,
         t_cond: &Tensor,
         base_adaln: &Tensor,
-        rope_rot: &Tensor,
+        rope_cos: &Tensor,
+        rope_sin: &Tensor,
         block_idx: usize,
     ) -> Result<Tensor> {
         let prefix = format!("net.blocks.{block_idx}");
@@ -437,11 +442,10 @@ impl Anima {
             base_adaln,
             &format!("{prefix}.adaln_modulation_self_attn"),
         )?;
-        // LayerNorm(no affine) is applied inside apply_adaln
         let x_mod = self.apply_adaln(x, &shift_sa, &scale_sa)?;
-        let attn_out = self.self_attention(&x_mod, rope_rot, &format!("{prefix}.self_attn"))?;
-        // Gate and residual
-        let gate_sa_unsq = gate_sa.unsqueeze(1)?; // [B, 1, D]
+        let attn_out = self.self_attention(&x_mod, rope_cos, rope_sin, &format!("{prefix}.self_attn"))?;
+
+        let gate_sa_unsq = gate_sa.unsqueeze(1)?;
         let x = x.add(&attn_out.mul(&gate_sa_unsq)?)?;
 
         // --- Cross-attention ---
@@ -679,21 +683,29 @@ impl Anima {
     // Full forward pass
     // ========================================================================
 
-    /// Full MiniTrainDIT forward.
+    /// Run LLM adapter once to produce text context. Cache the result
+    /// and pass it to `forward_with_context` to avoid recomputing every step.
+    pub fn encode_context(
+        &self,
+        token_ids: &Tensor,
+        llm_hidden: &Tensor,
+    ) -> Result<Tensor> {
+        self.llm_adapter(token_ids, llm_hidden)
+    }
+
+    /// Full MiniTrainDIT forward with pre-computed context.
     ///
     /// Arguments:
     /// - `x`: latent [B, T, H, W, C] where C=16
     /// - `timestep`: [B] float timestep values
-    /// - `token_ids`: [B, S_txt] integer token IDs for LLM adapter embedding
-    /// - `llm_hidden`: [B, S_txt, D_llm] Qwen3 hidden states for LLM adapter cross-attn
+    /// - `context`: [B, S_txt, 1024] pre-computed from `encode_context`
     ///
     /// Returns: predicted noise/velocity [B, T, H, W, C]
-    pub fn forward(
+    pub fn forward_with_context(
         &mut self,
         x: &Tensor,
         timestep: &Tensor,
-        token_ids: &Tensor,
-        llm_hidden: &Tensor,
+        context: &Tensor,
     ) -> Result<Tensor> {
         let x_dims = x.shape().dims().to_vec();
         let t_frames = x_dims[1];
@@ -701,17 +713,14 @@ impl Anima {
         // 1. Prepare timestep conditioning
         let (t_cond, base_adaln) = self.prepare_timestep(timestep)?;
 
-        // 2. Run LLM adapter to get text context [B, S_txt, 1024]
-        let context = self.llm_adapter(token_ids, llm_hidden)?;
-
-        // 3. Patchify: [B, T, H, W, 16] -> [B, N_patches, 68]
+        // 2. Patchify: [B, T, H, W, 16] -> [B, N_patches, 68]
         let (patches, _t, nh, nw) = self.patchify(x)?;
 
-        // 4. Patch embed: [B, N_patches, 68] -> [B, N_patches, 2048]
+        // 3. Patch embed: [B, N_patches, 68] -> [B, N_patches, 2048]
         let x_emb = self.patch_embed(&patches)?;
 
-        // 5. Build 3D RoPE rotation matrices
-        let rope_rot = build_3d_rope_rotation_matrix(
+        // 4. Build 3D RoPE cos/sin tables
+        let (rope_cos, rope_sin) = build_3d_rope_cossin(
             t_frames,
             nh,
             nw,
@@ -719,39 +728,50 @@ impl Anima {
             &self.device,
         )?;
 
-        // 6. Stream through 28 transformer blocks
+        // 5. Run through 28 transformer blocks
         let mut x_hidden = x_emb;
         for i in 0..self.config.num_blocks {
-            let prefix = format!("net.blocks.{i}");
-            println!("  Block {i}/{}", self.config.num_blocks);
-            self.load_block(&prefix)?;
+            if !self.all_on_gpu {
+                let prefix = format!("net.blocks.{i}");
+                self.load_block(&prefix)?;
+            }
             x_hidden = self.transformer_block(
                 &x_hidden,
-                &context,
+                context,
                 &t_cond,
                 &base_adaln,
-                &rope_rot,
+                &rope_cos,
+                &rope_sin,
                 i,
             )?;
-            self.unload_block();
+            if !self.all_on_gpu {
+                self.unload_block();
+            }
         }
 
-        // 7. Final layer
+        // 6. Final layer
         let x_out = self.final_layer(&x_hidden, &t_cond)?;
 
-        // 8. Unpatchify: [B, N_patches, 64] -> [B, T, H, W, 16]
+        // 7. Unpatchify: [B, N_patches, 64] -> [B, T, H, W, 16]
         self.unpatchify(&x_out, t_frames, nh, nw)
+    }
+
+    /// Full MiniTrainDIT forward (convenience — runs adapter internally).
+    pub fn forward(
+        &mut self,
+        x: &Tensor,
+        timestep: &Tensor,
+        token_ids: &Tensor,
+        llm_hidden: &Tensor,
+    ) -> Result<Tensor> {
+        let context = self.encode_context(token_ids, llm_hidden)?;
+        self.forward_with_context(x, timestep, &context)
     }
 }
 
 // ===========================================================================
 // Standalone helpers
 // ===========================================================================
-
-/// Transpose a 2D tensor [M, N] -> [N, M]
-fn transpose_2d(t: &Tensor) -> Result<Tensor> {
-    t.permute(&[1, 0])
-}
 
 /// Embedding lookup: select rows from weight matrix by integer indices.
 /// weight: [vocab_size, dim], indices: [B, S] (stored as f32 but representing ints)
@@ -980,49 +1000,132 @@ fn build_3d_rope_rotation_matrix(
     )
 }
 
-/// Apply 3D RoPE using rotation-matrix format.
+/// Build 3D RoPE cos/sin tables for the fused kernel.
+/// Returns (cos, sin) each [1, 1, S, D/2] where S = T*nH*nW.
+/// Uses the same frequency computation as build_3d_rope_rotation_matrix.
+fn build_3d_rope_cossin(
+    t_frames: usize,
+    nh: usize,
+    nw: usize,
+    head_dim: usize,
+    device: &Arc<cudarc::driver::CudaDevice>,
+) -> Result<(Tensor, Tensor)> {
+    let half_d = head_dim / 2;
+    let total_seq = t_frames * nh * nw;
+
+    let full_d = half_d * 2;
+    let dim_h: usize = full_d / 6 * 2;
+    let dim_w: usize = dim_h;
+    let dim_t: usize = full_d - 2 * dim_h;
+    let bins_t = dim_t / 2;
+    let bins_h = dim_h / 2;
+    let bins_w = dim_w / 2;
+
+    let base_theta: f64 = 10000.0;
+    let h_ntk = 4.0f64.powf(dim_h as f64 / (dim_h as f64 - 2.0));
+    let w_ntk = 4.0f64.powf(dim_w as f64 / (dim_w as f64 - 2.0));
+    let t_ntk = 1.0f64.powf(dim_t as f64 / (dim_t as f64 - 2.0));
+    let theta_h = (base_theta * h_ntk) as f32;
+    let theta_w = (base_theta * w_ntk) as f32;
+    let theta_t = (base_theta * t_ntk) as f32;
+
+    let freqs_t: Vec<f32> = (0..bins_t)
+        .map(|i| 1.0 / theta_t.powf((2 * i) as f32 / dim_t as f32))
+        .collect();
+    let freqs_h: Vec<f32> = (0..bins_h)
+        .map(|i| 1.0 / theta_h.powf((2 * i) as f32 / dim_h as f32))
+        .collect();
+    let freqs_w: Vec<f32> = (0..bins_w)
+        .map(|i| 1.0 / theta_w.powf((2 * i) as f32 / dim_w as f32))
+        .collect();
+
+    let mut cos_data = vec![0.0f32; total_seq * half_d];
+    let mut sin_data = vec![0.0f32; total_seq * half_d];
+
+    for tf in 0..t_frames {
+        for ih in 0..nh {
+            for iw in 0..nw {
+                let seq_idx = tf * nh * nw + ih * nw + iw;
+                let base = seq_idx * half_d;
+                let mut dim_offset = 0;
+
+                for (fi, &freq) in freqs_t.iter().enumerate() {
+                    let angle = (tf as f32) * freq;
+                    cos_data[base + dim_offset + fi] = angle.cos();
+                    sin_data[base + dim_offset + fi] = angle.sin();
+                }
+                dim_offset += bins_t;
+
+                for (fi, &freq) in freqs_h.iter().enumerate() {
+                    let angle = (ih as f32) * freq;
+                    cos_data[base + dim_offset + fi] = angle.cos();
+                    sin_data[base + dim_offset + fi] = angle.sin();
+                }
+                dim_offset += bins_h;
+
+                for (fi, &freq) in freqs_w.iter().enumerate() {
+                    let angle = (iw as f32) * freq;
+                    cos_data[base + dim_offset + fi] = angle.cos();
+                    sin_data[base + dim_offset + fi] = angle.sin();
+                }
+            }
+        }
+    }
+
+    let cos = Tensor::from_vec_dtype(
+        cos_data,
+        Shape::from_dims(&[1, 1, total_seq, half_d]),
+        device.clone(),
+        DType::BF16,
+    )?;
+    let sin = Tensor::from_vec_dtype(
+        sin_data,
+        Shape::from_dims(&[1, 1, total_seq, half_d]),
+        device.clone(),
+        DType::BF16,
+    )?;
+
+    Ok((cos, sin))
+}
+
+/// Apply 3D RoPE using pre-computed cos/sin tables.
 ///
 /// x: [B, S, H, D] where D=head_dim=128
-/// rope_rot: [S, D/2, 2, 2] rotation matrices
+/// rope_cos, rope_sin: [S, D/2] pre-computed from build_3d_rope_cossin
 ///
-/// For each head dimension pair (2i, 2i+1), apply the 2x2 rotation:
-///   [x_even', x_odd'] = [x_even, x_odd] @ [[cos, sin], [-sin, cos]]
-/// which is equivalent to:
-///   x_even' = x_even * cos - x_odd * sin
-///   x_odd'  = x_even * sin + x_odd * cos
-fn apply_rope_rotation_matrix(
+/// Uses interleaved pairs: (x[2i], x[2i+1]) rotated by (cos[i], sin[i]).
+fn apply_rope_interleaved(
     x: &Tensor,
-    rope_rot: &Tensor, // [S, D/2, 2, 2]
+    rope_cos: &Tensor, // [S, D/2]
+    rope_sin: &Tensor, // [S, D/2]
 ) -> Result<Tensor> {
     let dims = x.shape().dims().to_vec();
     let (b, s, h, d) = (dims[0], dims[1], dims[2], dims[3]);
     let half_d = d / 2;
 
-    // Reshape x to [B, S, H, D/2, 2]
-    let x_pairs = x.reshape(&[b, s, h, half_d, 2])?;
-    let x_even = x_pairs.narrow(4, 0, 1)?.squeeze(Some(4))?; // [B, S, H, D/2]
-    let x_odd = x_pairs.narrow(4, 1, 1)?.squeeze(Some(4))?;  // [B, S, H, D/2]
+    // Use half-split approach: first half and second half of head_dim
+    // Reshape to [B*S*H, D], split into halves, apply rotation, concat back
+    let flat = x.reshape(&[b * s * h, d])?;
+    let x1 = flat.narrow(1, 0, half_d)?;      // [BSH, D/2] — first half
+    let x2 = flat.narrow(1, half_d, half_d)?;  // [BSH, D/2] — second half
 
-    // Extract cos and sin from rotation matrices
-    // rope_rot: [S, D/2, 2, 2]
-    // cos = rope_rot[:, :, 0, 0], sin = rope_rot[:, :, 1, 0]
-    let rot_flat = rope_rot.reshape(&[s, half_d, 4])?;
-    let cos = rot_flat.narrow(2, 0, 1)?.squeeze(Some(2))?; // [S, D/2] (element [0,0] = cos)
-    let sin = rot_flat.narrow(2, 2, 1)?.squeeze(Some(2))?; // [S, D/2] (element [1,0] = sin)
+    // Broadcast cos/sin: [S, D/2] -> [B*S*H, D/2]
+    // Each of the B*H copies of a position shares the same cos/sin
+    let cos_flat = rope_cos.reshape(&[1, s, 1, half_d])?;
+    let sin_flat = rope_sin.reshape(&[1, s, 1, half_d])?;
+    // Broadcast over B and H by reshaping x to [B, S, H, D/2]
+    let x1_4d = x1.reshape(&[b, s, h, half_d])?;
+    let x2_4d = x2.reshape(&[b, s, h, half_d])?;
 
-    // Broadcast: [S, D/2] -> [1, S, 1, D/2]
-    let cos = cos.reshape(&[1, s, 1, half_d])?;
-    let sin = sin.reshape(&[1, s, 1, half_d])?;
+    // rotate_half: new_x1 = x1*cos - x2*sin, new_x2 = x1*sin + x2*cos
+    let new_x1 = x1_4d.mul(&cos_flat)?.sub(&x2_4d.mul(&sin_flat)?)?;
+    let new_x2 = x1_4d.mul(&sin_flat)?.add(&x2_4d.mul(&cos_flat)?)?;
 
-    // Apply rotation
-    let new_even = x_even.mul(&cos)?.sub(&x_odd.mul(&sin)?)?;
-    let new_odd = x_even.mul(&sin)?.add(&x_odd.mul(&cos)?)?;
-
-    // Interleave back
-    let new_even_exp = new_even.unsqueeze(4)?; // [B, S, H, D/2, 1]
-    let new_odd_exp = new_odd.unsqueeze(4)?;
-    let stacked = Tensor::cat(&[&new_even_exp, &new_odd_exp], 4)?; // [B, S, H, D/2, 2]
-    stacked.reshape(&[b, s, h, d])
+    // Concat halves back: [B, S, H, D/2] + [B, S, H, D/2] -> [B, S, H, D]
+    let new_x1_flat = new_x1.reshape(&[b * s * h, half_d])?;
+    let new_x2_flat = new_x2.reshape(&[b * s * h, half_d])?;
+    let result = Tensor::cat(&[&new_x1_flat, &new_x2_flat], 1)?;
+    result.reshape(&[b, s, h, d])
 }
 
 // ===========================================================================
@@ -1048,6 +1151,14 @@ pub fn load_resident_weights(
             .iter()
             .any(|prefix| key.starts_with(prefix))
     })
+}
+
+/// Load ALL weights (resident + blocks) to GPU. For small models that fit in VRAM.
+pub fn load_all_weights(
+    model_path: &str,
+    device: &Arc<cudarc::driver::CudaDevice>,
+) -> Result<HashMap<String, Tensor>> {
+    flame_core::serialization::load_file(std::path::Path::new(model_path), device)
 }
 
 /// Count backbone blocks by probing weight keys.
