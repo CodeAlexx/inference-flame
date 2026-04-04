@@ -290,12 +290,17 @@ impl Anima {
     fn final_adaln_modulation(
         &self,
         t_cond: &Tensor,
+        base_adaln: &Tensor, // [B, 6144] — take first 4096 elements
     ) -> Result<(Tensor, Tensor)> {
         let t_silu = t_cond.silu()?;
         let h = self.linear_no_bias(&t_silu, "net.final_layer.adaln_modulation.1.weight")?;
-        let mod_out = self.linear_no_bias(&h, "net.final_layer.adaln_modulation.2.weight")?;
+        let mod_out = self.linear_no_bias(&h, "net.final_layer.adaln_modulation.2.weight")?; // [B, 4096]
 
+        // Add base_adaln[:, :2*D] (first 4096 of 6144)
         let dim = self.config.model_channels;
+        let adaln_slice = base_adaln.narrow(1, 0, 2 * dim)?; // [B, 4096]
+        let mod_out = mod_out.add(&adaln_slice)?;
+
         let shift = mod_out.narrow(1, 0, dim)?;
         let scale = mod_out.narrow(1, dim, dim)?;
 
@@ -478,8 +483,8 @@ impl Anima {
     // Final layer
     // ========================================================================
 
-    fn final_layer(&self, x: &Tensor, t_cond: &Tensor) -> Result<Tensor> {
-        let (shift, scale) = self.final_adaln_modulation(t_cond)?;
+    fn final_layer(&self, x: &Tensor, t_cond: &Tensor, base_adaln: &Tensor) -> Result<Tensor> {
+        let (shift, scale) = self.final_adaln_modulation(t_cond, base_adaln)?;
         let x_mod = self.apply_adaln(x, &shift, &scale)?;
         // Linear(2048 -> 64, no bias) — unpatchify output
         self.linear_no_bias(&x_mod, "net.final_layer.linear.weight")
@@ -750,7 +755,7 @@ impl Anima {
         }
 
         // 6. Final layer
-        let x_out = self.final_layer(&x_hidden, &t_cond)?;
+        let x_out = self.final_layer(&x_hidden, &t_cond, &base_adaln)?;
 
         // 7. Unpatchify: [B, N_patches, 64] -> [B, T, H, W, 16]
         self.unpatchify(&x_out, t_frames, nh, nw)

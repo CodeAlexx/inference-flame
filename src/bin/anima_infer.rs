@@ -66,6 +66,13 @@ fn main() -> anyhow::Result<()> {
     let context_cond = model.encode_context(&token_ids, &llm_hidden)?;
     let context_uncond = model.encode_context(&neg_token_ids, &neg_llm_hidden)?;
     println!("  Context: {:?}", context_cond.dims());
+    // Debug: save context for comparison with Python
+    {
+        let ctx_f32 = context_cond.to_dtype(DType::F32)?;
+        let data = ctx_f32.to_vec()?;
+        let mean_abs: f32 = data.iter().map(|v| v.abs()).sum::<f32>() / data.len() as f32;
+        println!("  Context mean_abs: {:.4}", mean_abs);
+    }
     println!("  Encoded in {:.1}s", t0.elapsed().as_secs_f32());
 
     // ------------------------------------------------------------------
