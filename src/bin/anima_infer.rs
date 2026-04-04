@@ -15,8 +15,8 @@ const VAE_PATH: &str = "/home/alex/EriDiffusion/Models/anima/split_files/vae/qwe
 const OUTPUT_PATH: &str = "/home/alex/EriDiffusion/inference-flame/output/anima_rust.png";
 
 // Rectified flow: linear sigma schedule, no shift at inference
-const NUM_STEPS: usize = 30;
-const CFG_SCALE: f32 = 4.5;
+const NUM_STEPS: usize = 50;
+const CFG_SCALE: f32 = 7.0;
 const SEED: u64 = 42;
 const WIDTH: usize = 512;
 const HEIGHT: usize = 512;

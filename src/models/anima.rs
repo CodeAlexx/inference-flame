@@ -349,9 +349,9 @@ impl Anima {
         let q = self.rms_norm_per_head_bhsd(&q, &format!("{prefix}.q_norm.weight"))?;
         let k = self.rms_norm_per_head_bhsd(&k, &format!("{prefix}.k_norm.weight"))?;
 
-        // Apply 3D RoPE using fused CUDA kernel (half-split convention)
-        let q = flame_core::bf16_ops::rope_halfsplit_bf16(&q, rope_cos, rope_sin)?;
-        let k = flame_core::bf16_ops::rope_halfsplit_bf16(&k, rope_cos, rope_sin)?;
+        // Apply 3D RoPE using fused CUDA kernel (interleaved pairs — matches ComfyUI)
+        let q = flame_core::bf16_ops::rope_fused_bf16(&q, rope_cos, rope_sin)?;
+        let k = flame_core::bf16_ops::rope_fused_bf16(&k, rope_cos, rope_sin)?;
 
         // Scaled dot-product attention
         let out = sdpa(&q, &k, &v, None)?;
@@ -441,17 +441,20 @@ impl Anima {
     ) -> Result<Tensor> {
         let prefix = format!("net.blocks.{block_idx}");
 
+        // FP32 residual stream (model has large values ~200+, BF16 loses precision)
+        let mut x_f32 = x.to_dtype(DType::F32)?;
+
         // --- Self-attention ---
         let (shift_sa, scale_sa, gate_sa) = self.adaln_modulation(
             t_cond,
             base_adaln,
             &format!("{prefix}.adaln_modulation_self_attn"),
         )?;
-        let x_mod = self.apply_adaln(x, &shift_sa, &scale_sa)?;
+        let x_bf16 = x_f32.to_dtype(DType::BF16)?;
+        let x_mod = self.apply_adaln(&x_bf16, &shift_sa, &scale_sa)?;
         let attn_out = self.self_attention(&x_mod, rope_cos, rope_sin, &format!("{prefix}.self_attn"))?;
-
         let gate_sa_unsq = gate_sa.unsqueeze(1)?;
-        let x = x.add(&attn_out.mul(&gate_sa_unsq)?)?;
+        x_f32 = x_f32.add(&attn_out.to_dtype(DType::F32)?.mul(&gate_sa_unsq.to_dtype(DType::F32)?)?)?;
 
         // --- Cross-attention ---
         let (shift_ca, scale_ca, gate_ca) = self.adaln_modulation(
@@ -459,11 +462,12 @@ impl Anima {
             base_adaln,
             &format!("{prefix}.adaln_modulation_cross_attn"),
         )?;
-        let x_mod = self.apply_adaln(&x, &shift_ca, &scale_ca)?;
+        let x_bf16 = x_f32.to_dtype(DType::BF16)?;
+        let x_mod = self.apply_adaln(&x_bf16, &shift_ca, &scale_ca)?;
         let cross_out =
             self.cross_attention(&x_mod, context, &format!("{prefix}.cross_attn"))?;
         let gate_ca_unsq = gate_ca.unsqueeze(1)?;
-        let x = x.add(&cross_out.mul(&gate_ca_unsq)?)?;
+        x_f32 = x_f32.add(&cross_out.to_dtype(DType::F32)?.mul(&gate_ca_unsq.to_dtype(DType::F32)?)?)?;
 
         // --- MLP ---
         let (shift_mlp, scale_mlp, gate_mlp) = self.adaln_modulation(
@@ -471,12 +475,13 @@ impl Anima {
             base_adaln,
             &format!("{prefix}.adaln_modulation_mlp"),
         )?;
-        let x_mod = self.apply_adaln(&x, &shift_mlp, &scale_mlp)?;
+        let x_bf16 = x_f32.to_dtype(DType::BF16)?;
+        let x_mod = self.apply_adaln(&x_bf16, &shift_mlp, &scale_mlp)?;
         let mlp_out = self.mlp(&x_mod, &format!("{prefix}.mlp"))?;
         let gate_mlp_unsq = gate_mlp.unsqueeze(1)?;
-        let x = x.add(&mlp_out.mul(&gate_mlp_unsq)?)?;
+        x_f32 = x_f32.add(&mlp_out.to_dtype(DType::F32)?.mul(&gate_mlp_unsq.to_dtype(DType::F32)?)?)?;
 
-        Ok(x)
+        x_f32.to_dtype(DType::BF16)
     }
 
     // ========================================================================
