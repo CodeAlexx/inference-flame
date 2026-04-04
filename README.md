@@ -2,8 +2,10 @@
 
 Pure Rust diffusion model inference using [flame-core](https://github.com/CodeAlexx/Flame). No Python, no diffusers, no ONNX.
 
-![Klein 9B Sample](docs/klein9b_sample.png)
-*Klein 9B Base, 1024x1024, 50 steps, guidance 4.0 — pure Rust on a single 3090 Ti*
+| Klein 9B | Anima 2B |
+|---|---|
+| ![Klein 9B Sample](docs/klein9b_sample.png) | ![Anima Sample](docs/anima_sample.png) |
+| *1024x1024, 50 steps, CFG 4.0* | *1024x1024, 30 steps, CFG 4.5* |
 
 ## Performance
 
@@ -29,7 +31,7 @@ Denoise is **10% faster per-step** than PyTorch. Fits entirely on a single 24GB 
 | SD3.5 | MMDiT | Built, needs TE |
 | SDXL | UNet | Built, needs TE |
 | LTX-2 | Video DiT | Ported, needs testing |
-| Anima | Wan-style DiT | Built, needs testing |
+| Anima 2B | Cosmos Predict2 DiT | Working |
 
 ## Pipeline
 

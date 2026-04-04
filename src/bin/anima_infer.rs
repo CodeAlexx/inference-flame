@@ -15,11 +15,12 @@ const VAE_PATH: &str = "/home/alex/EriDiffusion/Models/anima/split_files/vae/qwe
 const OUTPUT_PATH: &str = "/home/alex/EriDiffusion/inference-flame/output/anima_rust.png";
 
 // Rectified flow: linear sigma schedule, no shift at inference
-const NUM_STEPS: usize = 50;
-const CFG_SCALE: f32 = 7.0;
+// HF recommends: 1024x1024, CFG 4-5, 30-50 steps
+const NUM_STEPS: usize = 30;
+const CFG_SCALE: f32 = 4.5;
 const SEED: u64 = 42;
-const WIDTH: usize = 512;
-const HEIGHT: usize = 512;
+const WIDTH: usize = 1024;
+const HEIGHT: usize = 1024;
 
 fn main() -> anyhow::Result<()> {
     env_logger::init();
@@ -35,17 +36,21 @@ fn main() -> anyhow::Result<()> {
     let device = global_cuda_device();
 
     // ------------------------------------------------------------------
-    // Stage 1: Load cached embeddings
+    // Stage 1: Load pre-computed context (adapter already run in Python)
     // ------------------------------------------------------------------
-    println!("\n--- Stage 1: Load cached embeddings ---");
+    println!("\n--- Stage 1: Load pre-computed context ---");
     let t0 = Instant::now();
     let emb = flame_core::serialization::load_file(std::path::Path::new(&emb_path), &device)?;
-    let llm_hidden = emb.get("llm_hidden").ok_or_else(|| anyhow::anyhow!("Missing llm_hidden"))?.clone();
-    let token_ids = emb.get("token_ids").ok_or_else(|| anyhow::anyhow!("Missing token_ids"))?.clone();
-    let neg_llm_hidden = emb.get("neg_llm_hidden").ok_or_else(|| anyhow::anyhow!("Missing neg_llm_hidden"))?.clone();
-    let neg_token_ids = emb.get("neg_token_ids").ok_or_else(|| anyhow::anyhow!("Missing neg_token_ids"))?.clone();
+    let context_cond = emb.get("context_cond").ok_or_else(|| anyhow::anyhow!("Missing context_cond"))?.clone();
+    let context_uncond = emb.get("context_uncond").ok_or_else(|| anyhow::anyhow!("Missing context_uncond"))?.clone();
     drop(emb);
-    println!("  llm_hidden: {:?}, token_ids: {:?}", llm_hidden.dims(), token_ids.dims());
+    println!("  context_cond: {:?}", context_cond.dims());
+    {
+        let ctx_f32 = context_cond.to_dtype(DType::F32)?;
+        let data = ctx_f32.to_vec()?;
+        let mean_abs: f32 = data.iter().map(|v| v.abs()).sum::<f32>() / data.len() as f32;
+        println!("  Context mean_abs: {:.4}", mean_abs);
+    }
     println!("  Loaded in {:.1}s", t0.elapsed().as_secs_f32());
 
     // ------------------------------------------------------------------
@@ -57,23 +62,6 @@ fn main() -> anyhow::Result<()> {
     println!("  {} weight tensors loaded", all_weights.len());
     let mut model = Anima::new_all_on_gpu(MODEL_PATH.to_string(), all_weights, device.clone());
     println!("  Loaded in {:.1}s", t0.elapsed().as_secs_f32());
-
-    // ------------------------------------------------------------------
-    // Stage 2b: Pre-compute LLM adapter context (run once, reuse every step)
-    // ------------------------------------------------------------------
-    println!("\n--- Stage 2b: Encode text context (cached) ---");
-    let t0 = Instant::now();
-    let context_cond = model.encode_context(&token_ids, &llm_hidden)?;
-    let context_uncond = model.encode_context(&neg_token_ids, &neg_llm_hidden)?;
-    println!("  Context: {:?}", context_cond.dims());
-    // Debug: save context for comparison with Python
-    {
-        let ctx_f32 = context_cond.to_dtype(DType::F32)?;
-        let data = ctx_f32.to_vec()?;
-        let mean_abs: f32 = data.iter().map(|v| v.abs()).sum::<f32>() / data.len() as f32;
-        println!("  Context mean_abs: {:.4}", mean_abs);
-    }
-    println!("  Encoded in {:.1}s", t0.elapsed().as_secs_f32());
 
     // ------------------------------------------------------------------
     // Stage 3: Create noise + denoise

@@ -211,9 +211,9 @@ impl Anima {
     /// - t_cond: RMSNormed hidden state, input to per-block adaln_modulation
     /// - base_adaln: 6144-dim base modulation added to each sub-block's output
     ///
-    /// Flow: sinusoidal(2048) -> Linear(2048,2048,bias) -> SiLU -> hidden(2048)
+    /// Flow: sinusoidal(2048) -> Linear(2048,2048,no bias) -> SiLU -> hidden(2048)
     ///       hidden -> Linear(2048,6144,no bias) -> base_adaln
-    ///       hidden -> RMSNorm -> t_cond
+    ///       sinusoidal -> RMSNorm -> t_cond  (NOT hidden — adaln_lora returns raw input)
     fn prepare_timestep(&self, t: &Tensor) -> Result<(Tensor, Tensor)> {
         let dim = self.config.model_channels;
         let half = dim / 2;
@@ -250,8 +250,10 @@ impl Anima {
         // base_adaln = Linear(hidden) [B, 6144] — no bias
         let base_adaln = self.linear_no_bias(&hidden, "net.t_embedder.1.linear_2.weight")?;
 
-        // t_cond = RMSNorm(hidden) [B, 2048] — input to per-block adaln_modulation
-        let t_cond = self.rms_norm(&hidden, "net.t_embedding_norm.weight", 1e-6)?;
+        // t_cond = RMSNorm(sinusoidal) [B, 2048] — input to per-block adaln_modulation
+        // IMPORTANT: With use_adaln_lora=True, TimestepEmbedding returns the ORIGINAL
+        // sinusoidal embedding (not the SiLU'd hidden), then t_embedding_norm is applied.
+        let t_cond = self.rms_norm(&emb, "net.t_embedding_norm.weight", 1e-6)?;
 
         Ok((t_cond, base_adaln))
     }
@@ -349,9 +351,9 @@ impl Anima {
         let q = self.rms_norm_per_head_bhsd(&q, &format!("{prefix}.q_norm.weight"))?;
         let k = self.rms_norm_per_head_bhsd(&k, &format!("{prefix}.k_norm.weight"))?;
 
-        // Apply 3D RoPE using fused CUDA kernel (interleaved pairs — matches ComfyUI)
-        let q = flame_core::bf16_ops::rope_fused_bf16(&q, rope_cos, rope_sin)?;
-        let k = flame_core::bf16_ops::rope_fused_bf16(&k, rope_cos, rope_sin)?;
+        // Apply 3D RoPE using half-split kernel (matches standalone trainer's interleaved=False)
+        let q = flame_core::bf16_ops::rope_halfsplit_bf16(&q, rope_cos, rope_sin)?;
+        let k = flame_core::bf16_ops::rope_halfsplit_bf16(&k, rope_cos, rope_sin)?;
 
         // Scaled dot-product attention
         let out = sdpa(&q, &k, &v, None)?;
@@ -522,9 +524,11 @@ impl Anima {
 
         // Reshape to extract patches: [B, T, nH, pH, nW, pW, C+1]
         let x_r = x_padded.reshape(&[b, t, nh, ph, nw, ph, c_pad])?;
-        // Permute to [B, T, nH, nW, pH, pW, C+1]
-        let x_p = x_r.permute(&[0, 1, 2, 4, 3, 5, 6])?;
-        // Flatten patches: [B, T*nH*nW, pH*pW*(C+1)] = [B, T*nH*nW, 68]
+        // Permute to [B, T, nH, nW, C+1, pH, pW] — channels OUTERMOST in patch dim
+        // Matches Python einops: "b c (t r) (h m) (w n) -> b t h w (c r m n)"
+        // where c varies slowest and n (spatial width) varies fastest
+        let x_p = x_r.permute(&[0, 1, 2, 4, 6, 3, 5])?;
+        // Flatten patches: [B, T*nH*nW, (C+1)*pH*pW] = [B, T*nH*nW, 68]
         let num_patches = t * nh * nw;
         let patch_dim = ph * ph * c_pad; // 2*2*17 = 68
         let x_flat = x_p.reshape(&[b, num_patches, patch_dim])?;
@@ -1031,10 +1035,10 @@ fn build_3d_rope_cossin(
     let bins_h = dim_h / 2;
     let bins_w = dim_w / 2;
 
-    // Extrapolation ratios: 3.0 for in_channels=17 (16 latent + 1 padding mask)
+    // Extrapolation ratios: 4.0 for in_channels=16 (padding mask is a concat, not in_channels)
     let base_theta: f64 = 10000.0;
-    let h_ntk = 3.0f64.powf(dim_h as f64 / (dim_h as f64 - 2.0));
-    let w_ntk = 3.0f64.powf(dim_w as f64 / (dim_w as f64 - 2.0));
+    let h_ntk = 4.0f64.powf(dim_h as f64 / (dim_h as f64 - 2.0));
+    let w_ntk = 4.0f64.powf(dim_w as f64 / (dim_w as f64 - 2.0));
     let t_ntk = 1.0f64.powf(dim_t as f64 / (dim_t as f64 - 2.0));
     let theta_h = (base_theta * h_ntk) as f32;
     let theta_w = (base_theta * w_ntk) as f32;
