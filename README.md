@@ -2,10 +2,10 @@
 
 Pure Rust diffusion model inference using [flame-core](https://github.com/CodeAlexx/Flame). No Python, no diffusers, no ONNX.
 
-| Klein 9B | Anima 2B |
-|---|---|
-| ![Klein 9B Sample](docs/klein9b_sample.png) | ![Anima Sample](docs/anima_sample.png) |
-| *1024x1024, 50 steps, CFG 4.0* | *1024x1024, 30 steps, CFG 4.5* |
+| Klein 9B | Anima 2B | SDXL |
+|---|---|---|
+| ![Klein 9B Sample](docs/klein9b_sample.png) | ![Anima Sample](docs/anima_sample.png) | ![SDXL Sample](docs/sdxl_sample.png) |
+| *1024x1024, 50 steps, CFG 4.0* | *1024x1024, 30 steps, CFG 4.5* | *1024x1024, 30 steps, CFG 7.5* |
 
 ## Performance
 
@@ -29,7 +29,7 @@ Denoise is **10% faster per-step** than PyTorch. Fits entirely on a single 24GB 
 | Klein 9B | Flux 2 DiT (8+24 blocks) | Working |
 | Z-Image | NextDiT | Built, needs testing |
 | SD3.5 | MMDiT | Built, needs TE |
-| SDXL | UNet | Built, needs TE |
+| SDXL | LDM UNet | Working |
 | LTX-2 | Video DiT | Ported, needs testing |
 | Anima 2B | Cosmos Predict2 DiT | Working |
 
