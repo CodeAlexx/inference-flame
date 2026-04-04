@@ -521,7 +521,10 @@ impl SDXLUNet {
             x.clone_result()?
         };
 
-        residual.add(&h)
+        // FP32 residual accumulation — prevents BF16 truncation error compounding
+        // through skip connections (same pattern as Anima's FP32 residual stream)
+        let out = residual.to_dtype(DType::F32)?.add(&h.to_dtype(DType::F32)?)?;
+        out.to_dtype(DType::BF16)
     }
 
     // -----------------------------------------------------------------------
@@ -610,7 +613,8 @@ impl SDXLUNet {
             1e-5,
         )?;
         let attn1_out = self.cross_attention(&x_norm1, &x_norm1, &format!("{prefix}.attn1"))?;
-        let x = x.add(&attn1_out)?;
+        // FP32 residual accumulation
+        let x = x.to_dtype(DType::F32)?.add(&attn1_out.to_dtype(DType::F32)?)?.to_dtype(DType::BF16)?;
 
         // Cross-attention: norm2 -> attn2 (Q from image, K/V from text context)
         let x_norm2 = layer_norm(
@@ -621,7 +625,7 @@ impl SDXLUNet {
             1e-5,
         )?;
         let attn2_out = self.cross_attention(&x_norm2, context, &format!("{prefix}.attn2"))?;
-        let x = x.add(&attn2_out)?;
+        let x = x.to_dtype(DType::F32)?.add(&attn2_out.to_dtype(DType::F32)?)?.to_dtype(DType::BF16)?;
 
         // Feed-forward: norm3 -> GEGLU -> Linear
         let x_norm3 = layer_norm(
@@ -644,7 +648,7 @@ impl SDXLUNet {
             &format!("{prefix}.ff.net.2.bias"),
         )?;
 
-        x.add(&ff_out)
+        x.to_dtype(DType::F32)?.add(&ff_out.to_dtype(DType::F32)?)?.to_dtype(DType::BF16)
     }
 
     /// SpatialTransformer: GroupNorm -> proj_in -> N x BasicTransformerBlock -> proj_out
@@ -705,7 +709,8 @@ impl SDXLUNet {
             self.conv2d_forward(&spatial, &format!("{prefix}.proj_out"))?
         };
 
-        residual.add(&out)
+        // FP32 residual accumulation
+        residual.to_dtype(DType::F32)?.add(&out.to_dtype(DType::F32)?)?.to_dtype(DType::BF16)
     }
 
     // -----------------------------------------------------------------------
@@ -848,6 +853,17 @@ impl SDXLUNet {
                     }
 
                     self.unload_block();
+
+                    // Debug: track max abs per output block (first call only)
+                    if std::env::var("SDXL_BLOCK_DEBUG").is_ok() {
+                        if let Ok(hf32) = h.to_dtype(DType::F32) {
+                            if let Ok(data) = hf32.to_vec() {
+                                let max_abs = data.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+                                let outliers = data.iter().filter(|v| v.abs() > 3.0).count();
+                                eprintln!("  output_blocks.{block_idx}: max_abs={max_abs:.2}, outliers>3={outliers}");
+                            }
+                        }
+                    }
                 }
                 _ => unreachable!("Output block has invalid descriptor type"),
             }

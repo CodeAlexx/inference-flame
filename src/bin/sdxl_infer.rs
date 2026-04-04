@@ -117,20 +117,15 @@ fn main() -> anyhow::Result<()> {
     let latent_w = WIDTH / 8;
     let numel = 4 * latent_h * latent_w; // 4 latent channels
 
-    let noise_data: Vec<f32> = {
-        use rand::prelude::*;
-        let mut rng = rand::rngs::StdRng::seed_from_u64(SEED);
-        let mut v = Vec::with_capacity(numel);
-        for _ in 0..numel / 2 {
-            let u1: f32 = rng.gen::<f32>().max(1e-10);
-            let u2: f32 = rng.gen::<f32>();
-            let r = (-2.0 * u1.ln()).sqrt();
-            let theta = 2.0 * std::f32::consts::PI * u2;
-            v.push(r * theta.cos());
-            v.push(r * theta.sin());
-        }
-        v
-    };
+    // Load PyTorch noise (same seed=42) for exact comparison with diffusers
+    let noise_path = "/home/alex/EriDiffusion/inference-flame/output/sdxl_noise_seed42.safetensors";
+    let noise_tensors = flame_core::serialization::load_file(
+        std::path::Path::new(noise_path), &device,
+    )?;
+    let noise_tensor = noise_tensors.get("noise")
+        .ok_or_else(|| anyhow::anyhow!("Missing 'noise' tensor"))?
+        .clone();
+    println!("  Loaded PyTorch noise: {:?}", noise_tensor.dims());
 
     let (sigmas, timesteps) = build_sdxl_schedule(NUM_STEPS);
     println!("  sigma_max={:.4}, sigma_min={:.6}", sigmas[0], sigmas[NUM_STEPS - 1]);
@@ -138,18 +133,20 @@ fn main() -> anyhow::Result<()> {
 
     // Initialize x = noise * init_noise_sigma (sqrt(sigma_max^2 + 1) per diffusers)
     let init_sigma = (sigmas[0] * sigmas[0] + 1.0).sqrt();
-    let mut x = Tensor::from_f32_to_bf16(
-        noise_data, Shape::from_dims(&[1, 4, latent_h, latent_w]), device.clone(),
-    )?.mul_scalar(init_sigma)?;
+    let mut x = noise_tensor.to_dtype(DType::BF16)?.mul_scalar(init_sigma)?;
 
     let t0 = Instant::now();
+    // Keep denoising state in FP32 — only convert to BF16 for UNet input
+    let mut x_f32 = x.to_dtype(DType::F32)?;
+    drop(x);
+
     for i in 0..NUM_STEPS {
         let sigma = sigmas[i];
         let sigma_next = sigmas[i + 1];
 
-        // Scale input: x_in = x / sqrt(sigma^2 + 1)
+        // Scale input: x_in = x / sqrt(sigma^2 + 1), convert to BF16 for UNet
         let c_in = 1.0 / (sigma * sigma + 1.0).sqrt();
-        let x_in = x.mul_scalar(c_in)?;
+        let x_in = x_f32.mul_scalar(c_in)?.to_dtype(DType::BF16)?;
 
         // UNet expects discrete timestep (0-999), NOT sigma
         let timestep = Tensor::from_f32_to_bf16(
@@ -160,27 +157,25 @@ fn main() -> anyhow::Result<()> {
         let pred_cond = model.forward(&x_in, &timestep, &context, &y)?;
         let pred_uncond = model.forward(&x_in, &timestep, &context_uncond, &y_uncond)?;
 
-        // CFG
-        let diff = pred_cond.sub(&pred_uncond)?;
-        let pred = pred_uncond.add(&diff.mul_scalar(CFG_SCALE)?)?;
+        // CFG in FP32
+        let pred_cond_f32 = pred_cond.to_dtype(DType::F32)?;
+        let pred_uncond_f32 = pred_uncond.to_dtype(DType::F32)?;
+        let diff = pred_cond_f32.sub(&pred_uncond_f32)?;
+        let pred_f32 = pred_uncond_f32.add(&diff.mul_scalar(CFG_SCALE)?)?;
 
-        // Euler step for eps-prediction:
-        // derivative = eps (for epsilon prediction, d(x)/d(sigma) = eps)
-        // x_next = x + eps * (sigma_next - sigma)
+        // Euler step in FP32
         let dt = sigma_next - sigma;
-        x = x.add(&pred.mul_scalar(dt)?)?;
+        x_f32 = x_f32.add(&pred_f32.mul_scalar(dt)?)?;
 
-        {
-            let pred_f32 = pred.to_dtype(DType::F32)?;
-            let data = pred_f32.to_vec()?;
-            let mean_abs: f32 = data.iter().map(|v| v.abs()).sum::<f32>() / data.len() as f32;
-            let x_f32 = x.to_dtype(DType::F32)?;
+        if i == 0 || i == NUM_STEPS - 1 {
             let xd = x_f32.to_vec()?;
             let x_abs: f32 = xd.iter().map(|v| v.abs()).sum::<f32>() / xd.len() as f32;
-            println!("  Step {}/{}: t={:.0}, sigma={:.4}, pred_abs={:.4}, x_abs={:.4}, dt={:.4}",
-                i + 1, NUM_STEPS, timesteps[i], sigma, mean_abs, x_abs, dt);
+            println!("  Step {}/{}: x_abs={:.4}", i + 1, NUM_STEPS, x_abs);
         }
     }
+
+    // Convert final latent back to BF16 for saving
+    let x = x_f32.to_dtype(DType::BF16)?;
     let dt = t0.elapsed().as_secs_f32();
     println!("  {:.1}s ({:.2}s/step)", dt, dt / NUM_STEPS as f32);
 
