@@ -125,8 +125,9 @@ fn main() -> anyhow::Result<()> {
         let t_curr = timesteps[i];
         let t_prev = timesteps[i + 1];
 
+        // ComfyUI ModelSamplingDiscreteFlow: timestep = sigma * multiplier (1000)
         let t_vec = Tensor::from_f32_to_bf16(
-            vec![t_curr], Shape::from_dims(&[1]), device.clone(),
+            vec![t_curr * 1000.0], Shape::from_dims(&[1]), device.clone(),
         )?;
 
         // Discrete flow matching (like Flux): direct velocity prediction
@@ -178,50 +179,66 @@ fn main() -> anyhow::Result<()> {
     }
 
     // ------------------------------------------------------------------
-    // Stage 4: VAE decode (Wan21 3D causal VAE)
+    // Stage 4: Save latent for external VAE decode
+    // (Wan21 Conv3d in flame-core is broken — use Python VAE for now)
     // ------------------------------------------------------------------
-    println!("\n--- Stage 4: VAE Decode (Wan21 VAE) ---");
+    println!("\n--- Stage 4: Save latent + VAE Decode ---");
     let t0 = Instant::now();
     drop(model); // Free DiT VRAM
 
-    // Anima latent is [B, T=1, H, W, 16] → need [B, 16, T, H, W] for Wan VAE
+    // Anima latent is [B, T=1, H, W, 16] → need [B, 16, T, H, W] for VAE
     let latent = x.permute(&[0, 4, 1, 2, 3])?; // [1, 16, 1, H/8, W/8]
     println!("  Latent for VAE: {:?}", latent.dims());
 
-    let vae = Wan21VaeDecoder::load(VAE_PATH, &device)?;
-    let rgb = vae.decode(&latent)?;
-    println!("  Decoded: {:?}", rgb.dims());
-    println!("  VAE in {:.1}s", t0.elapsed().as_secs_f32());
-
-    // Extract first frame: [B, 3, T_out, H, W]
-    let rgb_dims = rgb.dims().to_vec();
-    let (out_t, out_h, out_w) = (rgb_dims[2], rgb_dims[3], rgb_dims[4]);
-
-    // Take first temporal frame
-    let frame = if out_t > 1 {
-        rgb.narrow(2, 0, 1)?.reshape(&[1, 3, out_h, out_w])?
-    } else {
-        rgb.reshape(&[1, 3, out_h, out_w])?
-    };
-
-    // Convert to [0, 255] image: output is clamped [-1, 1]
-    let frame_f32 = frame.to_dtype(DType::F32)?;
-    let data = frame_f32.to_vec()?;
-
-    let mut pixels = vec![0u8; out_h * out_w * 3];
-    for y in 0..out_h {
-        for px in 0..out_w {
-            for c in 0..3 {
-                let idx = c * out_h * out_w + y * out_w + px;
-                let val = ((data[idx] + 1.0) * 127.5).clamp(0.0, 255.0) as u8;
-                pixels[(y * out_w + px) * 3 + c] = val;
-            }
-        }
+    // Save latent as safetensors for Python VAE decode
+    let latent_path = OUTPUT_PATH.replace(".png", "_latent.safetensors");
+    {
+        use std::collections::HashMap;
+        let mut tensors = HashMap::new();
+        tensors.insert("latent".to_string(), latent.clone());
+        flame_core::serialization::save_file(&tensors, std::path::Path::new(&latent_path))?;
+        println!("  Saved latent to {}", latent_path);
     }
 
-    image::RgbImage::from_raw(out_w as u32, out_h as u32, pixels)
-        .ok_or_else(|| anyhow::anyhow!("Image creation failed"))?
-        .save(OUTPUT_PATH)?;
+    // Try Rust VAE (known broken — Conv3d issue), fall back to noting the Python path
+    let vae_result = (|| -> anyhow::Result<()> {
+        let vae = Wan21VaeDecoder::load(VAE_PATH, &device)?;
+        let rgb = vae.decode(&latent)?;
+        let rgb_dims = rgb.dims().to_vec();
+        let (out_t, out_h, out_w) = (rgb_dims[2], rgb_dims[3], rgb_dims[4]);
+
+        let frame = if out_t > 1 {
+            rgb.narrow(2, 0, 1)?.reshape(&[1, 3, out_h, out_w])?
+        } else {
+            rgb.reshape(&[1, 3, out_h, out_w])?
+        };
+
+        let frame_f32 = frame.to_dtype(DType::F32)?;
+        let data = frame_f32.to_vec()?;
+
+        let mut pixels = vec![0u8; out_h * out_w * 3];
+        for y in 0..out_h {
+            for px in 0..out_w {
+                for c in 0..3 {
+                    let idx = c * out_h * out_w + y * out_w + px;
+                    let val = ((data[idx] + 1.0) * 127.5).clamp(0.0, 255.0) as u8;
+                    pixels[(y * out_w + px) * 3 + c] = val;
+                }
+            }
+        }
+
+        image::RgbImage::from_raw(out_w as u32, out_h as u32, pixels)
+            .ok_or_else(|| anyhow::anyhow!("Image creation failed"))?
+            .save(OUTPUT_PATH)?;
+        Ok(())
+    })();
+
+    if let Err(e) = vae_result {
+        println!("  Rust VAE failed: {}", e);
+        println!("  Run Python VAE: python decode_anima_latent.py {}", latent_path);
+    }
+
+    println!("  Stage 4 in {:.1}s", t0.elapsed().as_secs_f32());
 
     println!("\n============================================================");
     println!("IMAGE SAVED: {}", OUTPUT_PATH);

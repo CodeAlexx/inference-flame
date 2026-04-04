@@ -1049,24 +1049,28 @@ fn build_3d_rope_cossin(
                 let base = seq_idx * half_d;
                 let mut dim_offset = 0;
 
+                // Cosmos rotation matrix convention: [[cos, sin], [-sin, cos]]
+                // rope_fused_bf16 applies: out_even = cos*x_even - sin*x_odd
+                // To match Cosmos: out_even = cos*x_even + sin*x_odd
+                // Solution: negate sin so kernel does cos*even - (-sin)*odd = cos*even + sin*odd
                 for (fi, &freq) in freqs_t.iter().enumerate() {
                     let angle = (tf as f32) * freq;
                     cos_data[base + dim_offset + fi] = angle.cos();
-                    sin_data[base + dim_offset + fi] = angle.sin();
+                    sin_data[base + dim_offset + fi] = -angle.sin(); // negated for Cosmos convention
                 }
                 dim_offset += bins_t;
 
                 for (fi, &freq) in freqs_h.iter().enumerate() {
                     let angle = (ih as f32) * freq;
                     cos_data[base + dim_offset + fi] = angle.cos();
-                    sin_data[base + dim_offset + fi] = angle.sin();
+                    sin_data[base + dim_offset + fi] = -angle.sin();
                 }
                 dim_offset += bins_h;
 
                 for (fi, &freq) in freqs_w.iter().enumerate() {
                     let angle = (iw as f32) * freq;
                     cos_data[base + dim_offset + fi] = angle.cos();
-                    sin_data[base + dim_offset + fi] = angle.sin();
+                    sin_data[base + dim_offset + fi] = -angle.sin();
                 }
             }
         }
