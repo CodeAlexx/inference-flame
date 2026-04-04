@@ -15,15 +15,15 @@ const DEFAULT_EMB_PATH: &str = "/home/alex/EriDiffusion/inference-flame/output/a
 const VAE_PATH: &str = "/home/alex/EriDiffusion/Models/anima/split_files/vae/qwen_image_vae.safetensors";
 const OUTPUT_PATH: &str = "/home/alex/EriDiffusion/inference-flame/output/anima_rust.png";
 
-// Cosmos RFLOW sampling with shift=3.0
-const NUM_STEPS: usize = 20;
-const CFG_SCALE: f32 = 7.0;
+// Discrete flow matching with shift=3.0 (same as Flux)
+const NUM_STEPS: usize = 30;
+const CFG_SCALE: f32 = 4.5;
 const SHIFT: f32 = 3.0;
 const SEED: u64 = 42;
 const WIDTH: usize = 512;
 const HEIGHT: usize = 512;
 
-/// Cosmos RFLOW sigma schedule with time shifting.
+/// Discrete flow matching schedule with time shifting (same as Flux).
 fn build_cosmos_schedule(num_steps: usize, shift: f32) -> Vec<f32> {
     let mut t: Vec<f32> = (0..=num_steps)
         .map(|i| 1.0 - i as f32 / num_steps as f32)
@@ -129,27 +129,32 @@ fn main() -> anyhow::Result<()> {
             vec![t_curr], Shape::from_dims(&[1]), device.clone(),
         )?;
 
-        // Cosmos RFLOW: s = sigma / (sigma + 1)
-        let s = t_curr / (t_curr + 1.0);
-
-        // Model input: x * (1 - s)
-        let x_in = x.mul_scalar(1.0 - s)?;
+        // Discrete flow matching (like Flux): direct velocity prediction
+        // Model predicts velocity v, x_next = x + dt * v
 
         // Conditional + unconditional predictions (context is pre-cached)
-        let pred_cond = model.forward_with_context(&x_in, &t_vec, &context_cond)?;
-        let pred_uncond = model.forward_with_context(&x_in, &t_vec, &context_uncond)?;
+        let pred_cond = model.forward_with_context(&x, &t_vec, &context_cond)?;
+        let pred_uncond = model.forward_with_context(&x, &t_vec, &context_uncond)?;
 
         // CFG: pred = uncond + scale * (cond - uncond)
         let diff = pred_cond.sub(&pred_uncond)?;
         let pred = pred_uncond.add(&diff.mul_scalar(CFG_SCALE)?)?;
 
-        // Cosmos RFLOW denoised: x_in * (1-s) - pred * s
-        let denoised = x_in.mul_scalar(1.0 - s)?.sub(&pred.mul_scalar(s)?)?;
-
-        // Euler step: x = x + dt/t_curr * (x - denoised)
+        // Euler step: x = x + dt * pred
         let dt = t_prev - t_curr;
-        let d = x.sub(&denoised)?.mul_scalar(1.0 / t_curr)?;
-        x = x.add(&d.mul_scalar(dt)?)?;
+        x = x.add(&pred.mul_scalar(dt)?)?;
+
+        // Debug: check prediction magnitude
+        if i == 0 {
+            let pred_f32 = pred.to_dtype(DType::F32).unwrap();
+            let pred_data = pred_f32.to_vec().unwrap();
+            let sum: f32 = pred_data.iter().map(|x| x.abs()).sum::<f32>();
+            let mean_abs = sum / pred_data.len() as f32;
+            println!("  [DEBUG] step 0 pred: mean_abs={:.6}, min={:.6}, max={:.6}",
+                mean_abs,
+                pred_data.iter().cloned().fold(f32::INFINITY, f32::min),
+                pred_data.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
+        }
 
         let step_ms = step_t.elapsed().as_millis();
         if i == 0 || i % 5 == 4 || i == NUM_STEPS - 1 {
@@ -159,6 +164,18 @@ fn main() -> anyhow::Result<()> {
 
     let dt = t0.elapsed().as_secs_f32();
     println!("  Denoise: {:.1}s ({:.2}s/step)", dt, dt / NUM_STEPS as f32);
+
+    // Debug: check final latent
+    {
+        let x_f32 = x.to_dtype(DType::F32).unwrap();
+        let data = x_f32.to_vec().unwrap();
+        let sum: f32 = data.iter().map(|v| v.abs()).sum::<f32>();
+        let mean_abs = sum / data.len() as f32;
+        println!("  [DEBUG] final latent: mean_abs={:.6}, min={:.6}, max={:.6}",
+            mean_abs,
+            data.iter().cloned().fold(f32::INFINITY, f32::min),
+            data.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
+    }
 
     // ------------------------------------------------------------------
     // Stage 4: VAE decode (Wan21 3D causal VAE)
