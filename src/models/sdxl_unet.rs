@@ -279,14 +279,23 @@ impl SDXLUNet {
     fn load_block(&mut self, prefix: &str) -> Result<()> {
         self.block_cache.clear();
         let prefix_dot = format!("{prefix}.");
-        let block_weights = load_file_filtered(&self.model_path, &self.device, |key| {
-            key.starts_with(&prefix_dot)
+        let ckpt_prefix = "model.diffusion_model.";
+        let ckpt_prefix_dot = format!("{ckpt_prefix}{prefix_dot}");
+        let raw = load_file_filtered(&self.model_path, &self.device, |key| {
+            key.starts_with(&prefix_dot) || key.starts_with(&ckpt_prefix_dot)
         })?;
+        // Strip "model.diffusion_model." prefix if present, convert to BF16
+        let mut stripped = HashMap::with_capacity(raw.len());
+        for (key, val) in raw {
+            let k = key.strip_prefix(ckpt_prefix).unwrap_or(&key).to_string();
+            let v = if val.dtype() != DType::BF16 { val.to_dtype(DType::BF16)? } else { val };
+            stripped.insert(k, v);
+        }
         println!(
             "    [offload] Loaded {} tensors for {prefix}",
-            block_weights.len()
+            stripped.len()
         );
-        self.block_cache = block_weights;
+        self.block_cache = stripped;
         Ok(())
     }
 
@@ -416,11 +425,12 @@ impl SDXLUNet {
             (1, 1)
         };
 
-        let mut conv = Conv2d::new(in_ch, out_ch, kh, stride, padding, self.device.clone())?;
+        let has_bias = self.w(&format!("{prefix}.bias")).is_ok();
+        let mut conv = Conv2d::new_with_bias(in_ch, out_ch, kh, stride, padding, self.device.clone(), has_bias)?;
         conv.copy_weight_from(w)?;
 
-        let bias_key = format!("{prefix}.bias");
-        if let Ok(b) = self.w(&bias_key) {
+        if has_bias {
+            let b = self.w(&format!("{prefix}.bias"))?;
             conv.copy_bias_from(b)?;
         }
 
@@ -828,12 +838,23 @@ impl SDXLUNet {
         path: &str,
         device: &Arc<cudarc::driver::CudaDevice>,
     ) -> Result<HashMap<String, Tensor>> {
-        load_file_filtered(path, device, |key| {
-            key.starts_with("time_embed.")
-                || key.starts_with("label_emb.")
-                || key.starts_with("input_blocks.0.0.")
-                || key.starts_with("out.")
-        })
+        // SDXL combined checkpoints prefix UNet keys with "model.diffusion_model."
+        // Strip this prefix so internal code can reference "time_embed.*" etc.
+        let prefix = "model.diffusion_model.";
+        let raw = load_file_filtered(path, device, |key| {
+            let k = key.strip_prefix(prefix).unwrap_or(key);
+            k.starts_with("time_embed.")
+                || k.starts_with("label_emb.")
+                || k.starts_with("input_blocks.0.0.")
+                || k.starts_with("out.")
+        })?;
+        let mut stripped = HashMap::with_capacity(raw.len());
+        for (key, val) in raw {
+            let k = key.strip_prefix(prefix).unwrap_or(&key).to_string();
+            let v = if val.dtype() != DType::BF16 { val.to_dtype(DType::BF16)? } else { val };
+            stripped.insert(k, v);
+        }
+        Ok(stripped)
     }
 
     /// Convenience constructor: loads resident weights and creates the UNet.

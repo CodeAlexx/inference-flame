@@ -382,9 +382,23 @@ impl LdmVAEDecoder {
         shift_factor: f32,
         device: &Arc<cudarc::driver::CudaDevice>,
     ) -> Result<Self> {
-        let w = load_file_filtered(path, device, |key| {
-            key.starts_with("decoder.") || key == "decoder.conv_in.weight"
+        // Support both standalone VAE files (decoder.*) and combined checkpoints
+        // (first_stage_model.decoder.*). Strip prefix if present.
+        let raw = load_file_filtered(path, device, |key| {
+            key.starts_with("decoder.")
+                || key.starts_with("first_stage_model.decoder.")
+                || key == "post_quant_conv.weight"
+                || key == "post_quant_conv.bias"
+                || key == "first_stage_model.post_quant_conv.weight"
+                || key == "first_stage_model.post_quant_conv.bias"
         })?;
+        // Strip "first_stage_model." prefix
+        let fsm = "first_stage_model.";
+        let mut w = HashMap::with_capacity(raw.len());
+        for (key, val) in raw {
+            let k = key.strip_prefix(fsm).unwrap_or(&key).to_string();
+            w.insert(k, val);
+        }
         println!("[LdmVAE] Loaded {} decoder weight tensors", w.len());
         Self::from_weights(w, in_channels, scaling_factor, shift_factor, device)
     }
