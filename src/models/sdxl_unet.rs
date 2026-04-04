@@ -27,8 +27,8 @@
 //! NCHW layout throughout. GroupNorm converts NCHW->NHWC internally.
 //! BF16 in/out, F32 compute in kernels.
 
-use flame_core::conv::Conv2d;
 use flame_core::cuda_kernels::CudaKernels;
+use flame_core::cuda_ops::GpuOps;
 use flame_core::group_norm::group_norm;
 use flame_core::layer_norm::layer_norm;
 use flame_core::sdpa::forward as sdpa_forward;
@@ -38,17 +38,17 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
-// Layout helpers — GroupNorm wants NHWC, Conv2d wants NCHW
+// Layout helpers — GroupNorm and Conv kernel both want NHWC; UNet data flow is NCHW
 // ---------------------------------------------------------------------------
 
-/// NCHW -> NHWC
+/// NCHW -> NHWC (GPU-optimized, avoids CPU roundtrip)
 fn to_nhwc(x: &Tensor) -> Result<Tensor> {
-    x.permute(&[0, 2, 3, 1])
+    GpuOps::permute_nchw_to_nhwc(x)
 }
 
-/// NHWC -> NCHW
+/// NHWC -> NCHW (GPU-optimized, avoids CPU roundtrip)
 fn to_nchw(x: &Tensor) -> Result<Tensor> {
-    x.permute(&[0, 3, 1, 2])
+    GpuOps::permute_nhwc_to_nchw(x)
 }
 
 /// GroupNorm on NCHW tensor (converts to NHWC internally, converts back)
@@ -279,6 +279,7 @@ impl SDXLUNet {
     // -----------------------------------------------------------------------
 
     /// Load a block's weights from disk (mmap) into GPU.
+    /// Pre-computes HWIO permutations for conv weights in this block.
     fn load_block(&mut self, prefix: &str) -> Result<()> {
         if self.all_on_gpu { return Ok(()); }
         self.block_cache.clear();
@@ -295,9 +296,24 @@ impl SDXLUNet {
             let v = if val.dtype() != DType::BF16 { val.to_dtype(DType::BF16)? } else { val };
             stripped.insert(k, v);
         }
+
+        // Pre-compute HWIO weight permutations for conv weights in this block
+        let conv_keys: Vec<String> = stripped
+            .keys()
+            .filter(|k| k.ends_with(".weight") && stripped[k.as_str()].shape().dims().len() == 4)
+            .cloned()
+            .collect();
+        for key in &conv_keys {
+            let w = &stripped[key.as_str()];
+            let w_f32 = if w.dtype() != DType::F32 { w.to_dtype(DType::F32)? } else { w.clone_result()? };
+            let w_hwio = GpuOps::weight_ocickhkw_to_khwkicoc(&w_f32)?.to_dtype(DType::BF16)?;
+            let hwio_key = key.replace(".weight", ".weight_hwio");
+            stripped.insert(hwio_key, w_hwio);
+        }
+
         println!(
-            "    [offload] Loaded {} tensors for {prefix}",
-            stripped.len()
+            "    [offload] Loaded {} tensors for {prefix} ({} conv HWIO pre-computed)",
+            stripped.len(), conv_keys.len()
         );
         self.block_cache = stripped;
         Ok(())
@@ -409,42 +425,45 @@ impl SDXLUNet {
     }
 
     // -----------------------------------------------------------------------
-    // Conv2d helper — builds Conv2d from weight HashMap on the fly
+    // Conv2d helper — uses pre-computed HWIO weights from HashMap
     // -----------------------------------------------------------------------
 
-    /// Execute a Conv2d operation directly using cached HWIO weight.
-    /// Avoids creating Conv2d struct (which duplicates weights 3-4x).
+    /// Execute a Conv2d operation directly using pre-computed HWIO weight.
+    /// Weight OIHW->HWIO permutation is done once at load time, not per-call.
     fn conv2d_forward(&self, x: &Tensor, prefix: &str) -> Result<Tensor> {
-        let w_key = format!("{prefix}.weight");
         let hwio_key = format!("{prefix}.weight_hwio");
 
-        // Use pre-computed HWIO weight if available, otherwise compute on the fly
-        let w_hwio = if let Ok(cached) = self.w(&hwio_key) {
-            cached.clone_result()?
+        // Use pre-computed HWIO weight (computed at load time).
+        // Fallback to on-the-fly permutation only if missing (shouldn't happen).
+        let w_oihw;
+        let w_hwio_ref: &Tensor = if let Ok(cached) = self.w(&hwio_key) {
+            cached
         } else {
-            let w = self.w(&w_key)?;
-            w.permute(&[2, 3, 1, 0])?.clone_result()?
+            let w = self.w(&format!("{prefix}.weight"))?;
+            let w_f32_tmp = if w.dtype() != DType::F32 { w.to_dtype(DType::F32)? } else { w.clone_result()? };
+            w_oihw = GpuOps::weight_ocickhkw_to_khwkicoc(&w_f32_tmp)?.to_dtype(DType::BF16)?;
+            &w_oihw
         };
 
-        let w = self.w(&w_key)?;
-        let w_dims = w.shape().dims().to_vec();
-        let kh = w_dims[2];
+        // Determine stride/padding from the HWIO weight shape
+        let hwio_dims = w_hwio_ref.shape().dims();
+        let kh = hwio_dims[0]; // HWIO: first dim is kernel height
 
         let (stride, padding) = if kh == 1 {
             (1, 0)
         } else if prefix.contains(".op") {
-            (2, 1)
+            (2, 1) // downsample
         } else {
-            (1, 1)
+            (1, 1) // standard 3x3
         };
 
         let bias = self.w(&format!("{prefix}.bias")).ok();
 
-        // Convert NCHW input to NHWC for the conv kernel
+        // NCHW -> NHWC (GPU kernel), conv, NHWC -> NCHW (GPU kernel)
         let x_nhwc = to_nhwc(x)?;
         let out_nhwc = flame_core::cuda_ops_bf16::conv2d_bf16(
             &x_nhwc,
-            &w_hwio,
+            w_hwio_ref,
             bias,
             (stride as i32, stride as i32),
             (padding as i32, padding as i32),
@@ -872,6 +891,19 @@ impl SDXLUNet {
             let v = if val.dtype() != DType::BF16 { val.to_dtype(DType::BF16)? } else { val };
             stripped.insert(k, v);
         }
+        // Pre-compute HWIO permutations for resident conv weights (conv_in, out.2)
+        let conv_keys: Vec<String> = stripped
+            .keys()
+            .filter(|k| k.ends_with(".weight") && stripped[k.as_str()].shape().dims().len() == 4)
+            .cloned()
+            .collect();
+        for key in &conv_keys {
+            let w = &stripped[key.as_str()];
+            let w_f32 = if w.dtype() != DType::F32 { w.to_dtype(DType::F32)? } else { w.clone_result()? };
+            let w_hwio = GpuOps::weight_ocickhkw_to_khwkicoc(&w_f32)?.to_dtype(DType::BF16)?;
+            let hwio_key = key.replace(".weight", ".weight_hwio");
+            stripped.insert(hwio_key, w_hwio);
+        }
         Ok(stripped)
     }
 
@@ -890,14 +922,39 @@ impl SDXLUNet {
 
     /// Load ALL UNet weights onto GPU (no block offloading). ~5GB VRAM.
     /// Expects a pre-extracted BF16 safetensors file with stripped keys.
+    ///
+    /// Pre-computes HWIO weight permutations for all conv layers so
+    /// `conv2d_forward` never has to permute weights at inference time.
     pub fn from_safetensors_all_gpu(
         path: &str,
         device: &Arc<cudarc::driver::CudaDevice>,
     ) -> Result<Self> {
-        let all_weights = flame_core::serialization::load_file(
+        let mut all_weights = flame_core::serialization::load_file(
             std::path::Path::new(path), device,
         )?;
         println!("[SDXLUNet] Loaded {} weight tensors (all-on-GPU)", all_weights.len());
+
+        // Pre-compute HWIO weight permutations for every conv weight.
+        // OIHW [OC,IC,KH,KW] -> HWIO [KH,KW,IC,OC] — done once, used every forward pass.
+        let conv_keys: Vec<String> = all_weights
+            .keys()
+            .filter(|k| k.ends_with(".weight") && {
+                let dims = all_weights[k.as_str()].shape().dims();
+                dims.len() == 4 // conv weights are 4D [O,I,H,W]
+            })
+            .cloned()
+            .collect();
+
+        let mut hwio_count = 0;
+        for key in &conv_keys {
+            let w = &all_weights[key.as_str()];
+            let w_f32 = if w.dtype() != DType::F32 { w.to_dtype(DType::F32)? } else { w.clone_result()? };
+            let w_hwio = GpuOps::weight_ocickhkw_to_khwkicoc(&w_f32)?.to_dtype(DType::BF16)?;
+            let hwio_key = key.replace(".weight", ".weight_hwio");
+            all_weights.insert(hwio_key, w_hwio);
+            hwio_count += 1;
+        }
+        println!("[SDXLUNet] Pre-computed {} HWIO weight permutations", hwio_count);
 
         let config = SDXLConfig::default();
         let kernels = CudaKernels::new(device.clone())?;

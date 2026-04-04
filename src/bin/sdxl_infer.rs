@@ -18,11 +18,11 @@ const VAE_PATH: &str = "/home/alex/EriDiffusion/Models/checkpoints/sd_xl_base_1.
 const DEFAULT_EMB_PATH: &str = "/home/alex/EriDiffusion/inference-flame/output/sdxl_embeddings.safetensors";
 const OUTPUT_PATH: &str = "/home/alex/EriDiffusion/inference-flame/output/sdxl_rust.png";
 
-const NUM_STEPS: usize = 2;
+const NUM_STEPS: usize = 30;
 const CFG_SCALE: f32 = 7.5;
 const SEED: u64 = 42;
-const WIDTH: usize = 128;
-const HEIGHT: usize = 128;
+const WIDTH: usize = 1024;
+const HEIGHT: usize = 1024;
 
 // SDXL uses discrete noise schedule (beta_start=0.00085, beta_end=0.012, 1000 steps)
 // Returns (sigmas, timesteps) — sigmas for Euler stepping, timesteps for UNet input
@@ -31,9 +31,13 @@ fn build_sdxl_schedule(num_steps: usize) -> (Vec<f32>, Vec<f32>) {
     let beta_start: f64 = 0.00085;
     let beta_end: f64 = 0.012;
 
-    // Linear beta schedule → cumulative alpha → sigma
+    // Scaled-linear beta schedule (SDXL default: beta_schedule="scaled_linear")
     let betas: Vec<f64> = (0..num_train_steps)
-        .map(|i| beta_start + (beta_end - beta_start) * i as f64 / (num_train_steps - 1) as f64)
+        .map(|i| {
+            let v = beta_start.sqrt()
+                + (beta_end.sqrt() - beta_start.sqrt()) * i as f64 / (num_train_steps - 1) as f64;
+            v * v
+        })
         .collect();
 
     let mut alphas_cumprod = Vec::with_capacity(num_train_steps);
@@ -43,17 +47,19 @@ fn build_sdxl_schedule(num_steps: usize) -> (Vec<f32>, Vec<f32>) {
         alphas_cumprod.push(prod);
     }
 
-    // Pick evenly spaced timesteps (EulerDiscreteScheduler default)
-    let step_ratio = num_train_steps as f64 / num_steps as f64;
+    // Leading timestep spacing with steps_offset=1 (SDXL EulerDiscreteScheduler default)
+    let step_ratio = num_train_steps / num_steps; // integer division
+    let mut ts: Vec<usize> = (0..num_steps).map(|i| i * step_ratio + 1).collect();
+    ts.reverse(); // high noise first
+
     let mut sigmas = Vec::with_capacity(num_steps + 1);
     let mut timesteps = Vec::with_capacity(num_steps);
-    for i in 0..num_steps {
-        let t = (num_train_steps as f64 - 1.0 - i as f64 * step_ratio).round() as usize;
+    for &t in &ts {
         let t = t.min(num_train_steps - 1);
         let alpha = alphas_cumprod[t];
         let sigma = ((1.0 - alpha) / alpha).sqrt();
         sigmas.push(sigma as f32);
-        timesteps.push(t as f32); // discrete timestep for UNet sinusoidal embedding
+        timesteps.push(t as f32);
     }
     sigmas.push(0.0);
     (sigmas, timesteps)
@@ -130,10 +136,11 @@ fn main() -> anyhow::Result<()> {
     println!("  sigma_max={:.4}, sigma_min={:.6}", sigmas[0], sigmas[NUM_STEPS - 1]);
     println!("  timestep_max={:.0}, timestep_min={:.0}", timesteps[0], timesteps[NUM_STEPS - 1]);
 
-    // Initialize x = noise * sigma_max (Karras-style init)
+    // Initialize x = noise * init_noise_sigma (sqrt(sigma_max^2 + 1) per diffusers)
+    let init_sigma = (sigmas[0] * sigmas[0] + 1.0).sqrt();
     let mut x = Tensor::from_f32_to_bf16(
         noise_data, Shape::from_dims(&[1, 4, latent_h, latent_w]), device.clone(),
-    )?.mul_scalar(sigmas[0])?;
+    )?.mul_scalar(init_sigma)?;
 
     let t0 = Instant::now();
     for i in 0..NUM_STEPS {
