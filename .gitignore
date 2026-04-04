@@ -1,8 +1,4 @@
 /target/
 /output/
 *.py
-*.md
-!README.md
 *.safetensors
-*.png
-*.jpg
