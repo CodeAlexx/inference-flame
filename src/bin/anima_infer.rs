@@ -2,11 +2,10 @@
 //!
 //! Usage: anima_infer [path_to_cached_embeddings.safetensors]
 //!
-//! Cached embeddings contain Qwen3 0.6B hidden states + token IDs.
+//! Cached embeddings contain Qwen3 0.6B hidden states + T5 token IDs.
 //! Model is 3.9GB — loads entirely to GPU (no block offloading).
 
 use inference_flame::models::anima::{Anima, load_all_weights};
-use inference_flame::vae::Wan21VaeDecoder;
 use flame_core::{global_cuda_device, DType, Shape, Tensor};
 use std::time::Instant;
 
@@ -15,28 +14,12 @@ const DEFAULT_EMB_PATH: &str = "/home/alex/EriDiffusion/inference-flame/output/a
 const VAE_PATH: &str = "/home/alex/EriDiffusion/Models/anima/split_files/vae/qwen_image_vae.safetensors";
 const OUTPUT_PATH: &str = "/home/alex/EriDiffusion/inference-flame/output/anima_rust.png";
 
-// Discrete flow matching with shift=3.0 (same as Flux)
+// Rectified flow: linear sigma schedule, no shift at inference
 const NUM_STEPS: usize = 30;
 const CFG_SCALE: f32 = 4.5;
-const SHIFT: f32 = 3.0;
 const SEED: u64 = 42;
 const WIDTH: usize = 512;
 const HEIGHT: usize = 512;
-
-/// Discrete flow matching schedule with time shifting (same as Flux).
-fn build_cosmos_schedule(num_steps: usize, shift: f32) -> Vec<f32> {
-    let mut t: Vec<f32> = (0..=num_steps)
-        .map(|i| 1.0 - i as f32 / num_steps as f32)
-        .collect();
-    if (shift - 1.0).abs() > f32::EPSILON {
-        for v in t.iter_mut() {
-            if *v > 0.0 && *v < 1.0 {
-                *v = shift * *v / (1.0 + (shift - 1.0) * *v);
-            }
-        }
-    }
-    t
-}
 
 fn main() -> anyhow::Result<()> {
     env_logger::init();
@@ -108,7 +91,10 @@ fn main() -> anyhow::Result<()> {
         v
     };
 
-    let timesteps = build_cosmos_schedule(NUM_STEPS, SHIFT);
+    // Linear schedule: sigma from 1.0 to 0.0, NO shift at inference
+    let sigmas: Vec<f32> = (0..=NUM_STEPS)
+        .map(|i| 1.0 - i as f32 / NUM_STEPS as f32)
+        .collect();
 
     println!("\n--- Stage 3: Denoise ({} steps, CFG={}) ---", NUM_STEPS, CFG_SCALE);
     println!("  Latent: [1, {}, {}, {}, 16]", t_frames, latent_h, latent_w);
@@ -122,16 +108,13 @@ fn main() -> anyhow::Result<()> {
     let t0 = Instant::now();
     for i in 0..NUM_STEPS {
         let step_t = Instant::now();
-        let t_curr = timesteps[i];
-        let t_prev = timesteps[i + 1];
+        let sigma = sigmas[i];
+        let sigma_next = sigmas[i + 1];
 
-        // ComfyUI ModelSamplingDiscreteFlow: timestep = sigma * multiplier (1000)
+        // Timestep is raw sigma value [0, 1] — NOT multiplied by 1000
         let t_vec = Tensor::from_f32_to_bf16(
-            vec![t_curr * 1000.0], Shape::from_dims(&[1]), device.clone(),
+            vec![sigma], Shape::from_dims(&[1]), device.clone(),
         )?;
-
-        // Discrete flow matching (like Flux): direct velocity prediction
-        // Model predicts velocity v, x_next = x + dt * v
 
         // Conditional + unconditional predictions (context is pre-cached)
         let pred_cond = model.forward_with_context(&x, &t_vec, &context_cond)?;
@@ -141,53 +124,37 @@ fn main() -> anyhow::Result<()> {
         let diff = pred_cond.sub(&pred_uncond)?;
         let pred = pred_uncond.add(&diff.mul_scalar(CFG_SCALE)?)?;
 
-        // Euler step: x = x + dt * pred
-        let dt = t_prev - t_curr;
+        // Euler step: x = x + dt * pred (rectified flow velocity)
+        let dt = sigma_next - sigma;
         x = x.add(&pred.mul_scalar(dt)?)?;
 
-        // Debug: check prediction magnitude
-        if i == 0 {
-            let pred_f32 = pred.to_dtype(DType::F32).unwrap();
-            let pred_data = pred_f32.to_vec().unwrap();
-            let sum: f32 = pred_data.iter().map(|x| x.abs()).sum::<f32>();
-            let mean_abs = sum / pred_data.len() as f32;
-            println!("  [DEBUG] step 0 pred: mean_abs={:.6}, min={:.6}, max={:.6}",
-                mean_abs,
-                pred_data.iter().cloned().fold(f32::INFINITY, f32::min),
-                pred_data.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
-        }
-
         let step_ms = step_t.elapsed().as_millis();
-        if i == 0 || i % 5 == 4 || i == NUM_STEPS - 1 {
-            println!("  Step {}/{}: t={:.4} ({:.0}ms)", i + 1, NUM_STEPS, t_curr, step_ms);
+        if i == 0 || i % 10 == 9 || i == NUM_STEPS - 1 {
+            // Debug: check prediction magnitude on step 0
+            if i == 0 {
+                let pred_f32 = pred.to_dtype(DType::F32)?;
+                let data = pred_f32.to_vec()?;
+                let mean_abs: f32 = data.iter().map(|v| v.abs()).sum::<f32>() / data.len() as f32;
+                println!("  Step {}/{}: sigma={:.4} ({:.0}ms) pred_mean_abs={:.4}",
+                    i + 1, NUM_STEPS, sigma, step_ms, mean_abs);
+            } else {
+                println!("  Step {}/{}: sigma={:.4} ({:.0}ms)", i + 1, NUM_STEPS, sigma, step_ms);
+            }
         }
     }
 
     let dt = t0.elapsed().as_secs_f32();
     println!("  Denoise: {:.1}s ({:.2}s/step)", dt, dt / NUM_STEPS as f32);
 
-    // Debug: check final latent
-    {
-        let x_f32 = x.to_dtype(DType::F32).unwrap();
-        let data = x_f32.to_vec().unwrap();
-        let sum: f32 = data.iter().map(|v| v.abs()).sum::<f32>();
-        let mean_abs = sum / data.len() as f32;
-        println!("  [DEBUG] final latent: mean_abs={:.6}, min={:.6}, max={:.6}",
-            mean_abs,
-            data.iter().cloned().fold(f32::INFINITY, f32::min),
-            data.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
-    }
-
     // ------------------------------------------------------------------
-    // Stage 4: Save latent for external VAE decode
-    // (Wan21 Conv3d in flame-core is broken — use Python VAE for now)
+    // Stage 4: Save latent for Python VAE decode
     // ------------------------------------------------------------------
-    println!("\n--- Stage 4: Save latent + VAE Decode ---");
+    println!("\n--- Stage 4: Save latent ---");
     let t0 = Instant::now();
-    drop(model); // Free DiT VRAM
+    drop(model);
 
     // Anima latent is [B, T=1, H, W, 16] → need [B, 16, T, H, W] for VAE
-    let latent = x.permute(&[0, 4, 1, 2, 3])?; // [1, 16, 1, H/8, W/8]
+    let latent = x.permute(&[0, 4, 1, 2, 3])?;
     println!("  Latent for VAE: {:?}", latent.dims());
 
     // Save latent as safetensors for Python VAE decode
@@ -200,48 +167,11 @@ fn main() -> anyhow::Result<()> {
         println!("  Saved latent to {}", latent_path);
     }
 
-    // Try Rust VAE (known broken — Conv3d issue), fall back to noting the Python path
-    let vae_result = (|| -> anyhow::Result<()> {
-        let vae = Wan21VaeDecoder::load(VAE_PATH, &device)?;
-        let rgb = vae.decode(&latent)?;
-        let rgb_dims = rgb.dims().to_vec();
-        let (out_t, out_h, out_w) = (rgb_dims[2], rgb_dims[3], rgb_dims[4]);
-
-        let frame = if out_t > 1 {
-            rgb.narrow(2, 0, 1)?.reshape(&[1, 3, out_h, out_w])?
-        } else {
-            rgb.reshape(&[1, 3, out_h, out_w])?
-        };
-
-        let frame_f32 = frame.to_dtype(DType::F32)?;
-        let data = frame_f32.to_vec()?;
-
-        let mut pixels = vec![0u8; out_h * out_w * 3];
-        for y in 0..out_h {
-            for px in 0..out_w {
-                for c in 0..3 {
-                    let idx = c * out_h * out_w + y * out_w + px;
-                    let val = ((data[idx] + 1.0) * 127.5).clamp(0.0, 255.0) as u8;
-                    pixels[(y * out_w + px) * 3 + c] = val;
-                }
-            }
-        }
-
-        image::RgbImage::from_raw(out_w as u32, out_h as u32, pixels)
-            .ok_or_else(|| anyhow::anyhow!("Image creation failed"))?
-            .save(OUTPUT_PATH)?;
-        Ok(())
-    })();
-
-    if let Err(e) = vae_result {
-        println!("  Rust VAE failed: {}", e);
-        println!("  Run Python VAE: python decode_anima_latent.py {}", latent_path);
-    }
-
+    // Decode with Python: python decode_anima_latent.py
+    println!("  Run: python decode_anima_latent.py {}", latent_path);
     println!("  Stage 4 in {:.1}s", t0.elapsed().as_secs_f32());
 
     println!("\n============================================================");
-    println!("IMAGE SAVED: {}", OUTPUT_PATH);
     println!("Total: {:.1}s", t_total.elapsed().as_secs_f32());
     println!("============================================================");
 

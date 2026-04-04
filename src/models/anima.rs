@@ -344,9 +344,9 @@ impl Anima {
         let q = self.rms_norm_per_head_bhsd(&q, &format!("{prefix}.q_norm.weight"))?;
         let k = self.rms_norm_per_head_bhsd(&k, &format!("{prefix}.k_norm.weight"))?;
 
-        // Apply 3D RoPE using fused CUDA kernel (interleaved pairs)
-        let q = flame_core::bf16_ops::rope_fused_bf16(&q, rope_cos, rope_sin)?;
-        let k = flame_core::bf16_ops::rope_fused_bf16(&k, rope_cos, rope_sin)?;
+        // Apply 3D RoPE using fused CUDA kernel (half-split convention)
+        let q = flame_core::bf16_ops::rope_halfsplit_bf16(&q, rope_cos, rope_sin)?;
+        let k = flame_core::bf16_ops::rope_halfsplit_bf16(&k, rope_cos, rope_sin)?;
 
         // Scaled dot-product attention
         let out = sdpa(&q, &k, &v, None)?;
@@ -872,15 +872,15 @@ fn apply_rope_cossin(
     let cos = rope_cos.reshape(&[1, s, 1, half_d])?;
     let sin = rope_sin.reshape(&[1, s, 1, half_d])?;
 
-    // rotate_half: (x1 * cos - x2 * sin, x1 * sin + x2 * cos)
+    // Half-split rotate: out[:D/2] = x1*cos - x2*sin, out[D/2:] = x2*cos + x1*sin
     let new_x1 = x1.mul(&cos)?.sub(&x2.mul(&sin)?)?;
-    let new_x2 = x1.mul(&sin)?.add(&x2.mul(&cos)?)?;
+    let new_x2 = x2.mul(&cos)?.add(&x1.mul(&sin)?)?;
 
-    // Concatenate back along last dim
-    let new_x1_exp = new_x1.unsqueeze(4)?; // [B, S, H, D/2, 1]
-    let new_x2_exp = new_x2.unsqueeze(4)?;
-    let stacked = Tensor::cat(&[&new_x1_exp, &new_x2_exp], 4)?; // [B, S, H, D/2, 2]
-    stacked.reshape(&[b, s, h, d])
+    // Concatenate halves back along last dim (NOT interleaved)
+    let flat1 = new_x1.reshape(&[b * s * h, half_d])?;
+    let flat2 = new_x2.reshape(&[b * s * h, half_d])?;
+    let result = Tensor::cat(&[&flat1, &flat2], 1)?;
+    result.reshape(&[b, s, h, d])
 }
 
 /// Build 3D RoPE rotation matrices for MiniTrainDIT self-attention.
@@ -1021,9 +1021,10 @@ fn build_3d_rope_cossin(
     let bins_h = dim_h / 2;
     let bins_w = dim_w / 2;
 
+    // Extrapolation ratios: 3.0 for in_channels=17 (16 latent + 1 padding mask)
     let base_theta: f64 = 10000.0;
-    let h_ntk = 4.0f64.powf(dim_h as f64 / (dim_h as f64 - 2.0));
-    let w_ntk = 4.0f64.powf(dim_w as f64 / (dim_w as f64 - 2.0));
+    let h_ntk = 3.0f64.powf(dim_h as f64 / (dim_h as f64 - 2.0));
+    let w_ntk = 3.0f64.powf(dim_w as f64 / (dim_w as f64 - 2.0));
     let t_ntk = 1.0f64.powf(dim_t as f64 / (dim_t as f64 - 2.0));
     let theta_h = (base_theta * h_ntk) as f32;
     let theta_w = (base_theta * w_ntk) as f32;
@@ -1039,51 +1040,81 @@ fn build_3d_rope_cossin(
         .map(|i| 1.0 / theta_w.powf((2 * i) as f32 / dim_w as f32))
         .collect();
 
-    let mut cos_data = vec![0.0f32; total_seq * half_d];
-    let mut sin_data = vec![0.0f32; total_seq * half_d];
+    // Build angle values for each position: [T_angles, H_angles, W_angles]
+    // Then DOUBLE them: [angles, angles] to produce head_dim-sized freq tensor
+    // This is how Cosmos/Anima does it — apply_rotary_pos_emb uses half-split,
+    // computing cos(freqs) and sin(freqs) where freqs has shape [S, head_dim].
+    // The first half and second half of freqs are identical angle values.
+    let mut cos_data = vec![0.0f32; total_seq * half_d * 2]; // doubled: head_dim
+    let mut sin_data = vec![0.0f32; total_seq * half_d * 2];
 
     for tf in 0..t_frames {
         for ih in 0..nh {
             for iw in 0..nw {
                 let seq_idx = tf * nh * nw + ih * nw + iw;
-                let base = seq_idx * half_d;
-                let mut dim_offset = 0;
+                // Two copies: [0..half_d) and [half_d..head_dim)
+                for copy in 0..2 {
+                    let base = seq_idx * (half_d * 2) + copy * half_d;
+                    let mut dim_offset = 0;
 
-                // Cosmos rotation matrix convention: [[cos, sin], [-sin, cos]]
-                // rope_fused_bf16 applies: out_even = cos*x_even - sin*x_odd
-                // To match Cosmos: out_even = cos*x_even + sin*x_odd
-                // Solution: negate sin so kernel does cos*even - (-sin)*odd = cos*even + sin*odd
-                for (fi, &freq) in freqs_t.iter().enumerate() {
-                    let angle = (tf as f32) * freq;
-                    cos_data[base + dim_offset + fi] = angle.cos();
-                    sin_data[base + dim_offset + fi] = -angle.sin(); // negated for Cosmos convention
-                }
-                dim_offset += bins_t;
+                    for (fi, &freq) in freqs_t.iter().enumerate() {
+                        let angle = (tf as f32) * freq;
+                        cos_data[base + dim_offset + fi] = angle.cos();
+                        sin_data[base + dim_offset + fi] = angle.sin();
+                    }
+                    dim_offset += bins_t;
 
-                for (fi, &freq) in freqs_h.iter().enumerate() {
-                    let angle = (ih as f32) * freq;
-                    cos_data[base + dim_offset + fi] = angle.cos();
-                    sin_data[base + dim_offset + fi] = -angle.sin();
-                }
-                dim_offset += bins_h;
+                    for (fi, &freq) in freqs_h.iter().enumerate() {
+                        let angle = (ih as f32) * freq;
+                        cos_data[base + dim_offset + fi] = angle.cos();
+                        sin_data[base + dim_offset + fi] = angle.sin();
+                    }
+                    dim_offset += bins_h;
 
-                for (fi, &freq) in freqs_w.iter().enumerate() {
-                    let angle = (iw as f32) * freq;
-                    cos_data[base + dim_offset + fi] = angle.cos();
-                    sin_data[base + dim_offset + fi] = -angle.sin();
+                    for (fi, &freq) in freqs_w.iter().enumerate() {
+                        let angle = (iw as f32) * freq;
+                        cos_data[base + dim_offset + fi] = angle.cos();
+                        sin_data[base + dim_offset + fi] = angle.sin();
+                    }
                 }
             }
         }
     }
 
+    // rope_halfsplit_bf16 expects cos/sin shape [1, 1, S, D/2] where D = head_dim
+    // But our cos_data is [S, head_dim] = [S, 2*half_d]
+    // rope_halfsplit_bf16 expects D/2 = head_dim/2 = half_d
+    // So we pass [1, 1, S, half_d] — the kernel will apply half-split on head_dim
+    // Wait — rope_halfsplit_bf16 takes [B,H,N,D] input and [1,1,N,D/2] cos/sin
+    // With D=head_dim=128, D/2=64=half_d. The cos/sin should contain the
+    // angle values for the first half of head_dim.
+    //
+    // Actually, the Cosmos code builds freqs as [S, head_dim] with doubled angles,
+    // then in apply_rotary_pos_emb_base it does cos(freqs) for ALL head_dim.
+    // The half-split then uses cos[:half] and sin[:half] for the rotation.
+    // Since the two halves are identical, we just need [S, half_d] cos/sin.
+    //
+    // rope_halfsplit_bf16 already handles this correctly:
+    // out[0..D/2] = x[0..D/2]*cos - x[D/2..D]*sin
+    // out[D/2..D] = x[D/2..D]*cos + x[0..D/2]*sin
+    // So we just need cos/sin of the angle values (half_d each).
+
+    // Take first half of the doubled data (they're identical)
+    let cos_half: Vec<f32> = cos_data.chunks(half_d * 2)
+        .flat_map(|chunk| chunk[..half_d].iter().copied())
+        .collect();
+    let sin_half: Vec<f32> = sin_data.chunks(half_d * 2)
+        .flat_map(|chunk| chunk[..half_d].iter().copied())
+        .collect();
+
     let cos = Tensor::from_vec_dtype(
-        cos_data,
+        cos_half,
         Shape::from_dims(&[1, 1, total_seq, half_d]),
         device.clone(),
         DType::BF16,
     )?;
     let sin = Tensor::from_vec_dtype(
-        sin_data,
+        sin_half,
         Shape::from_dims(&[1, 1, total_seq, half_d]),
         device.clone(),
         DType::BF16,
