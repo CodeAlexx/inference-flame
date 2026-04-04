@@ -1,0 +1,69 @@
+[package]
+name = "inference-flame"
+version = "0.1.0"
+authors = ["Alex"]
+edition = "2021"
+license = "MIT"
+description = "Pure Rust diffusion model inference using flame-core"
+
+[dependencies]
+flame-core = { path = "../flame-core", default-features = false, features = ["cuda", "bf16_u16", "cudnn"] }
+cudarc = { version = "0.11.9", default-features = false, features = ["driver", "cublas", "cublaslt", "nvrtc", "cuda-12050", "f16"] }
+half = { version = "2.3", features = ["num-traits"] }
+serde_json = "1.0"
+memmap2 = "0.9"
+anyhow = "1.0"
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+env_logger = "0.10"
+rand = "0.8.5"
+log = "0.4"
+image = "0.24"
+
+[features]
+default = ["cuda", "bf16_u16"]
+cuda = []
+bf16_u16 = []
+
+[[bin]]
+name = "zimage_infer"
+path = "src/bin/zimage_infer.rs"
+
+[[bin]]
+name = "klein_infer"
+path = "src/bin/klein_infer.rs"
+
+[[bin]]
+name = "sd3_infer"
+path = "src/bin/sd3_infer.rs"
+
+[[bin]]
+name = "sdxl_infer"
+path = "src/bin/sdxl_infer.rs"
+
+[[bin]]
+name = "klein9b_infer"
+path = "src/bin/klein9b_infer.rs"
+
+[[bin]]
+name = "debug_encoder"
+path = "src/bin/debug_encoder.rs"
+
+[[bin]]
+name = "klein9b_encode"
+path = "src/bin/klein9b_encode.rs"
+
+[[bin]]
+name = "klein9b_compare"
+path = "src/bin/klein9b_compare.rs"
+
+[[bin]]
+name = "ltx2_generate"
+path = "src/bin/ltx2_generate.rs"
+
+[[bin]]
+name = "ltx2_load_test"
+path = "src/bin/ltx2_load_test.rs"
+
+[[bin]]
+name = "ltx2_vae_test"
+path = "src/bin/ltx2_vae_test.rs"
