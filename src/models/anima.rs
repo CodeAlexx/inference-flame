@@ -210,11 +210,10 @@ impl Anima {
             DType::BF16,
         )?;
 
-        // hidden = SiLU(Linear(emb))  [B, 2048]
-        let hidden = self.linear_with_bias(
+        // hidden = SiLU(Linear(emb))  [B, 2048] — no bias (use_adaln_lora=True)
+        let hidden = self.linear_no_bias(
             &emb,
             "net.t_embedder.1.linear_1.weight",
-            "net.t_embedder.1.linear_1.bias",
         )?;
         let hidden = hidden.silu()?;
 
@@ -623,7 +622,14 @@ impl Anima {
             let k =
                 self.rms_norm_per_head(&k, &format!("{bp}.cross_attn.k_norm.weight"))?;
 
-            // No RoPE on cross-attention
+            // Cross-attention RoPE: Q gets target positions, K gets context positions
+            let (q_cos, q_sin) =
+                build_1d_rope(seq_len, head_dim, self.config.rope_theta, &self.device)?;
+            let (k_cos, k_sin) =
+                build_1d_rope(seq_llm, head_dim, self.config.rope_theta, &self.device)?;
+            let q = apply_rope_cossin(&q, &q_cos, &q_sin)?;
+            let k = apply_rope_cossin(&k, &k_cos, &k_sin)?;
+
             let q = q.permute(&[0, 2, 1, 3])?;
             let k = k.permute(&[0, 2, 1, 3])?;
             let v = v.permute(&[0, 2, 1, 3])?;
@@ -872,29 +878,45 @@ fn build_3d_rope_rotation_matrix(
     let half_d = head_dim / 2; // 64
     let total_seq = t_frames * nh * nw;
 
-    // Split frequency dimensions across axes: t, h, w
-    // Common split for video models: even distribution or proportional
-    // With D/2=64 and 3 axes, we use roughly 1/3 each, but let's match
-    // the Cosmos convention. For 64 dims across 3 axes:
-    // temporal: 16, height: 24, width: 24 (or similar)
-    // Using even split: 22, 21, 21 won't divide evenly.
-    // Let's use: t=16, h=24, w=24 to sum to 64.
-    let dims_t: usize = 16;
-    let dims_h: usize = 24;
-    let dims_w: usize = 24;
-    assert_eq!(dims_t + dims_h + dims_w, half_d);
+    // Cosmos 3D RoPE dimension split (matches position_embedding.py:81-83):
+    //   dim = head_dim = 128 (full, not half)
+    //   dim_h = dim // 6 * 2 = 42
+    //   dim_w = dim_h = 42
+    //   dim_t = dim - 2*dim_h = 44
+    // Each axis uses dim_x/2 frequency bins:
+    //   t: 22 bins, h: 21 bins, w: 21 bins → total 64 = half_d ✓
+    let full_d = half_d * 2; // 128
+    let dim_h: usize = full_d / 6 * 2; // 42
+    let dim_w: usize = dim_h;           // 42
+    let dim_t: usize = full_d - 2 * dim_h; // 44
+    let bins_t = dim_t / 2; // 22
+    let bins_h = dim_h / 2; // 21
+    let bins_w = dim_w / 2; // 21
+    assert_eq!(bins_t + bins_h + bins_w, half_d);
 
-    let theta: f32 = 10000.0;
+    // NTK-scaled theta per axis (matches position_embedding.py:96-129):
+    // h/w extrapolation_ratio = 4.0 (for 16ch model), t = 1.0
+    let base_theta: f64 = 10000.0;
+    let h_extrapolation_ratio: f64 = 4.0;
+    let w_extrapolation_ratio: f64 = 4.0;
+    let t_extrapolation_ratio: f64 = 1.0;
+    let h_ntk = h_extrapolation_ratio.powf(dim_h as f64 / (dim_h as f64 - 2.0));
+    let w_ntk = w_extrapolation_ratio.powf(dim_w as f64 / (dim_w as f64 - 2.0));
+    let t_ntk = t_extrapolation_ratio.powf(dim_t as f64 / (dim_t as f64 - 2.0));
+    let theta_h = (base_theta * h_ntk) as f32;
+    let theta_w = (base_theta * w_ntk) as f32;
+    let theta_t = (base_theta * t_ntk) as f32;
 
-    // Precompute frequencies for each axis
-    let freqs_t: Vec<f32> = (0..dims_t)
-        .map(|i| 1.0 / theta.powf(2.0 * (i as f32) / (2 * dims_t) as f32))
+    // Frequency exponents: arange(0, dim_x, 2)[:dim_x//2] / dim_x
+    // Then freq = 1.0 / (theta ^ exponent)
+    let freqs_t: Vec<f32> = (0..bins_t)
+        .map(|i| 1.0 / theta_t.powf((2 * i) as f32 / dim_t as f32))
         .collect();
-    let freqs_h: Vec<f32> = (0..dims_h)
-        .map(|i| 1.0 / theta.powf(2.0 * (i as f32) / (2 * dims_h) as f32))
+    let freqs_h: Vec<f32> = (0..bins_h)
+        .map(|i| 1.0 / theta_h.powf((2 * i) as f32 / dim_h as f32))
         .collect();
-    let freqs_w: Vec<f32> = (0..dims_w)
-        .map(|i| 1.0 / theta.powf(2.0 * (i as f32) / (2 * dims_w) as f32))
+    let freqs_w: Vec<f32> = (0..bins_w)
+        .map(|i| 1.0 / theta_w.powf((2 * i) as f32 / dim_w as f32))
         .collect();
 
     // Build rotation matrices: [total_seq, half_d, 2, 2]
@@ -909,7 +931,7 @@ fn build_3d_rope_rotation_matrix(
 
                 let mut dim_offset = 0;
 
-                // Temporal frequencies
+                // Temporal frequencies (22 bins)
                 for (fi, &freq) in freqs_t.iter().enumerate() {
                     let angle = (tf as f32) * freq;
                     let c = angle.cos();
@@ -920,9 +942,9 @@ fn build_3d_rope_rotation_matrix(
                     rot_data[off + 2] = s;  // [1,0]
                     rot_data[off + 3] = c;  // [1,1]
                 }
-                dim_offset += dims_t;
+                dim_offset += bins_t;
 
-                // Height frequencies
+                // Height frequencies (21 bins)
                 for (fi, &freq) in freqs_h.iter().enumerate() {
                     let angle = (ih as f32) * freq;
                     let c = angle.cos();
@@ -933,9 +955,9 @@ fn build_3d_rope_rotation_matrix(
                     rot_data[off + 2] = s;
                     rot_data[off + 3] = c;
                 }
-                dim_offset += dims_h;
+                dim_offset += bins_h;
 
-                // Width frequencies
+                // Width frequencies (21 bins)
                 for (fi, &freq) in freqs_w.iter().enumerate() {
                     let angle = (iw as f32) * freq;
                     let c = angle.cos();
