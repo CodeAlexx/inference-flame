@@ -13,7 +13,7 @@ use flame_core::{global_cuda_device, DType, Shape, Tensor};
 use std::time::Instant;
 
 const MODEL_PATH: &str =
-    "/home/alex/.serenity/models/checkpoints/ltx-2.3-22b-distilled.safetensors";
+    "/home/alex/.serenity/models/checkpoints/ltx-2.3-22b-dev-fp8.safetensors";
 const EMBEDDINGS_PATH: &str =
     "/home/alex/EriDiffusion/inference-flame/cached_ltx2_embeddings.safetensors";
 const OUTPUT_PATH: &str =
@@ -68,8 +68,15 @@ fn main() -> anyhow::Result<()> {
     let config = LTX2Config::default();
     let mut model = LTX2StreamingModel::load_globals(MODEL_PATH, &config)?;
     println!("  Global params loaded in {:.1}s", t0.elapsed().as_secs_f32());
-    model.init_swap()?;
-    println!("  FlameSwap initialized in {:.1}s", t0.elapsed().as_secs_f32());
+    // Try FP8 resident first (fast, no I/O), fall back to FlameSwap
+    match model.load_fp8_resident() {
+        Ok(()) => println!("  FP8 resident loaded in {:.1}s", t0.elapsed().as_secs_f32()),
+        Err(e) => {
+            println!("  FP8 resident failed ({e}), falling back to FlameSwap");
+            model.init_swap()?;
+            println!("  FlameSwap initialized in {:.1}s", t0.elapsed().as_secs_f32());
+        }
+    }
 
     // Stage 3: Noise + schedule
     println!("\n--- Stage 3: Prepare noise + sigmas ---");

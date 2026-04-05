@@ -1917,6 +1917,8 @@ pub struct LTX2StreamingModel {
     /// Pre-cached F32 tensors per block (scale_shift_table etc.)
     /// Loaded once at init_swap to avoid BF16 precision loss.
     pub f32_cache: Vec<HashMap<String, Tensor>>,
+    /// FP8-resident blocks: all weights on GPU, dequant per-block during forward.
+    fp8_blocks: Vec<super::fp8_resident::ResidentBlock>,
 }
 
 impl LTX2StreamingModel {
@@ -2035,6 +2037,7 @@ impl LTX2StreamingModel {
             swap: None,
             key_prefix: prefix,
             f32_cache: Vec::new(),
+            fp8_blocks: Vec::new(),
         })
     }
 
@@ -2057,6 +2060,116 @@ impl LTX2StreamingModel {
                 (stripped, v)
             })
             .collect())
+    }
+
+    /// Load all block weights to GPU as raw FP8/BF16 bytes.
+    /// ~12-16GB on GPU. No disk I/O during inference.
+    pub fn load_fp8_resident(&mut self) -> Result<()> {
+        use super::fp8_resident::{RawWeight, ResidentBlock};
+        use cudarc::driver::DevicePtr;
+
+        let device = flame_core::global_cuda_device();
+        let t0 = std::time::Instant::now();
+        let prefix = self.key_prefix.clone();
+        let num_layers = self.config.num_layers;
+
+        log::info!("[LTX2] Loading FP8 resident ({} blocks)...", num_layers);
+
+        // Parse checkpoint header
+        let file = std::fs::File::open(&self.checkpoint_path)
+            .map_err(|e| flame_core::Error::Io(format!("open: {e}")))?;
+        let mmap = unsafe { memmap2::Mmap::map(&file) }
+            .map_err(|e| flame_core::Error::Io(format!("mmap: {e}")))?;
+        let header_len = u64::from_le_bytes(mmap[..8].try_into().unwrap()) as usize;
+        let header: serde_json::Value = serde_json::from_slice(&mmap[8..8 + header_len])
+            .map_err(|e| flame_core::Error::Io(format!("header parse: {e}")))?;
+        let data_start = 8 + header_len;
+        let meta = header.as_object().ok_or_else(||
+            flame_core::Error::InvalidInput("Invalid header".into()))?;
+
+        // Build scale map
+        let mut scale_map: HashMap<String, f32> = HashMap::new();
+        for (k, v) in meta {
+            if k.ends_with("_scale") && v["shape"].as_array().map(|a| a.is_empty()).unwrap_or(false) {
+                let offsets = v["data_offsets"].as_array().unwrap();
+                let s = data_start + offsets[0].as_u64().unwrap() as usize;
+                let scale = f32::from_le_bytes([mmap[s], mmap[s+1], mmap[s+2], mmap[s+3]]);
+                let target = k[..k.len()-6].to_string();
+                scale_map.insert(target, scale);
+            }
+        }
+
+        let mut blocks = Vec::with_capacity(num_layers);
+        let mut total_gpu_bytes = 0usize;
+
+        for block_idx in 0..num_layers {
+            let block_prefix = format!("{prefix}transformer_blocks.{block_idx}.");
+            let mut weights = HashMap::new();
+            let mut f32_tensors = HashMap::new();
+
+            for (k, v) in meta {
+                if k == "__metadata__" || !k.starts_with(&block_prefix) { continue; }
+                if k.contains("audio") && !k.contains("audio_to_video") { continue; }
+                if k.contains("video_to_audio") { continue; }
+                if k.ends_with("_scale") || k.ends_with("input_scale") { continue; }
+
+                let dtype = v["dtype"].as_str().unwrap_or("?");
+                let shape: Vec<usize> = v["shape"].as_array().unwrap_or(&vec![])
+                    .iter().filter_map(|s| s.as_u64().map(|u| u as usize)).collect();
+                let numel: usize = shape.iter().product();
+                let offsets = v["data_offsets"].as_array().unwrap();
+                let start = data_start + offsets[0].as_u64().unwrap() as usize;
+                let end = data_start + offsets[1].as_u64().unwrap() as usize;
+                let stripped = k.strip_prefix(&prefix).unwrap_or(k).to_string();
+
+                match dtype {
+                    "F8_E4M3" => {
+                        let scale = scale_map.get(k).copied().unwrap_or(1.0);
+                        let bytes = &mmap[start..end];
+                        let gpu: cudarc::driver::CudaSlice<u8> = device.htod_copy(bytes.to_vec())
+                            .map_err(|e| flame_core::Error::Cuda(format!("htod: {:?}", e)))?;
+                        total_gpu_bytes += bytes.len();
+                        weights.insert(stripped, RawWeight {
+                            data: gpu, shape, numel, scale, is_fp8: true,
+                        });
+                    }
+                    "BF16" => {
+                        let bytes = &mmap[start..end];
+                        let gpu: cudarc::driver::CudaSlice<u8> = device.htod_copy(bytes.to_vec())
+                            .map_err(|e| flame_core::Error::Cuda(format!("htod: {:?}", e)))?;
+                        total_gpu_bytes += bytes.len();
+                        weights.insert(stripped, RawWeight {
+                            data: gpu, shape, numel, scale: 1.0, is_fp8: false,
+                        });
+                    }
+                    "F32" => {
+                        // Load F32 as proper Tensor (scale_shift_table etc.)
+                        let data = &mmap[start..end];
+                        let f32_data: Vec<f32> = data.chunks_exact(4)
+                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                            .collect();
+                        let tensor = Tensor::from_vec(
+                            f32_data, Shape::from_dims(&shape), device.clone(),
+                        )?;
+                        f32_tensors.insert(stripped, tensor);
+                    }
+                    _ => {} // skip unsupported
+                }
+            }
+
+            blocks.push(ResidentBlock { weights, f32_tensors });
+
+            if (block_idx + 1) % 12 == 0 || block_idx == 0 || block_idx + 1 == num_layers {
+                log::info!("[LTX2] Loaded block {}/{}, {:.1}GB GPU so far",
+                    block_idx + 1, num_layers, total_gpu_bytes as f64 / 1e9);
+            }
+        }
+
+        log::info!("[LTX2] FP8 resident ready: {} blocks, {:.2}GB GPU, {:.1}s",
+            blocks.len(), total_gpu_bytes as f64 / 1e9, t0.elapsed().as_secs_f32());
+
+        self.fp8_blocks = blocks;
+        Ok(())
     }
 
     /// Initialize FlameSwap for async double-buffered block streaming.
@@ -2373,7 +2486,28 @@ impl LTX2StreamingModel {
         let config_clone = self.config.clone();
         let checkpoint_path = self.checkpoint_path.clone();
 
-        if self.swap.is_some() {
+        if !self.fp8_blocks.is_empty() {
+            // FP8 resident path: dequant each block on-the-fly, no disk I/O
+            log::info!("[LTX2] FP8 resident forward ({} blocks)", num_layers);
+            for i in 0..num_layers {
+                let t_block = std::time::Instant::now();
+                let block_weights = self.fp8_blocks[i].to_bf16_block(&device)?;
+                let t_load = t_block.elapsed().as_millis();
+                let block = Self::load_block_from_weights_static(&config_clone, i, block_weights)?;
+                hs = block.forward_video_only(
+                    &hs, &enc_hs, &v_timestep,
+                    Some((&v_cos, &v_sin)),
+                    None,
+                    prompt_timestep.as_ref(),
+                )?;
+                drop(block);
+                let t_total = t_block.elapsed().as_millis();
+                if (i + 1) % 12 == 0 || i + 1 == num_layers || i == 0 {
+                    log::info!("[LTX2] Block {}/{}: dequant={}ms, forward={}ms, total={}ms",
+                        i + 1, num_layers, t_load, t_total - t_load, t_total);
+                }
+            }
+        } else if self.swap.is_some() {
             // Async path: FlameSwap prefetch/await
             let swap = self.swap.as_mut().unwrap();
             let key_prefix = &self.key_prefix;
@@ -2417,14 +2551,7 @@ impl LTX2StreamingModel {
                     None,
                     prompt_timestep.as_ref(),
                 )?;
-                if i < 3 || i == num_layers - 1 {
-                    if let Ok(hd) = hs.to_vec() {
-                        let mean = hd.iter().sum::<f32>() / hd.len().max(1) as f32;
-                        log::info!("[SWAP] Block {} hs: mean={:.6} first=[{:.4},{:.4},{:.4}]",
-                            i, mean, hd.get(0).unwrap_or(&0.0), hd.get(1).unwrap_or(&0.0), hd.get(2).unwrap_or(&0.0));
-                    }
-                }
-                drop(block);
+                drop(block); // Free transposed weights immediately
                 let t_total = t_block.elapsed().as_millis();
                 if (i + 1) % 12 == 0 || i + 1 == num_layers || i == 0 {
                     log::info!("[LTX2] Block {}/{}: load={}ms, forward={}ms, total={}ms",
