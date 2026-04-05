@@ -12,6 +12,7 @@ use inference_flame::sampling::ltx2_sampling::{build_dev_sigma_schedule, LTX2_DI
 use flame_core::{global_cuda_device, DType, Shape, Tensor};
 use std::time::Instant;
 
+// Use dev-fp8 for testing FP8 resident path
 const MODEL_PATH: &str =
     "/home/alex/.serenity/models/checkpoints/ltx-2.3-22b-dev-fp8.safetensors";
 const EMBEDDINGS_PATH: &str =

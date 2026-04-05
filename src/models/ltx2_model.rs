@@ -1948,6 +1948,10 @@ impl LTX2StreamingModel {
                 let k = key.strip_prefix(&prefix).unwrap_or(key);
                 !k.contains("audio")
                     && !k.starts_with("transformer_blocks.")
+                    // Skip connector + aggregate_embed to save ~3.6GB VRAM
+                    // (not needed when using pre-processed 4096-dim embeddings)
+                    && !k.starts_with("video_embeddings_connector.")
+                    && !k.contains("aggregate_embed")
             },
         )?;
 
@@ -1989,9 +1993,7 @@ impl LTX2StreamingModel {
         };
 
         if caption_proj.is_none() && connector.is_none() {
-            return Err(flame_core::Error::InvalidInput(
-                "Neither caption_projection nor video_embeddings_connector found".into(),
-            ));
+            log::warn!("[LTX2] No connector or caption_projection loaded (OK if using 4096-dim cached embeddings)");
         }
         if connector.is_some() {
             log::info!("[LTX2] Using VideoEmbeddingsConnector (ComfyUI format)");
@@ -2129,18 +2131,21 @@ impl LTX2StreamingModel {
                         let gpu: cudarc::driver::CudaSlice<u8> = device.htod_copy(bytes.to_vec())
                             .map_err(|e| flame_core::Error::Cuda(format!("htod: {:?}", e)))?;
                         total_gpu_bytes += bytes.len();
-                        weights.insert(stripped, RawWeight {
-                            data: gpu, shape, numel, scale, is_fp8: true,
+                        weights.insert(stripped, RawWeight::FP8 {
+                            data: gpu, shape, numel, scale,
                         });
                     }
                     "BF16" => {
-                        let bytes = &mmap[start..end];
-                        let gpu: cudarc::driver::CudaSlice<u8> = device.htod_copy(bytes.to_vec())
-                            .map_err(|e| flame_core::Error::Cuda(format!("htod: {:?}", e)))?;
-                        total_gpu_bytes += bytes.len();
-                        weights.insert(stripped, RawWeight {
-                            data: gpu, shape, numel, scale: 1.0, is_fp8: false,
-                        });
+                        // Load directly as BF16 Tensor — zero-copy on use
+                        let bf16_data: Vec<u16> = mmap[start..end].chunks_exact(2)
+                            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                            .collect();
+                        let mut tensor = Tensor::zeros_dtype(
+                            Shape::from_dims(&shape), DType::BF16, device.clone(),
+                        )?;
+                        tensor.copy_from_bf16_slice(&bf16_data)?;
+                        total_gpu_bytes += bf16_data.len() * 2;
+                        weights.insert(stripped, RawWeight::BF16 { tensor });
                     }
                     "F32" => {
                         // Load F32 as proper Tensor (scale_shift_table etc.)
@@ -2489,11 +2494,16 @@ impl LTX2StreamingModel {
         if !self.fp8_blocks.is_empty() {
             // FP8 resident path: dequant each block on-the-fly, no disk I/O
             log::info!("[LTX2] FP8 resident forward ({} blocks)", num_layers);
+            let mut dequant_buf = super::fp8_resident::DequantBuffer::new(
+                4096 * 16384, // largest weight: FFN [16384, 4096]
+                &device,
+            )?;
             for i in 0..num_layers {
                 let t_block = std::time::Instant::now();
-                let block_weights = self.fp8_blocks[i].to_bf16_block(&device)?;
-                let t_load = t_block.elapsed().as_millis();
+                let block_weights = self.fp8_blocks[i].to_bf16_block(&device, &mut dequant_buf)?;
+                let t_dequant = t_block.elapsed().as_millis();
                 let block = Self::load_block_from_weights_static(&config_clone, i, block_weights)?;
+                let t_load = t_block.elapsed().as_millis();
                 hs = block.forward_video_only(
                     &hs, &enc_hs, &v_timestep,
                     Some((&v_cos, &v_sin)),
@@ -2503,8 +2513,8 @@ impl LTX2StreamingModel {
                 drop(block);
                 let t_total = t_block.elapsed().as_millis();
                 if (i + 1) % 12 == 0 || i + 1 == num_layers || i == 0 {
-                    log::info!("[LTX2] Block {}/{}: dequant={}ms, forward={}ms, total={}ms",
-                        i + 1, num_layers, t_load, t_total - t_load, t_total);
+                    log::info!("[LTX2] Block {}/{}: dequant={}ms, build={}ms, forward={}ms, total={}ms",
+                        i + 1, num_layers, t_dequant, t_load - t_dequant, t_total - t_load, t_total);
                 }
             }
         } else if self.swap.is_some() {
