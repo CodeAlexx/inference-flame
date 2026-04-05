@@ -484,7 +484,7 @@ pub struct AdaLayerNormSingle {
 
 impl AdaLayerNormSingle {
     /// Forward: returns (mod_params, embedded_timestep)
-    fn forward(&self, timestep: &Tensor) -> Result<(Tensor, Tensor)> {
+    pub fn forward(&self, timestep: &Tensor) -> Result<(Tensor, Tensor)> {
         let embedded = self.emb.forward(timestep)?;
         let h = silu(&embedded)?;
         let mod_params = linear3d(&h, &self.linear_weight, Some(&self.linear_bias))?;
@@ -1932,7 +1932,14 @@ impl LTX2StreamingModel {
         let globals = flame_core::serialization::load_file_filtered(
             path, &device,
             |key| {
-                // Strip prefix for matching
+                // Only load diffusion model keys (skip VAE, vocoder, audio VAE)
+                if !key.starts_with(&prefix) {
+                    // Also load text_embedding_projection (video only)
+                    if key.starts_with("text_embedding_projection.video") {
+                        return true;
+                    }
+                    return false;
+                }
                 let k = key.strip_prefix(&prefix).unwrap_or(key);
                 !k.contains("audio")
                     && !k.starts_with("transformer_blocks.")
@@ -1969,9 +1976,12 @@ impl LTX2StreamingModel {
             .ok();
 
         // video_embeddings_connector (ComfyUI LTX-2.3) — replaces caption_projection
-        let connector = load_video_embeddings_connector(
+        let connector = match load_video_embeddings_connector(
             &globals, "video_embeddings_connector", config.norm_eps, config.rope_theta,
-        ).ok();
+        ) {
+            Ok(c) => Some(c),
+            Err(e) => { log::warn!("[LTX2] Connector load failed: {:?}", e); None }
+        };
 
         if caption_proj.is_none() && connector.is_none() {
             return Err(flame_core::Error::InvalidInput(
