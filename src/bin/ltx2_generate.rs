@@ -77,7 +77,9 @@ fn main() -> anyhow::Result<()> {
     let t0 = Instant::now();
     let config = LTX2Config::default();
     let mut model = LTX2StreamingModel::load_globals(MODEL_PATH, &config)?;
-    println!("  Loaded in {:.1}s", t0.elapsed().as_secs_f32());
+    println!("  Global params loaded in {:.1}s", t0.elapsed().as_secs_f32());
+    model.init_swap()?;
+    println!("  FlameSwap initialized in {:.1}s", t0.elapsed().as_secs_f32());
 
     // Stage 3: Noise + schedule
     println!("\n--- Stage 3: Prepare noise + sigmas ---");

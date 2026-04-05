@@ -1919,6 +1919,12 @@ pub struct LTX2StreamingModel {
     // Populated by preload_blocks(). When present, load_block() reads from cache
     // instead of re-parsing the 43GB checkpoint for every denoise step.
     block_cache: Vec<Option<HashMap<String, Tensor>>>,
+
+    /// Async block swapper (FlameSwap). When initialized via `init_swap()`,
+    /// replaces block_cache and load_block_from_disk with async pinned transfers.
+    swap: Option<flame_swap::FlameSwap>,
+    /// Detected key prefix for stripping from FlameSwap output keys.
+    key_prefix: String,
 }
 
 impl LTX2StreamingModel {
@@ -2024,7 +2030,39 @@ impl LTX2StreamingModel {
             proj_out_weight: pre_transpose_weight(&get("proj_out.weight")?)?,
             proj_out_bias: get("proj_out.bias")?,
             block_cache: Vec::new(),
+            swap: None,
+            key_prefix: prefix,
         })
+    }
+
+    /// Initialize FlameSwap for async double-buffered block streaming.
+    /// Call after `load_globals()`. Replaces sync `load_block_from_disk`.
+    pub fn init_swap(&mut self) -> Result<()> {
+        let device = flame_core::global_cuda_device();
+        let t0 = std::time::Instant::now();
+        let prefix = self.key_prefix.clone();
+        let num_layers = self.config.num_layers;
+
+        log::info!("[LTX2] Initializing FlameSwap for {} blocks (prefix='{}')", num_layers, prefix);
+
+        let swap = flame_swap::FlameSwap::load(
+            &[&self.checkpoint_path],
+            &device,
+            |name| {
+                let stripped = name.strip_prefix(&prefix).unwrap_or(name);
+                if !stripped.starts_with("transformer_blocks.") { return None; }
+                if stripped.contains("audio") && !stripped.contains("audio_to_video") { return None; }
+                if stripped.contains("video_to_audio") { return None; }
+                let rest = stripped.strip_prefix("transformer_blocks.")?;
+                rest.split('.').next()?.parse().ok()
+            },
+        ).map_err(|e| flame_core::Error::Io(format!("FlameSwap load failed: {e}")))?;
+
+        log::info!("[LTX2] FlameSwap ready: {} blocks, ~{:.2}GB pinned, {:.1}s",
+            swap.num_blocks(), swap.pinned_bytes() as f64 / 1e9, t0.elapsed().as_secs_f32());
+
+        self.swap = Some(swap);
+        Ok(())
     }
 
     /// Pre-load all block weights by reading each block once from disk.
@@ -2074,9 +2112,6 @@ impl LTX2StreamingModel {
     /// Load a single block's video-only weights.
     /// Uses pre-loaded cache if available, otherwise reads from disk.
     pub fn load_block(&self, block_idx: usize) -> Result<LTX2TransformerBlock> {
-        let device = flame_core::global_cuda_device();
-
-        // Use cached weights if available (avoids re-parsing 43GB file)
         let block_weights = if block_idx < self.block_cache.len() {
             if let Some(ref cached) = self.block_cache[block_idx] {
                 cached.clone()
@@ -2086,11 +2121,21 @@ impl LTX2StreamingModel {
         } else {
             self.load_block_from_disk(block_idx)?
         };
+        Self::load_block_from_weights_static(&self.config, block_idx, block_weights)
+    }
 
-        let eps = self.config.norm_eps;
-        let num_heads = self.config.num_attention_heads;
-        let head_dim = self.config.attention_head_dim;
-        let ad = self.config.audio_inner_dim();
+    /// Build an LTX2TransformerBlock from a weight HashMap. Public for validation.
+    pub fn load_block_from_weights_static(
+        config: &LTX2Config,
+        block_idx: usize,
+        block_weights: HashMap<String, Tensor>,
+    ) -> Result<LTX2TransformerBlock> {
+        let device = flame_core::global_cuda_device();
+
+        let eps = config.norm_eps;
+        let num_heads = config.num_attention_heads;
+        let head_dim = config.attention_head_dim;
+        let ad = config.audio_inner_dim();
 
         let get_opt = |key: &str| -> Option<Tensor> { block_weights.get(key).cloned() };
 
@@ -2111,13 +2156,13 @@ impl LTX2StreamingModel {
                 norm_q_weight: dummy_1d(ad)?, norm_k_weight: dummy_1d(ad)?,
                 to_out_weight: dummy_2d(ad, ad)?, to_out_bias: dummy_1d(ad)?,
                 to_gate_logits_weight: None, to_gate_logits_bias: None,
-                num_heads: self.config.audio_num_attention_heads,
-                head_dim: self.config.audio_attention_head_dim, eps,
+                num_heads: config.audio_num_attention_heads,
+                head_dim: config.audio_attention_head_dim, eps,
             })
         };
 
         let dummy_ff = || -> Result<FeedForward> {
-            let affn = self.config.audio_ffn_hidden();
+            let affn = config.audio_ffn_hidden();
             Ok(FeedForward {
                 gelu_proj_weight: dummy_2d(ad, affn)?,     // pre-transposed: [in=ad, out=affn]
                 gelu_proj_bias: dummy_1d(affn)?,
@@ -2148,7 +2193,7 @@ impl LTX2StreamingModel {
                 .cloned()
                 .ok_or_else(|| flame_core::Error::InvalidInput(format!("Missing: {pfx}.scale_shift_table")))?,
             audio_scale_shift_table: dummy_2d(6, ad)?,
-            video_a2v_cross_attn_scale_shift_table: dummy_2d(5, self.config.inner_dim())?,
+            video_a2v_cross_attn_scale_shift_table: dummy_2d(5, config.inner_dim())?,
             audio_a2v_cross_attn_scale_shift_table: dummy_2d(5, ad)?,
             prompt_scale_shift_table: get_opt(&format!("{pfx}.prompt_scale_shift_table")),
             eps,
@@ -2164,7 +2209,7 @@ impl LTX2StreamingModel {
     /// Supports both diffusers format (CaptionProjection, 6-param adaln)
     /// and ComfyUI format (VideoEmbeddingsConnector, 9-param adaln, prompt_adaln_single).
     pub fn forward_video_only(
-        &self,
+        &mut self,
         x: &Tensor,
         timestep: &Tensor,
         context: &Tensor,
@@ -2257,25 +2302,69 @@ impl LTX2StreamingModel {
             None
         };
 
-        // 7. Stream blocks: load -> run -> drop
-        log::info!("[LTX2] Starting block streaming");
-        for i in 0..self.config.num_layers {
-            let t_block = std::time::Instant::now();
-            let block = self.load_block(i)?;
-            let t_load = t_block.elapsed().as_millis();
-            hs = block.forward_video_only(
-                &hs, &enc_hs, &v_timestep,
-                Some((&v_cos, &v_sin)),
-                None, // encoder_attention_mask (already baked into connector)
-                prompt_timestep.as_ref(),
-            )?;
-            drop(block);  // Free ~536MB immediately
+        // 7. Stream blocks
+        let num_layers = self.config.num_layers;
+        let num_heads = self.config.num_attention_heads;
+        let head_dim = self.config.attention_head_dim;
+        let config_clone = self.config.clone();
 
-            let t_total_block = t_block.elapsed().as_millis();
-            if (i + 1) % 12 == 0 || i + 1 == self.config.num_layers || i == 0 {
-                log::info!("[LTX2] Block {}/{}: load={}ms, forward={}ms, total={}ms",
-                    i + 1, self.config.num_layers, t_load,
-                    t_total_block - t_load, t_total_block);
+        if self.swap.is_some() {
+            // Async path: FlameSwap prefetch/await
+            let swap = self.swap.as_mut().unwrap();
+            let key_prefix = &self.key_prefix;
+            log::info!("[LTX2] Block streaming via FlameSwap ({} blocks)", num_layers);
+
+            swap.prefetch(0)
+                .map_err(|e| flame_core::Error::Io(format!("prefetch: {e}")))?;
+            for i in 0..num_layers {
+                let t_block = std::time::Instant::now();
+                let raw_weights = swap.await_block(i)
+                    .map_err(|e| flame_core::Error::Io(format!("await_block: {e}")))?;
+                if i + 1 < num_layers {
+                    swap.prefetch(i + 1)
+                        .map_err(|e| flame_core::Error::Io(format!("prefetch: {e}")))?;
+                }
+                // Strip key prefix
+                let block_weights: HashMap<String, Tensor> = raw_weights.into_iter()
+                    .map(|(k, v)| {
+                        let stripped = k.strip_prefix(key_prefix).unwrap_or(&k).to_string();
+                        (stripped, v)
+                    })
+                    .collect();
+                let t_load = t_block.elapsed().as_millis();
+                let block = Self::load_block_from_weights_static(&config_clone, i, block_weights)?;
+                hs = block.forward_video_only(
+                    &hs, &enc_hs, &v_timestep,
+                    Some((&v_cos, &v_sin)),
+                    None,
+                    prompt_timestep.as_ref(),
+                )?;
+                drop(block);
+                let t_total = t_block.elapsed().as_millis();
+                if (i + 1) % 12 == 0 || i + 1 == num_layers || i == 0 {
+                    log::info!("[LTX2] Block {}/{}: load={}ms, forward={}ms, total={}ms",
+                        i + 1, num_layers, t_load, t_total - t_load, t_total);
+                }
+            }
+        } else {
+            // Sync fallback: load from disk
+            log::info!("[LTX2] Block streaming from disk ({} blocks)", num_layers);
+            for i in 0..num_layers {
+                let t_block = std::time::Instant::now();
+                let block = self.load_block(i)?;
+                let t_load = t_block.elapsed().as_millis();
+                hs = block.forward_video_only(
+                    &hs, &enc_hs, &v_timestep,
+                    Some((&v_cos, &v_sin)),
+                    None,
+                    prompt_timestep.as_ref(),
+                )?;
+                drop(block);
+                let t_total = t_block.elapsed().as_millis();
+                if (i + 1) % 12 == 0 || i + 1 == num_layers || i == 0 {
+                    log::info!("[LTX2] Block {}/{}: load={}ms, forward={}ms, total={}ms",
+                        i + 1, num_layers, t_load, t_total - t_load, t_total);
+                }
             }
         }
 
