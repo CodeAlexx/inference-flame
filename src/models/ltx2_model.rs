@@ -1914,6 +1914,9 @@ pub struct LTX2StreamingModel {
     pub swap: Option<flame_swap::FlameSwap>,
     /// Detected key prefix for stripping from FlameSwap output keys.
     pub key_prefix: String,
+    /// Pre-cached F32 tensors per block (scale_shift_table etc.)
+    /// Loaded once at init_swap to avoid BF16 precision loss.
+    pub f32_cache: Vec<HashMap<String, Tensor>>,
 }
 
 impl LTX2StreamingModel {
@@ -2031,6 +2034,7 @@ impl LTX2StreamingModel {
             block_cache: Vec::new(),
             swap: None,
             key_prefix: prefix,
+            f32_cache: Vec::new(),
         })
     }
 
@@ -2083,7 +2087,28 @@ impl LTX2StreamingModel {
         log::info!("[LTX2] FlameSwap ready: {} blocks, ~{:.2}GB pinned, {:.1}s",
             swap.num_blocks(), swap.pinned_bytes() as f64 / 1e9, t0.elapsed().as_secs_f32());
 
+        // Pre-cache F32 tensors (scale_shift_table etc.) — one-time load, ~1.7MB total
+        log::info!("[LTX2] Caching F32 block tensors...");
+        let mut f32_cache = Vec::with_capacity(num_layers);
+        for i in 0..num_layers {
+            let pfx = format!("{prefix}transformer_blocks.{i}.");
+            let f32_tensors = flame_core::serialization::load_file_filtered(
+                &self.checkpoint_path, &device,
+                |key| key.starts_with(&pfx) && key.contains("scale_shift_table"),
+            )?;
+            let stripped: HashMap<String, Tensor> = f32_tensors.into_iter()
+                .map(|(k, v)| {
+                    let s = k.strip_prefix(&prefix).unwrap_or(&k).to_string();
+                    (s, v)
+                })
+                .collect();
+            f32_cache.push(stripped);
+        }
+        log::info!("[LTX2] F32 cache: {} blocks, {:.1}s total init",
+            f32_cache.len(), t0.elapsed().as_secs_f32());
+
         self.swap = Some(swap);
+        self.f32_cache = f32_cache;
         Ok(())
     }
 
@@ -2147,6 +2172,23 @@ impl LTX2StreamingModel {
     }
 
     /// Build an LTX2TransformerBlock from a weight HashMap. Public for validation.
+    /// Build block with optional F32 override tensors (borrowed, no clone).
+    fn load_block_from_weights_with_overrides(
+        config: &LTX2Config,
+        block_idx: usize,
+        mut block_weights: HashMap<String, Tensor>,
+        f32_overrides: Option<&HashMap<String, Tensor>>,
+    ) -> Result<LTX2TransformerBlock> {
+        // Merge F32 overrides by borrowing — clone only the Tensor wrapper (cheap Arc if shared_storage,
+        // or unavoidable deep copy without it — but F32 tensors are tiny: ~36KB each)
+        if let Some(overrides) = f32_overrides {
+            for (k, v) in overrides {
+                block_weights.insert(k.clone(), v.clone());
+            }
+        }
+        Self::load_block_from_weights_static(config, block_idx, block_weights)
+    }
+
     pub fn load_block_from_weights_static(
         config: &LTX2Config,
         block_idx: usize,
@@ -2354,19 +2396,18 @@ impl LTX2StreamingModel {
                         (stripped, v)
                     })
                     .collect();
-                // Load F32 tensors (scale_shift_table) from disk to preserve precision.
-                // FlameSwap skips these to avoid F32→BF16 truncation.
-                // Use a direct load since self is borrowed by swap.
-                {
-                    let pfx = format!("{}transformer_blocks.{}.", key_prefix, i);
-                    let f32_tensors = flame_core::serialization::load_file_filtered(
-                        &checkpoint_path, &device,
-                        |key| key.starts_with(&pfx) && key.contains("scale_shift_table"),
-                    )?;
-                    for (k, v) in f32_tensors {
-                        let stripped = k.strip_prefix(key_prefix).unwrap_or(&k).to_string();
-                        block_weights.insert(stripped, v);
+                // Merge F32 tensors from cache
+                let n_f32 = if i < self.f32_cache.len() {
+                    let cache = &self.f32_cache[i];
+                    for (k, v) in cache {
+                        block_weights.insert(k.clone(), v.clone());
                     }
+                    cache.len()
+                } else { 0 };
+                if i == 0 {
+                    eprintln!("[DEBUG] Block 0: {} swap + {} f32 = {} total. Has SST: {}",
+                        block_weights.len() - n_f32, n_f32, block_weights.len(),
+                        block_weights.contains_key("transformer_blocks.0.scale_shift_table"));
                 }
                 let t_load = t_block.elapsed().as_millis();
                 let block = Self::load_block_from_weights_static(&config_clone, i, block_weights)?;

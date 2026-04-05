@@ -84,3 +84,7 @@ path = "src/bin/temb_dump.rs"
 [[bin]]
 name = "swap_weight_compare"
 path = "src/bin/swap_weight_compare.rs"
+
+[[bin]]
+name = "full_weight_diff"
+path = "src/bin/full_weight_diff.rs"

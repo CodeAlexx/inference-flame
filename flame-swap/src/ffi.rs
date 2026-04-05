@@ -117,6 +117,10 @@ impl Event {
         Ok(Self { raw })
     }
 
+    pub fn as_raw(&self) -> *mut c_void {
+        self.raw
+    }
+
     /// Record this event on a stream.  Any subsequent `stream.wait_event()`
     /// will block that stream until work up to this point completes.
     pub fn record(&self, stream: &Stream) -> Result<(), CudaError> {

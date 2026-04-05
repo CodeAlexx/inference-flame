@@ -378,7 +378,8 @@ impl FlameSwap {
                 let dst = *gpu.device_ptr() as *mut c_void;
                 let src = self.staging[slot.idx()].as_ptr().add(sl.offset) as *const c_void;
                 let bytes = sl.numel * std::mem::size_of::<u16>();
-                ffi::async_h2d(dst, src, bytes, &self.transfer)?;
+                // Use default (null) stream so H2D is ordered with compute — no sync needed
+                ffi::flame_cuda_memcpy_async(dst, src, bytes, 1, std::ptr::null_mut());
             }
 
             pending_tensors.push(PendingTensor {
@@ -418,8 +419,8 @@ impl FlameSwap {
             pending.block_idx
         );
 
-        self.transfer.synchronize()?;
-        self.event.record(&self.transfer)?;
+        // H2D runs on default (null) stream — naturally ordered with compute.
+        // No explicit sync needed.
 
         let mut weights = HashMap::with_capacity(pending.tensors.len());
         for pt in pending.tensors {
