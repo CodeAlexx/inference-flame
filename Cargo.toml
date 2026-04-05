@@ -72,3 +72,7 @@ path = "src/bin/ltx2_load_test.rs"
 [[bin]]
 name = "ltx2_vae_test"
 path = "src/bin/ltx2_vae_test.rs"
+
+[[bin]]
+name = "rope_dump"
+path = "src/bin/rope_dump.rs"

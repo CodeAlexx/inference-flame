@@ -26,7 +26,7 @@ const SEED: u64 = 42;
 const FRAME_RATE: f32 = 25.0;
 const LATENT_CHANNELS: usize = 128;
 const GUIDANCE_SCALE: f32 = 4.0; // Official LTX-2 default
-const NUM_STEPS: usize = 3;
+const NUM_STEPS: usize = 10;
 
 fn main() -> anyhow::Result<()> {
     env_logger::init();
