@@ -88,3 +88,7 @@ path = "src/bin/swap_weight_compare.rs"
 [[bin]]
 name = "full_weight_diff"
 path = "src/bin/full_weight_diff.rs"
+
+[[bin]]
+name = "mistral_test"
+path = "src/bin/mistral_test.rs"
