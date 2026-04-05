@@ -456,6 +456,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "flame-swap"
+version = "0.1.0"
+dependencies = [
+ "cudarc",
+ "flame-core",
+ "half",
+ "memmap2",
+]
+
+[[package]]
 name = "flate2"
 version = "1.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -657,6 +667,7 @@ dependencies = [
  "cudarc",
  "env_logger 0.10.2",
  "flame-core",
+ "flame-swap",
  "half",
  "image",
  "log",

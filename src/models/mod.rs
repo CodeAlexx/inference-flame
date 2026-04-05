@@ -5,3 +5,5 @@ pub mod sd3_mmdit;
 pub mod sdxl_unet;
 pub mod ltx2_model;
 pub mod qwen3_encoder;
+pub mod gemma3_encoder;
+pub mod feature_extractor;

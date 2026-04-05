@@ -39,6 +39,9 @@
 //!   audio_norm_out.{weight,bias}
 //!   audio_proj_out.{weight,bias}
 
+use flame_core::ops::fused_inference::{
+    fused_modulate, fused_residual_gate, fused_rms_norm, fused_rms_norm_modulate,
+};
 use flame_core::serialization;
 use flame_core::{DType, Result, Shape, Tensor};
 use std::collections::HashMap;
@@ -283,19 +286,18 @@ fn timestep_embedding(timesteps: &Tensor, dim: usize) -> Result<Tensor> {
 // Rotary Position Embedding (3D Video / 1D Audio)
 // ---------------------------------------------------------------------------
 
-/// Compute interleaved RoPE frequencies for video (3D) or audio (1D) coordinates.
+/// Compute split-RoPE frequencies for video (3D) or audio (1D) coordinates.
 ///
-/// Returns (cos_freqs, sin_freqs) tensors suitable for apply_rotary_emb.
+/// Returns (cos_freqs, sin_freqs) shaped [B, num_heads, N, head_dim/2]
+/// suitable for apply_rotary_emb (split variant matching official LTX-2).
 ///
 /// `coords` shape: [B, num_dims, num_patches, 2] where last dim is [start, end)
-/// For video: num_dims=3 (frame, height, width)
-/// For audio: num_dims=1 (temporal)
 pub fn compute_rope_frequencies(
     coords: &Tensor,
     dim: usize,
-    max_positions: &[f64],  // base normalization for each dim
+    max_positions: &[f64],
     theta: f64,
-    num_heads: usize,       // for split-rope head reshaping
+    num_heads: usize,
 ) -> Result<(Tensor, Tensor)> {
     let device = coords.device().clone();
     let cdims = coords.shape().dims().to_vec();
@@ -304,89 +306,72 @@ pub fn compute_rope_frequencies(
     let num_patches = cdims[2];
 
     // Midpoint of [start, end) boundaries
-    // coords: [B, num_pos_dims, num_patches, 2]
     let coords_f32 = coords.to_dtype(DType::F32)?;
-    let starts = coords_f32.narrow(3, 0, 1)?;  // [B, D, P, 1]
-    let ends = coords_f32.narrow(3, 1, 1)?;    // [B, D, P, 1]
-    let midpoints = starts.add(&ends)?.mul_scalar(0.5)?;
-    let midpoints = midpoints.squeeze_dim(3)?;  // [B, D, P]
+    let starts = coords_f32.narrow(3, 0, 1)?;
+    let ends = coords_f32.narrow(3, 1, 1)?;
+    let midpoints = starts.add(&ends)?.mul_scalar(0.5)?.squeeze_dim(3)?; // [B, D, P]
 
-    // Normalize to fraction of base shape
-    // grid[d] = midpoints[:, d, :] / max_positions[d]
-    // Then stack -> [B, P, num_pos_dims]
-    let mut grid_parts = Vec::with_capacity(num_pos_dims);
+    // Fractional positions: grid[d] = midpoints[:, d, :] / max_positions[d]
+    let mut grid_expanded = Vec::with_capacity(num_pos_dims);
     for d in 0..num_pos_dims {
         let dim_slice = midpoints.narrow(1, d, 1)?.squeeze_dim(1)?; // [B, P]
         let normed = dim_slice.mul_scalar(1.0 / max_positions[d] as f32)?;
-        grid_parts.push(normed);
-    }
-
-    // Stack along last dim: [B, P, num_pos_dims]
-    // We'll do this by unsqueezing each to [B, P, 1] and cat
-    let mut grid_expanded = Vec::new();
-    for part in &grid_parts {
-        grid_expanded.push(part.unsqueeze(2)?);
+        grid_expanded.push(normed.unsqueeze(2)?); // [B, P, 1]
     }
     let grid = Tensor::cat(&grid_expanded.iter().collect::<Vec<_>>(), 2)?; // [B, P, num_pos_dims]
 
-    // Number of RoPE elements per dimension
+    // Frequency vector: theta^linspace(0, 1, dim // (num_pos_dims * 2)) * pi / 2
     let num_rope_elems = num_pos_dims * 2;
-
-    // Frequency vector: theta^(linspace(0, 1, dim // num_rope_elems)) * pi / 2
     let freq_count = dim / num_rope_elems;
     let mut freq_data = Vec::with_capacity(freq_count);
     for i in 0..freq_count {
         let t = i as f64 / (freq_count as f64 - 1.0).max(1.0);
-        let val = theta.powf(t) * PI / 2.0;
-        freq_data.push(val as f32);
+        freq_data.push((theta.powf(t) * PI / 2.0) as f32);
     }
     let freqs_vec = Tensor::from_vec(
-        freq_data,
-        Shape::from_dims(&[1, 1, 1, freq_count]),
-        device.clone(),
-    )?; // [1, 1, 1, freq_count]
+        freq_data, Shape::from_dims(&[1, 1, 1, freq_count]), device.clone(),
+    )?;
 
-    // grid: [B, P, num_pos_dims] -> [B, P, num_pos_dims, 1]
+    // angles = (grid * 2 - 1) * freqs → [B, P, num_pos_dims, freq_count]
     let grid_4d = grid.unsqueeze(3)?;
-
-    // (grid * 2 - 1) * freqs -> [B, P, num_pos_dims, freq_count]
     let scaled = grid_4d.mul_scalar(2.0)?.add_scalar(-1.0)?;
     let angles = scaled.mul(&freqs_vec.expand(&[batch_size, num_patches, num_pos_dims, freq_count])?)?;
 
-    // Transpose and flatten: [B, P, freq_count, num_pos_dims] -> [B, P, freq_count * num_pos_dims]
+    // Transpose dims and flatten: [B, P, freq_count, num_pos_dims] → [B, P, freq_count * num_pos_dims]
     let angles_t = angles.permute(&[0, 1, 3, 2])?;
-    let half_dim_rope = freq_count * num_pos_dims;
-    let angles_flat = angles_t.reshape(&[batch_size, num_patches, half_dim_rope])?;
+    let rope_freqs = freq_count * num_pos_dims;
+    let angles_flat = angles_t.reshape(&[batch_size, num_patches, rope_freqs])?;
 
-    // Interleaved cos/sin with repeat_interleave(2)
+    // Split RoPE: cos/sin without repeat_interleave, pad to dim/2, reshape to [B, H, N, D_head/2]
     let cos_raw = angles_flat.cos()?.to_dtype(DType::BF16)?;
     let sin_raw = angles_flat.sin()?.to_dtype(DType::BF16)?;
 
-    // repeat_interleave(2, dim=-1): each value duplicated
-    // [B, P, half] -> [B, P, half*2]
-    let cos_freqs = repeat_interleave_last(&cos_raw, 2)?;
-    let sin_freqs = repeat_interleave_last(&sin_raw, 2)?;
-
-    // Pad if dim % num_rope_elems != 0
-    let current_size = cos_freqs.shape().dims()[2];
-    if current_size < dim {
-        let pad_size = dim - current_size;
+    let half_dim = dim / 2;
+    let (cos_out, sin_out) = if rope_freqs < half_dim {
+        // Pad with ones (cos) / zeros (sin) at the FRONT (matching official)
+        let pad_size = half_dim - rope_freqs;
         let cos_pad = Tensor::ones_dtype(
             Shape::from_dims(&[batch_size, num_patches, pad_size]),
-            DType::BF16,
-            device.clone(),
+            DType::BF16, device.clone(),
         )?;
         let sin_pad = Tensor::zeros_dtype(
             Shape::from_dims(&[batch_size, num_patches, pad_size]),
-            DType::BF16,
-            device.clone(),
+            DType::BF16, device.clone(),
         )?;
-        let cos_freqs = Tensor::cat(&[&cos_pad, &cos_freqs], 2)?;
-        let sin_freqs = Tensor::cat(&[&sin_pad, &sin_freqs], 2)?;
-        return Ok((cos_freqs, sin_freqs));
-    }
+        (Tensor::cat(&[&cos_pad, &cos_raw], 2)?,
+         Tensor::cat(&[&sin_pad, &sin_raw], 2)?)
+    } else {
+        (cos_raw, sin_raw)
+    };
 
-    Ok((cos_freqs, sin_freqs))
+    // Reshape to per-head: [B, N, H, D_head/2] → [B, H, N, D_head/2]
+    let head_rope_dim = half_dim / num_heads;
+    let cos_heads = cos_out.reshape(&[batch_size, num_patches, num_heads, head_rope_dim])?
+        .permute(&[0, 2, 1, 3])?;  // [B, H, N, D_head/2]
+    let sin_heads = sin_out.reshape(&[batch_size, num_patches, num_heads, head_rope_dim])?
+        .permute(&[0, 2, 1, 3])?;
+
+    Ok((cos_heads, sin_heads))
 }
 
 /// Repeat each element along the last dimension `n` times.
@@ -410,38 +395,57 @@ fn repeat_interleave_last(x: &Tensor, n: usize) -> Result<Tensor> {
 
 /// Apply interleaved rotary embedding to query/key tensor.
 /// x: [B, S, inner_dim], freqs: (cos [B, S, inner_dim], sin [B, S, inner_dim])
+/// Apply split rotary embeddings (LTX-2 style).
+///
+/// `x`: [B, H, N, D_head] or [B, N, D] (auto-reshaped if cos is 4D)
+/// `cos_freqs`, `sin_freqs`: [B, H, N, D_head/2]
+///
+/// Split RoPE splits head_dim into two halves and cross-rotates:
+///   first_half_out  = first_half * cos - second_half * sin
+///   second_half_out = second_half * cos + first_half * sin
 pub fn apply_rotary_emb(x: &Tensor, cos_freqs: &Tensor, sin_freqs: &Tensor) -> Result<Tensor> {
-    let dims = x.shape().dims().to_vec();
-    let last = dims[dims.len() - 1];
+    let x_dims = x.shape().dims().to_vec();
+    let cos_dims = cos_freqs.shape().dims().to_vec();
 
-    // Split into pairs: x_real, x_imag from interleaved [r0, i0, r1, i1, ...]
-    // x -> [B, S, D/2, 2] -> unbind last -> x_real, x_imag
-    let mut shape_pairs = dims[..dims.len() - 1].to_vec();
-    shape_pairs.push(last / 2);
-    shape_pairs.push(2);
-    let x_pairs = x.reshape(&shape_pairs)?;
+    // If x is 3D [B, N, D] but cos is 4D [B, H, N, D_head/2], reshape x
+    let (x4d, needs_reshape) = if x_dims.len() == 3 && cos_dims.len() == 4 {
+        let (b, h, t, _half_d) = (cos_dims[0], cos_dims[1], cos_dims[2], cos_dims[3]);
+        let d_head = x_dims[2] / h;
+        let reshaped = x.reshape(&[b, t, h, d_head])?.permute(&[0, 2, 1, 3])?; // [B, H, N, D_head]
+        (reshaped, true)
+    } else {
+        (x.clone(), false)
+    };
 
-    let x_real = x_pairs.narrow(dims.len(), 0, 1)?.squeeze_dim(dims.len())?; // [B, S, D/2]
-    let x_imag = x_pairs.narrow(dims.len(), 1, 1)?.squeeze_dim(dims.len())?; // [B, S, D/2]
+    let xd = x4d.shape().dims().to_vec();
+    let (b, h, n, d_head) = (xd[0], xd[1], xd[2], xd[3]);
+    let half = d_head / 2;
 
-    // Rotated: [-x_imag, x_real] interleaved
-    let neg_imag = x_imag.mul_scalar(-1.0)?;
-    // Stack [-x_imag, x_real] along last dim and flatten
-    let neg_imag_u = neg_imag.unsqueeze(dims.len())?;
-    let x_real_u = x_real.unsqueeze(dims.len())?;
-    let rotated = Tensor::cat(&[&neg_imag_u, &x_real_u], dims.len())?;
-    let mut rot_shape = dims[..dims.len() - 1].to_vec();
-    rot_shape.push(last);
-    let x_rotated = rotated.reshape(&rot_shape)?;
+    // Split head_dim into two halves using narrow on dim 3 (4D tensor)
+    let first_half = x4d.narrow(3, 0, half)?;       // [B, H, N, half]
+    let second_half = x4d.narrow(3, half, half)?;    // [B, H, N, half]
 
-    // out = x * cos + x_rotated * sin
-    let x_f32 = x.to_dtype(DType::F32)?;
-    let cos_f32 = cos_freqs.to_dtype(DType::F32)?;
+    let cos_f32 = cos_freqs.to_dtype(DType::F32)?;  // [B, H, N, half]
     let sin_f32 = sin_freqs.to_dtype(DType::F32)?;
-    let rot_f32 = x_rotated.to_dtype(DType::F32)?;
+    let first_f32 = first_half.to_dtype(DType::F32)?;
+    let second_f32 = second_half.to_dtype(DType::F32)?;
 
-    let out = x_f32.mul(&cos_f32)?.add(&rot_f32.mul(&sin_f32)?)?;
-    out.to_dtype(DType::BF16)
+    // Split RoPE rotation:
+    //   first_out  = first * cos - second * sin
+    //   second_out = second * cos + first * sin
+    let first_out = first_f32.mul(&cos_f32)?.sub(&second_f32.mul(&sin_f32)?)?;
+    let second_out = second_f32.mul(&cos_f32)?.add(&first_f32.mul(&sin_f32)?)?;
+
+    // Concatenate halves back: [B, H, N, D_head]
+    let out = Tensor::cat(&[&first_out, &second_out], 3)?.to_dtype(DType::BF16)?;
+
+    if needs_reshape {
+        // [B, H, N, D_head] → [B, N, H*D_head]
+        let (b, h, n, d) = (xd[0], xd[1], xd[2], xd[3]);
+        out.permute(&[0, 2, 1, 3])?.reshape(&[b, n, h * d])
+    } else {
+        Ok(out)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -558,9 +562,9 @@ impl LTX2Attention {
         let k = linear3d(kv_input, &self.to_k_weight, Some(&self.to_k_bias))?;
         let v = linear3d(kv_input, &self.to_v_weight, Some(&self.to_v_bias))?;
 
-        // RMSNorm across heads on Q and K
-        let q = rms_norm(&q, Some(&self.norm_q_weight), self.eps)?;
-        let k = rms_norm(&k, Some(&self.norm_k_weight), self.eps)?;
+        // Fused RMSNorm across heads on Q and K
+        let q = fused_rms_norm(&q, &self.norm_q_weight, self.eps)?;
+        let k = fused_rms_norm(&k, &self.norm_k_weight, self.eps)?;
 
         // Apply rotary embeddings
         let q = if let Some((cos, sin)) = query_rope {
@@ -682,12 +686,16 @@ impl LTX2TransformerBlock {
             self.compute_ada_params_6(&self.scale_shift_table, temb, b, dim)?;
 
         // 1. Self-Attention with AdaLN-Zero
-        let norm_h = rms_norm(hidden_states, self.norm1_weight.as_ref(), self.eps)?;
-        let mod_h = norm_h.mul(&scale_msa.add_scalar(1.0)?.to_dtype(DType::BF16)?)?.add(&shift_msa)?;
+        let mod_h = if let Some(w) = self.norm1_weight.as_ref() {
+            fused_rms_norm_modulate(hidden_states, w, &scale_msa, &shift_msa, self.eps)?
+        } else {
+            let norm_h = rms_norm(hidden_states, None, self.eps)?;
+            fused_modulate(&norm_h, &scale_msa, &shift_msa)?
+        };
         let t_adaln = t0.elapsed().as_millis();
         let attn_out = self.attn1.forward(&mod_h, None, None, video_rotary_emb, None)?;
         let t_sa = t0.elapsed().as_millis() - t_adaln;
-        let mut hs = hidden_states.add(&attn_out.mul(&gate_msa)?)?;
+        let mut hs = fused_residual_gate(hidden_states, &attn_out, &gate_msa)?;
 
         // 2. Cross-Attention (text) — with or without adaln modulation
         if num_ada_params >= 9 {
@@ -696,9 +704,12 @@ impl LTX2TransformerBlock {
                 self.compute_ada_params_ca(&self.scale_shift_table, temb, b, dim)?;
 
             // Modulate query: rms_norm(x) * (1 + scale_q) + shift_q
-            let attn_input = rms_norm(&hs, self.norm2_weight.as_ref(), self.eps)?
-                .mul(&scale_ca_q.add_scalar(1.0)?.to_dtype(DType::BF16)?)?
-                .add(&shift_ca_q)?;
+            let attn_input = if let Some(w) = self.norm2_weight.as_ref() {
+                fused_rms_norm_modulate(&hs, w, &scale_ca_q, &shift_ca_q, self.eps)?
+            } else {
+                let norm_hs = rms_norm(&hs, None, self.eps)?;
+                fused_modulate(&norm_hs, &scale_ca_q, &shift_ca_q)?
+            };
 
             // Modulate context (KV) using prompt_scale_shift_table + prompt_timestep
             let modulated_context = if let (Some(psst), Some(pt)) =
@@ -715,7 +726,7 @@ impl LTX2TransformerBlock {
                 let shift_kv = combined.narrow(2, 0, 1)?.squeeze_dim(2)?; // [B, seq, dim]
                 let scale_kv = combined.narrow(2, 1, 1)?.squeeze_dim(2)?; // [B, seq, dim]
                 // context * (1 + scale_kv) + shift_kv
-                encoder_hidden_states.mul(&scale_kv.add_scalar(1.0)?.to_dtype(DType::BF16)?)?.add(&shift_kv)?
+                fused_modulate(encoder_hidden_states, &scale_kv, &shift_kv)?
             } else {
                 encoder_hidden_states.clone()
             };
@@ -723,7 +734,7 @@ impl LTX2TransformerBlock {
             let ca_out = self.attn2.forward(
                 &attn_input, Some(&modulated_context), encoder_attention_mask, None, None,
             )?;
-            hs = hs.add(&ca_out.mul(&gate_ca)?)?;
+            hs = fused_residual_gate(&hs, &ca_out, &gate_ca)?;
         } else {
             // Legacy 6-param path: no cross-attn modulation
             let norm_h2 = rms_norm(&hs, self.norm2_weight.as_ref(), self.eps)?;
@@ -736,10 +747,14 @@ impl LTX2TransformerBlock {
         let t_ca = t0.elapsed().as_millis() - t_adaln - t_sa;
 
         // 3. FeedForward with AdaLN-Zero
-        let norm_ff = rms_norm(&hs, self.norm3_weight.as_ref(), self.eps)?;
-        let mod_ff = norm_ff.mul(&scale_mlp.add_scalar(1.0)?.to_dtype(DType::BF16)?)?.add(&shift_mlp)?;
+        let mod_ff = if let Some(w) = self.norm3_weight.as_ref() {
+            fused_rms_norm_modulate(&hs, w, &scale_mlp, &shift_mlp, self.eps)?
+        } else {
+            let norm_ff = rms_norm(&hs, None, self.eps)?;
+            fused_modulate(&norm_ff, &scale_mlp, &shift_mlp)?
+        };
         let ff_out = self.ff.forward(&mod_ff)?;
-        hs = hs.add(&ff_out.mul(&gate_mlp)?)?;
+        hs = fused_residual_gate(&hs, &ff_out, &gate_mlp)?;
         let t_ff = t0.elapsed().as_millis() - t_adaln - t_sa - t_ca;
         log::info!("[PERF] adaln={}ms sa={}ms ca={}ms ff={}ms total={}ms",
             t_adaln, t_sa, t_ca, t_ff, t0.elapsed().as_millis());
@@ -2200,29 +2215,29 @@ impl LTX2StreamingModel {
         let v_timestep = v_timestep.reshape(&[batch_size, num_tokens, num_mod_params * inner_dim])?;
         let v_embedded = v_embedded.reshape(&[batch_size, num_tokens, inner_dim])?;
 
-        // 6. Project text embeddings if aggregate_embed exists (packed Gemma → 4096)
-        log::info!("[LTX2] context dtype={:?} shape={:?}", context.dtype(), context.dims());
-        let context_projected = if let (Some(w), Some(b)) =
-            (&self.aggregate_embed_weight, &self.aggregate_embed_bias)
-        {
-            log::info!("[LTX2] aggregate_embed w dtype={:?}, context dtype={:?}", w.dtype(), context.dtype());
-            linear3d(context, w, Some(b))?
-        } else {
+        // 6. Text embedding: skip aggregate_embed + connector if already 4096-dim
+        let context_dim = context.shape().dims()[2];
+        let enc_hs = if context_dim == inner_dim {
+            log::info!("[LTX2] Pre-processed 4096-dim embeddings, skipping connector");
             context.clone()
-        };
-        log::info!("[LTX2] context_projected dtype={:?}", context_projected.dtype());
-
-        // 6b. Process through connector or caption_projection
-        let enc_hs = if let Some(connector) = &self.connector {
-            // ComfyUI path: VideoEmbeddingsConnector
-            connector.forward(&context_projected, encoder_attention_mask)?
-        } else if let Some(caption_proj) = &self.caption_projection {
-            // Diffusers path: CaptionProjection
-            caption_proj.forward(&context_projected)?
         } else {
-            return Err(flame_core::Error::InvalidInput(
-                "No text projection available (neither connector nor caption_projection)".into(),
-            ));
+            let context_projected = if let (Some(w), Some(b)) =
+                (&self.aggregate_embed_weight, &self.aggregate_embed_bias)
+            {
+                let rescale = ((inner_dim as f64) / (context_dim as f64)).sqrt() as f32;
+                linear3d(&context.mul_scalar(rescale)?, w, Some(b))?
+            } else {
+                context.clone()
+            };
+            if let Some(connector) = &self.connector {
+                connector.forward(&context_projected, encoder_attention_mask)?
+            } else if let Some(caption_proj) = &self.caption_projection {
+                caption_proj.forward(&context_projected)?
+            } else {
+                return Err(flame_core::Error::InvalidInput(
+                    "No text projection available".into(),
+                ));
+            }
         };
 
         // 6b. Compute prompt_timestep from prompt_adaln_single (ComfyUI 9-param path)
