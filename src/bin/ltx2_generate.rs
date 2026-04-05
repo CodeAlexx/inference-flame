@@ -55,22 +55,12 @@ fn main() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("Missing text_hidden"))?;
     println!("  Conditional: {:?} {:?}", text_cond.dims(), text_cond.dtype());
 
-    // Negative embedding: proper empty-string encoding from official pipeline
-    let neg_path = std::path::Path::new(
-        "/home/alex/EriDiffusion/inference-flame/cached_ltx2_negative.safetensors"
-    );
-    let text_uncond = if neg_path.exists() {
-        let neg = flame_core::serialization::load_file(neg_path, &device)?;
-        let t = neg.get("text_hidden")
-            .ok_or_else(|| anyhow::anyhow!("Missing text_hidden in negative"))?
-            .clone();
-        println!("  Unconditional: {:?} (official empty-string)", t.dims());
-        t
-    } else {
-        let t = Tensor::zeros_dtype(text_cond.shape().clone(), DType::BF16, device.clone())?;
-        println!("  Unconditional: zeros {:?} (fallback)", t.dims());
-        t
-    };
+    // Negative/unconditional embedding: zeros works reliably.
+    // NOTE: official empty-string embedding produces near-black output at low step counts
+    // because pos and neg embeddings are too similar after connector normalization.
+    // TODO: investigate proper negative embedding with 10+ steps.
+    let text_uncond = Tensor::zeros_dtype(text_cond.shape().clone(), DType::BF16, device.clone())?;
+    println!("  Unconditional: zeros {:?}", text_uncond.dims());
 
     // Stage 2: Load transformer
     println!("\n--- Stage 2: Load transformer ---");

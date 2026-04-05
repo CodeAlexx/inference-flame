@@ -563,8 +563,8 @@ impl LTX2Attention {
         let v = linear3d(kv_input, &self.to_v_weight, Some(&self.to_v_bias))?;
 
         // Fused RMSNorm across heads on Q and K
-        let q = fused_rms_norm(&q, &self.norm_q_weight, self.eps)?;
-        let k = fused_rms_norm(&k, &self.norm_k_weight, self.eps)?;
+        let q = rms_norm(&q, Some(&self.norm_q_weight), self.eps)?;
+        let k = rms_norm(&k, Some(&self.norm_k_weight), self.eps)?;
 
         // Apply rotary embeddings
         let q = if let Some((cos, sin)) = query_rope {
@@ -686,16 +686,12 @@ impl LTX2TransformerBlock {
             self.compute_ada_params_6(&self.scale_shift_table, temb, b, dim)?;
 
         // 1. Self-Attention with AdaLN-Zero
-        let mod_h = if let Some(w) = self.norm1_weight.as_ref() {
-            fused_rms_norm_modulate(hidden_states, w, &scale_msa, &shift_msa, self.eps)?
-        } else {
-            let norm_h = rms_norm(hidden_states, None, self.eps)?;
-            fused_modulate(&norm_h, &scale_msa, &shift_msa)?
-        };
+        let norm_h = rms_norm(hidden_states, self.norm1_weight.as_ref(), self.eps)?;
+        let mod_h = norm_h.mul(&scale_msa.add_scalar(1.0)?.to_dtype(DType::BF16)?)?.add(&shift_msa)?;
         let t_adaln = t0.elapsed().as_millis();
         let attn_out = self.attn1.forward(&mod_h, None, None, video_rotary_emb, None)?;
         let t_sa = t0.elapsed().as_millis() - t_adaln;
-        let mut hs = fused_residual_gate(hidden_states, &attn_out, &gate_msa)?;
+        let mut hs = hidden_states.add(&attn_out.mul(&gate_msa)?)?;
 
         // 2. Cross-Attention (text) — with or without adaln modulation
         if num_ada_params >= 9 {
@@ -704,12 +700,9 @@ impl LTX2TransformerBlock {
                 self.compute_ada_params_ca(&self.scale_shift_table, temb, b, dim)?;
 
             // Modulate query: rms_norm(x) * (1 + scale_q) + shift_q
-            let attn_input = if let Some(w) = self.norm2_weight.as_ref() {
-                fused_rms_norm_modulate(&hs, w, &scale_ca_q, &shift_ca_q, self.eps)?
-            } else {
-                let norm_hs = rms_norm(&hs, None, self.eps)?;
-                fused_modulate(&norm_hs, &scale_ca_q, &shift_ca_q)?
-            };
+            let attn_input = rms_norm(&hs, self.norm2_weight.as_ref(), self.eps)?
+                .mul(&scale_ca_q.add_scalar(1.0)?.to_dtype(DType::BF16)?)?
+                .add(&shift_ca_q)?;
 
             // Modulate context (KV) using prompt_scale_shift_table + prompt_timestep
             let modulated_context = if let (Some(psst), Some(pt)) =
@@ -726,7 +719,7 @@ impl LTX2TransformerBlock {
                 let shift_kv = combined.narrow(2, 0, 1)?.squeeze_dim(2)?; // [B, seq, dim]
                 let scale_kv = combined.narrow(2, 1, 1)?.squeeze_dim(2)?; // [B, seq, dim]
                 // context * (1 + scale_kv) + shift_kv
-                fused_modulate(encoder_hidden_states, &scale_kv, &shift_kv)?
+                encoder_hidden_states.mul(&scale_kv.add_scalar(1.0)?.to_dtype(DType::BF16)?)?.add(&shift_kv)?
             } else {
                 encoder_hidden_states.clone()
             };
@@ -734,7 +727,7 @@ impl LTX2TransformerBlock {
             let ca_out = self.attn2.forward(
                 &attn_input, Some(&modulated_context), encoder_attention_mask, None, None,
             )?;
-            hs = fused_residual_gate(&hs, &ca_out, &gate_ca)?;
+            hs = hs.add(&ca_out.mul(&gate_ca)?)?;
         } else {
             // Legacy 6-param path: no cross-attn modulation
             let norm_h2 = rms_norm(&hs, self.norm2_weight.as_ref(), self.eps)?;
@@ -747,14 +740,10 @@ impl LTX2TransformerBlock {
         let t_ca = t0.elapsed().as_millis() - t_adaln - t_sa;
 
         // 3. FeedForward with AdaLN-Zero
-        let mod_ff = if let Some(w) = self.norm3_weight.as_ref() {
-            fused_rms_norm_modulate(&hs, w, &scale_mlp, &shift_mlp, self.eps)?
-        } else {
-            let norm_ff = rms_norm(&hs, None, self.eps)?;
-            fused_modulate(&norm_ff, &scale_mlp, &shift_mlp)?
-        };
+        let norm_ff = rms_norm(&hs, self.norm3_weight.as_ref(), self.eps)?;
+        let mod_ff = norm_ff.mul(&scale_mlp.add_scalar(1.0)?.to_dtype(DType::BF16)?)?.add(&shift_mlp)?;
         let ff_out = self.ff.forward(&mod_ff)?;
-        hs = fused_residual_gate(&hs, &ff_out, &gate_mlp)?;
+        hs = hs.add(&ff_out.mul(&gate_mlp)?)?;
         let t_ff = t0.elapsed().as_millis() - t_adaln - t_sa - t_ca;
         log::info!("[PERF] adaln={}ms sa={}ms ca={}ms ff={}ms total={}ms",
             t_adaln, t_sa, t_ca, t_ff, t0.elapsed().as_millis());
