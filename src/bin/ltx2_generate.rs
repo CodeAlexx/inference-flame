@@ -8,12 +8,12 @@
 //! 5. Save denoised latents → decode with Python VAE
 
 use inference_flame::models::ltx2_model::{LTX2Config, LTX2StreamingModel};
-use inference_flame::sampling::ltx2_sampling::build_dev_sigma_schedule;
+use inference_flame::sampling::ltx2_sampling::{build_dev_sigma_schedule, LTX2_DISTILLED_SIGMAS};
 use flame_core::{global_cuda_device, DType, Shape, Tensor};
 use std::time::Instant;
 
 const MODEL_PATH: &str =
-    "/home/alex/.serenity/models/checkpoints/ltx-2.3-22b-dev.safetensors";
+    "/home/alex/.serenity/models/checkpoints/ltx-2.3-22b-distilled.safetensors";
 const EMBEDDINGS_PATH: &str =
     "/home/alex/EriDiffusion/inference-flame/cached_ltx2_embeddings.safetensors";
 const OUTPUT_PATH: &str =
@@ -25,8 +25,8 @@ const HEIGHT: usize = 288;
 const SEED: u64 = 42;
 const FRAME_RATE: f32 = 25.0;
 const LATENT_CHANNELS: usize = 128;
-const GUIDANCE_SCALE: f32 = 4.0; // Official LTX-2 default
-const NUM_STEPS: usize = 10;
+const GUIDANCE_SCALE: f32 = 1.0; // Distilled: no CFG needed
+const NUM_STEPS: usize = 8;     // Distilled fixed steps
 
 fn main() -> anyhow::Result<()> {
     env_logger::init();
@@ -68,9 +68,8 @@ fn main() -> anyhow::Result<()> {
     let config = LTX2Config::default();
     let mut model = LTX2StreamingModel::load_globals(MODEL_PATH, &config)?;
     println!("  Global params loaded in {:.1}s", t0.elapsed().as_secs_f32());
-    // FlameSwap disabled for quality verification — using sync fallback
-    // model.init_swap()?;
-    println!("  Using sync block loading (FlameSwap disabled)");
+    model.init_swap()?;
+    println!("  FlameSwap initialized in {:.1}s", t0.elapsed().as_secs_f32());
 
     // Stage 3: Noise + schedule
     println!("\n--- Stage 3: Prepare noise + sigmas ---");
@@ -99,7 +98,12 @@ fn main() -> anyhow::Result<()> {
         Shape::from_dims(&[1, LATENT_CHANNELS, latent_f, latent_h, latent_w]),
         device.clone(),
     )?;
-    let sigmas = build_dev_sigma_schedule(NUM_STEPS, num_tokens, 0.5, 1.15, 0.0);
+    let sigmas = if GUIDANCE_SCALE <= 1.0 {
+        // Distilled: use fixed sigma schedule
+        LTX2_DISTILLED_SIGMAS.to_vec()
+    } else {
+        build_dev_sigma_schedule(NUM_STEPS, num_tokens, 0.5, 1.15, 0.0)
+    };
     println!("  Noise: {:?}", noise.dims());
     println!("  Sigmas: {:?}", sigmas);
 
@@ -117,19 +121,20 @@ fn main() -> anyhow::Result<()> {
             vec![sigma], Shape::from_dims(&[1]), device.clone(),
         )?;
 
-        // Forward pass 1: unconditional
-        let velocity_uncond = model.forward_video_only(
-            &x, &sigma_t, &text_uncond, FRAME_RATE, None,
-        )?;
-
-        // Forward pass 2: conditional
-        let velocity_cond = model.forward_video_only(
-            &x, &sigma_t, text_cond, FRAME_RATE, None,
-        )?;
-
-        // CFG: pred = uncond + scale * (cond - uncond)
-        let delta = velocity_cond.sub(&velocity_uncond)?;
-        let velocity = velocity_uncond.add(&delta.mul_scalar(GUIDANCE_SCALE)?)?;
+        let velocity = if GUIDANCE_SCALE > 1.0 {
+            // CFG: two forward passes
+            let velocity_uncond = model.forward_video_only(
+                &x, &sigma_t, &text_uncond, FRAME_RATE, None,
+            )?;
+            let velocity_cond = model.forward_video_only(
+                &x, &sigma_t, text_cond, FRAME_RATE, None,
+            )?;
+            let delta = velocity_cond.sub(&velocity_uncond)?;
+            velocity_uncond.add(&delta.mul_scalar(GUIDANCE_SCALE)?)?
+        } else {
+            // No CFG: single forward pass (distilled model)
+            model.forward_video_only(&x, &sigma_t, text_cond, FRAME_RATE, None)?
+        };
 
         // Euler step
         if sigma_next == 0.0 {

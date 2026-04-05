@@ -80,3 +80,7 @@ path = "src/bin/rope_dump.rs"
 [[bin]]
 name = "temb_dump"
 path = "src/bin/temb_dump.rs"
+
+[[bin]]
+name = "swap_weight_compare"
+path = "src/bin/swap_weight_compare.rs"
