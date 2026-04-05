@@ -13,7 +13,7 @@ use flame_core::{global_cuda_device, DType, Shape, Tensor};
 use std::time::Instant;
 
 const MODEL_PATH: &str =
-    "/home/alex/.serenity/models/checkpoints/ltx-2.3-22b-dev-fp8.safetensors";
+    "/home/alex/.serenity/models/checkpoints/ltx-2.3-22b-dev.safetensors";
 const EMBEDDINGS_PATH: &str =
     "/home/alex/EriDiffusion/inference-flame/cached_ltx2_embeddings.safetensors";
 const OUTPUT_PATH: &str =
@@ -26,7 +26,7 @@ const SEED: u64 = 42;
 const FRAME_RATE: f32 = 25.0;
 const LATENT_CHANNELS: usize = 128;
 const GUIDANCE_SCALE: f32 = 4.0; // Official LTX-2 default
-const NUM_STEPS: usize = 10;
+const NUM_STEPS: usize = 3;
 
 fn main() -> anyhow::Result<()> {
     env_logger::init();
