@@ -78,8 +78,9 @@ fn main() -> anyhow::Result<()> {
     let config = LTX2Config::default();
     let mut model = LTX2StreamingModel::load_globals(MODEL_PATH, &config)?;
     println!("  Global params loaded in {:.1}s", t0.elapsed().as_secs_f32());
-    model.init_swap()?;
-    println!("  FlameSwap initialized in {:.1}s", t0.elapsed().as_secs_f32());
+    // FlameSwap disabled for quality verification — using sync fallback
+    // model.init_swap()?;
+    println!("  Using sync block loading (FlameSwap disabled)");
 
     // Stage 3: Noise + schedule
     println!("\n--- Stage 3: Prepare noise + sigmas ---");
