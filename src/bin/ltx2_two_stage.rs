@@ -216,21 +216,19 @@ fn main() -> anyhow::Result<()> {
             vec![sigma], Shape::from_dims(&[1]), device.clone(),
         )?;
 
+        // Model outputs velocity. Convert to X0: denoised = sample - sigma * velocity
+        // Then Euler step: velocity = (sample - denoised) / sigma, sample += velocity * dt
+        // Which simplifies to: sample += velocity * dt (velocity IS the model output)
         let (video_vel, audio_vel) = model.forward_audio_video(
             &video_x, &audio_x, &sigma_t,
             &video_context, &audio_context,
             FRAME_RATE,
         )?;
 
-        // Euler step
-        if sigma_next == 0.0 {
-            video_x = video_x.sub(&video_vel.mul_scalar(sigma)?)?;
-            audio_x = audio_x.sub(&audio_vel.mul_scalar(sigma)?)?;
-        } else {
-            let dt = sigma_next - sigma;
-            video_x = video_x.add(&video_vel.mul_scalar(dt)?)?;
-            audio_x = audio_x.add(&audio_vel.mul_scalar(dt)?)?;
-        }
+        // Euler step: x_{t+1} = x_t + velocity * dt, where dt = sigma_next - sigma
+        let dt = sigma_next - sigma;
+        video_x = video_x.add(&video_vel.mul_scalar(dt)?)?;
+        audio_x = audio_x.add(&audio_vel.mul_scalar(dt)?)?;
 
         // NaN check
         if let Ok(v) = video_x.to_vec() {
@@ -327,20 +325,18 @@ fn main() -> anyhow::Result<()> {
             vec![sigma], Shape::from_dims(&[1]), device.clone(),
         )?;
 
-        let (video_vel, audio_vel) = model.forward_audio_video(
+        let (video_x0, audio_x0) = model.forward_audio_video(
             &video_x, &audio_x, &sigma_t,
             &video_context, &audio_context,
             FRAME_RATE,
         )?;
 
-        if sigma_next == 0.0 {
-            video_x = video_x.sub(&video_vel.mul_scalar(sigma)?)?;
-            audio_x = audio_x.sub(&audio_vel.mul_scalar(sigma)?)?;
-        } else {
-            let dt = sigma_next - sigma;
-            video_x = video_x.add(&video_vel.mul_scalar(dt)?)?;
-            audio_x = audio_x.add(&audio_vel.mul_scalar(dt)?)?;
-        }
+        // Euler step: velocity = (sample - x0) / sigma, then sample += velocity * dt
+        let dt = sigma_next - sigma;
+        let video_vel = video_x.sub(&video_x0)?.mul_scalar(1.0 / sigma)?;
+        video_x = video_x.add(&video_vel.mul_scalar(dt)?)?;
+        let audio_vel = audio_x.sub(&audio_x0)?.mul_scalar(1.0 / sigma)?;
+        audio_x = audio_x.add(&audio_vel.mul_scalar(dt)?)?;
 
         // NaN check
         if let Ok(v) = video_x.to_vec() {
