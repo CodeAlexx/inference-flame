@@ -31,6 +31,17 @@ extern "C" {
         kind: i32, // 1=H2D, 2=D2H, 3=D2D
         stream: *mut c_void,
     ) -> i32;
+
+    /// GPU-side FP8 E4M3 → BF16 dequant.  out[i] = bf16(fp8(in[i]) * scale).
+    /// `input` and `output` are device pointers; `stream` may be the null
+    /// stream.  Returns 0 on success.
+    pub(crate) fn flame_fp8_to_bf16(
+        input: *const c_void,
+        output: *mut c_void,
+        scale: f32,
+        n_elements: usize,
+        stream: *mut c_void,
+    ) -> i32;
 }
 
 const CUDA_STREAM_NON_BLOCKING: u32 = 0x01;

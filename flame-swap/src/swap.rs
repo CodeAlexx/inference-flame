@@ -35,31 +35,6 @@ use flame_core::tensor::Tensor;
 
 use crate::ffi::{self, Event, Stream};
 
-/// Convert a single FP8 E4M3 byte to BF16 bits.
-#[inline]
-fn fp8_e4m3_to_bf16(bits: u8, scale: f32) -> u16 {
-    let sign = (bits >> 7) & 1;
-    let exp = (bits >> 3) & 0xF;
-    let mant = bits & 0x7;
-
-    if exp == 0 && mant == 0 {
-        return if sign == 1 { 0x8000 } else { 0 };
-    }
-    if exp == 0xF && mant == 0x7 {
-        return 0x7FC0; // NaN
-    }
-
-    let (effective_exp, effective_mant) = if exp == 0 {
-        (-6i32, mant as f32 / 8.0)
-    } else {
-        (exp as i32 - 7, 1.0 + mant as f32 / 8.0)
-    };
-
-    let magnitude = effective_mant * (2.0f32).powi(effective_exp);
-    let f = if sign == 1 { -magnitude } else { magnitude } * scale;
-    half::bf16::from_f32(f).to_bits()
-}
-
 // ---------------------------------------------------------------------------
 // Metadata
 // ---------------------------------------------------------------------------
@@ -84,23 +59,37 @@ struct TensorMeta {
 #[derive(Debug)]
 struct BlockMeta {
     tensors: Vec<TensorMeta>,
-    total_u16s: usize,
+    /// Total bytes written to staging for this block (sum of raw_bytes per tensor).
+    staging_bytes: usize,
+    /// Total bytes the gpu_buf must hold for this block (final BF16 region
+    /// for every tensor + a transient raw region for FP8 tensors).
+    gpu_bytes: usize,
 }
 
 #[derive(Debug, Clone)]
 struct StagingLayout {
+    /// Byte offset into the pinned staging buffer for this tensor's raw data.
     offset: usize,
-    numel: usize,
+    /// Bytes copied from the safetensors mmap into the pinned buffer.
+    /// BF16/F32 tensors use their full byte length; FP8 tensors copy `numel`
+    /// bytes (one per element).
+    raw_bytes: usize,
 }
 
 /// Pre-computed layout for a tensor inside a pre-allocated GPU buffer.
 ///
-/// Phase 1: every output tensor is BF16, so `final_offset` is byte-addressed
-/// into `gpu_buf[slot]` and `numel * 2` bytes are written there.
+/// `final_offset` always names the BF16 destination region the kernel/caller
+/// will read from.  `raw_offset` names the staging region the H2D copies into:
+/// for BF16 tensors it equals `final_offset` (DMA writes directly to the
+/// final region); for FP8 tensors it points into a separate transient region
+/// past the end of the BF16 area, which the dequant kernel reads from.
 #[derive(Debug, Clone)]
 struct GpuTensorLayout {
-    final_offset: usize, // byte offset into gpu_buf[slot]
-    numel: usize,        // BF16 element count
+    final_offset: usize,    // byte offset of BF16 output in gpu_buf[slot]
+    final_numel: usize,     // BF16 element count
+    raw_offset: usize,      // byte offset of raw H2D landing zone
+    raw_bytes: usize,       // bytes copied from staging to raw_offset
+    src_dtype: SourceDtype, // dtype of the raw bytes
 }
 
 // ---------------------------------------------------------------------------
@@ -156,8 +145,18 @@ struct StagingState {
     shutdown: bool,
 }
 
-struct SendPtr(*mut u16);
+struct SendPtr(*mut u8);
 unsafe impl Send for SendPtr {}
+
+/// Bytes one tensor occupies in the safetensors mmap (and therefore in the
+/// pinned staging buffer once raw-copied).
+fn raw_byte_size(t: &TensorMeta) -> usize {
+    match t.src_dtype {
+        SourceDtype::BF16 => t.numel * 2,
+        SourceDtype::F32 => t.numel * 4,
+        SourceDtype::F8E4M3 { .. } => t.numel, // 1 byte per element
+    }
+}
 
 // ---------------------------------------------------------------------------
 // FlameSwap
@@ -168,10 +167,11 @@ pub struct FlameSwap {
     blocks: Vec<BlockMeta>,
     layouts: Vec<Vec<StagingLayout>>,
     gpu_layouts: Vec<Vec<GpuTensorLayout>>,
-    staging: [PinnedHostBuffer<u16>; 2],
+    staging: [PinnedHostBuffer<u8>; 2],
     gpu_buf: [CudaSlice<u8>; 2],
     slot_state: [SlotState; 2],
-    max_block_bytes: usize,
+    max_staging_bytes: usize,
+    max_gpu_bytes: usize,
     transfer: Stream,
     event: Event,
     pending: Option<Pending>,
@@ -241,57 +241,98 @@ impl FlameSwap {
         let num_blocks = block_indices.last().map(|m| m + 1).unwrap_or(0);
 
         let mut blocks: Vec<BlockMeta> = (0..num_blocks)
-            .map(|_| BlockMeta { tensors: Vec::new(), total_u16s: 0 })
+            .map(|_| BlockMeta { tensors: Vec::new(), staging_bytes: 0, gpu_bytes: 0 })
             .collect();
 
         for idx in &block_indices {
             let tensors = all_tensors.remove(idx).unwrap();
-            let total_u16s: usize = tensors.iter().map(|t| t.numel).sum();
-            blocks[*idx] = BlockMeta { tensors, total_u16s };
+            let mut staging_bytes = 0usize;
+            let mut final_bytes = 0usize;
+            let mut fp8_bytes = 0usize;
+            for t in &tensors {
+                let raw = raw_byte_size(t);
+                staging_bytes += raw;
+                final_bytes += t.numel * 2;
+                if matches!(t.src_dtype, SourceDtype::F8E4M3 { .. }) {
+                    fp8_bytes += t.numel; // transient raw region for dequant
+                }
+            }
+            blocks[*idx] = BlockMeta {
+                tensors,
+                staging_bytes,
+                gpu_bytes: final_bytes + fp8_bytes,
+            };
         }
 
+        // Per-tensor staging layout: tensors packed sequentially at byte
+        // offsets in the pinned buffer.
         let layouts: Vec<Vec<StagingLayout>> = blocks
             .iter()
             .map(|block| {
                 let mut offset = 0usize;
                 block.tensors.iter().map(|t| {
-                    let layout = StagingLayout { offset, numel: t.numel };
-                    offset += t.numel;
+                    let raw = raw_byte_size(t);
+                    let layout = StagingLayout { offset, raw_bytes: raw };
+                    offset += raw;
                     layout
                 }).collect()
             })
             .collect();
 
-        // Phase 1: every output tensor is BF16 (= 2 bytes per element).
-        // Pack tensors sequentially in gpu_buf at byte offsets.
+        // GPU layout: pack every tensor's BF16 final region sequentially in
+        // gpu_buf, starting at offset 0.  Then any FP8 tensors get a transient
+        // raw landing zone packed AFTER the final region.  BF16/F32 tensors
+        // DMA directly into their final region (raw_offset == final_offset).
         let gpu_layouts: Vec<Vec<GpuTensorLayout>> = blocks
             .iter()
             .map(|block| {
-                let mut offset_bytes = 0usize;
-                block.tensors.iter().map(|t| {
-                    let layout = GpuTensorLayout { final_offset: offset_bytes, numel: t.numel };
-                    offset_bytes += t.numel * 2;
-                    layout
-                }).collect()
+                let final_total: usize = block.tensors.iter().map(|t| t.numel * 2).sum();
+                let mut final_off = 0usize;
+                let mut raw_off = final_total; // FP8 raw region starts here
+                let mut out = Vec::with_capacity(block.tensors.len());
+                for t in &block.tensors {
+                    let bf16_bytes = t.numel * 2;
+                    let (this_raw_off, this_raw_bytes) = match t.src_dtype {
+                        SourceDtype::BF16 => (final_off, bf16_bytes),
+                        SourceDtype::F32 => (final_off, t.numel * 4),
+                        SourceDtype::F8E4M3 { .. } => {
+                            let off = raw_off;
+                            raw_off += t.numel; // 1 byte per FP8 element
+                            (off, t.numel)
+                        }
+                    };
+                    out.push(GpuTensorLayout {
+                        final_offset: final_off,
+                        final_numel: t.numel,
+                        raw_offset: this_raw_off,
+                        raw_bytes: this_raw_bytes,
+                        src_dtype: t.src_dtype,
+                    });
+                    final_off += bf16_bytes;
+                }
+                out
             })
             .collect();
 
         let mmaps = Arc::new(mmaps);
 
-        let max_u16s = blocks.iter().map(|b| b.total_u16s).max().unwrap_or(1);
-        let max_block_bytes = max_u16s * 2;
-        let staging_a = PinnedHostBuffer::<u16>::with_capacity_elems(max_u16s, PinnedAllocFlags::DEFAULT)?;
-        let staging_b = PinnedHostBuffer::<u16>::with_capacity_elems(max_u16s, PinnedAllocFlags::DEFAULT)?;
+        let max_staging_bytes = blocks.iter().map(|b| b.staging_bytes).max().unwrap_or(1);
+        let max_gpu_bytes = blocks.iter().map(|b| b.gpu_bytes).max().unwrap_or(1);
+
+        let staging_a = PinnedHostBuffer::<u8>::with_capacity_elems(max_staging_bytes, PinnedAllocFlags::DEFAULT)?;
+        let staging_b = PinnedHostBuffer::<u8>::with_capacity_elems(max_staging_bytes, PinnedAllocFlags::DEFAULT)?;
 
         // Pre-allocate two GPU staging buffers, one per slot. After load(), no
         // per-block device.alloc happens in the hot path.
-        let gpu_buf_a: CudaSlice<u8> = unsafe { device.alloc::<u8>(max_block_bytes)? };
-        let gpu_buf_b: CudaSlice<u8> = unsafe { device.alloc::<u8>(max_block_bytes)? };
+        let gpu_buf_a: CudaSlice<u8> = unsafe { device.alloc::<u8>(max_gpu_bytes)? };
+        let gpu_buf_b: CudaSlice<u8> = unsafe { device.alloc::<u8>(max_gpu_bytes)? };
 
-        eprintln!("[FlameSwap] {} blocks, {:.1}MB max block, {:.1}MB pinned total, {:.1}MB GPU staging total",
-            num_blocks, max_block_bytes as f64 / 1e6,
-            (staging_a.len() + staging_b.len()) as f64 * 2.0 / 1e6,
-            (max_block_bytes * 2) as f64 / 1e6);
+        eprintln!("[FlameSwap] {} blocks, max staging {:.1}MB, max gpu {:.1}MB, pinned total {:.1}MB, GPU staging total {:.1}MB",
+            num_blocks,
+            max_staging_bytes as f64 / 1e6,
+            max_gpu_bytes as f64 / 1e6,
+            (max_staging_bytes * 2) as f64 / 1e6,
+            (max_gpu_bytes * 2) as f64 / 1e6);
 
         let state = Arc::new((
             Mutex::new(StagingState { request: None, complete: None, shutdown: false }),
@@ -299,8 +340,8 @@ impl FlameSwap {
         ));
 
         let ptrs = [
-            SendPtr(staging_a.as_ptr() as *mut u16),
-            SendPtr(staging_b.as_ptr() as *mut u16),
+            SendPtr(staging_a.as_ptr() as *mut u8),
+            SendPtr(staging_b.as_ptr() as *mut u8),
         ];
         let thread_mmaps = Arc::clone(&mmaps);
         let thread_blocks: Vec<Vec<TensorMeta>> = blocks.iter().map(|b| b.tensors.clone()).collect();
@@ -325,7 +366,8 @@ impl FlameSwap {
             staging: [staging_a, staging_b],
             gpu_buf: [gpu_buf_a, gpu_buf_b],
             slot_state: [SlotState::Idle, SlotState::Idle],
-            max_block_bytes,
+            max_staging_bytes,
+            max_gpu_bytes,
             transfer,
             event,
             pending: None,
@@ -376,17 +418,36 @@ impl FlameSwap {
         let gpu_base = *self.gpu_buf[slot.idx()].device_ptr();
         let host_base = self.staging[slot.idx()].as_ptr();
         for ((t_meta, sl), gl) in block.tensors.iter().zip(layout.iter()).zip(gpu_layout.iter()) {
-            debug_assert_eq!(sl.numel, gl.numel);
+            debug_assert_eq!(sl.raw_bytes, gl.raw_bytes);
+            // 1. H2D: pinned staging → gpu_buf raw region.
+            //    For BF16/F32 this lands directly in the final region; for FP8
+            //    this fills a transient region the dequant kernel reads from.
             unsafe {
-                let dst = (gpu_base + gl.final_offset as u64) as *mut c_void;
+                let dst = (gpu_base + gl.raw_offset as u64) as *mut c_void;
                 let src = host_base.add(sl.offset) as *const c_void;
-                let bytes = gl.numel * std::mem::size_of::<u16>();
-                ffi::flame_cuda_memcpy_async(dst, src, bytes, 1, std::ptr::null_mut());
+                ffi::flame_cuda_memcpy_async(dst, src, gl.raw_bytes, 1, std::ptr::null_mut());
+            }
+            // 2. If FP8, dispatch the GPU dequant kernel from raw → final.
+            if let SourceDtype::F8E4M3 { scale } = gl.src_dtype {
+                let raw_ptr = (gpu_base + gl.raw_offset as u64) as *const c_void;
+                let final_ptr = (gpu_base + gl.final_offset as u64) as *mut c_void;
+                let ret = unsafe {
+                    ffi::flame_fp8_to_bf16(
+                        raw_ptr,
+                        final_ptr,
+                        scale,
+                        gl.final_numel,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if ret != 0 {
+                    return Err(format!("flame_fp8_to_bf16 failed for {} ({})", t_meta.name, ret).into());
+                }
             }
             pending_tensors.push(PendingTensor {
                 name: t_meta.name.clone(),
                 offset: gl.final_offset,
-                numel: gl.numel,
+                numel: gl.final_numel,
                 shape: t_meta.shape.clone(),
             });
         }
@@ -430,7 +491,7 @@ impl FlameSwap {
     }
 
     pub fn pinned_bytes(&self) -> usize {
-        (self.staging[0].len() + self.staging[1].len()) * std::mem::size_of::<u16>()
+        self.max_staging_bytes * 2
     }
 
     fn request_staging(&self, block_idx: usize, slot: Slot) {
@@ -477,7 +538,7 @@ fn staging_thread_main(
     mmaps: Arc<Vec<Mmap>>,
     block_tensors: Vec<Vec<TensorMeta>>,
     layouts: Vec<Vec<StagingLayout>>,
-    staging_ptrs: [*mut u16; 2],
+    staging_ptrs: [*mut u8; 2],
     state: Arc<(Mutex<StagingState>, Condvar)>,
 ) {
     let (lock, cvar) = &*state;
@@ -494,49 +555,16 @@ fn staging_thread_main(
         let tensors = &block_tensors[block_idx];
         let layout = &layouts[block_idx];
 
-        // Process each tensor — use thread::scope for FP8 parallelism
+        // Pure raw memcpy from mmap into pinned staging — no CPU dequant.
+        // FP8 → BF16 conversion happens on GPU after the H2D transfer.
         for (t, sl) in tensors.iter().zip(layout.iter()) {
-            let dst = unsafe {
-                std::slice::from_raw_parts_mut(dst_base.add(sl.offset), sl.numel)
-            };
-            match t.src_dtype {
-                SourceDtype::F8E4M3 { scale } => {
-                    let src = &mmaps[t.file_idx][t.file_offset..t.file_offset + t.numel];
-                    // Parallel FP8 dequant using 8 chunks
-                    let num_threads = 8usize.min(t.numel / 1024 + 1);
-                    // Multi-threaded FP8 dequant using chunks_mut
-                    let chunk_size = (t.numel + num_threads - 1) / num_threads;
-                    thread::scope(|s| {
-                        for (i, dst_chunk) in dst.chunks_mut(chunk_size).enumerate() {
-                            let start = i * chunk_size;
-                            let src_chunk = &src[start..start + dst_chunk.len()];
-                            s.spawn(move || {
-                                for (d, &byte) in dst_chunk.iter_mut().zip(src_chunk.iter()) {
-                                    *d = fp8_e4m3_to_bf16(byte, scale);
-                                }
-                            });
-                        }
-                    });
-                }
-                SourceDtype::F32 => {
-                    let byte_len = t.numel * 4;
-                    let src = &mmaps[t.file_idx][t.file_offset..t.file_offset + byte_len];
-                    let src_f32 = unsafe {
-                        std::slice::from_raw_parts(src.as_ptr() as *const f32, t.numel)
-                    };
-                    for (d, &f) in dst.iter_mut().zip(src_f32.iter()) {
-                        *d = half::bf16::from_f32(f).to_bits();
-                    }
-                }
-                SourceDtype::BF16 => {
-                    let byte_len = t.numel * 2;
-                    let src = &mmaps[t.file_idx][t.file_offset..t.file_offset + byte_len];
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            src.as_ptr(), dst.as_mut_ptr() as *mut u8, byte_len,
-                        );
-                    }
-                }
+            let src = &mmaps[t.file_idx][t.file_offset..t.file_offset + sl.raw_bytes];
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    src.as_ptr(),
+                    dst_base.add(sl.offset),
+                    sl.raw_bytes,
+                );
             }
         }
 
