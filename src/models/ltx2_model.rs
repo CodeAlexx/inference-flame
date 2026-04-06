@@ -807,14 +807,22 @@ impl LTX2TransformerBlock {
         let attn_a_out = self.audio_attn1.forward(&mod_a, None, None, audio_rotary_emb, None)?;
         let mut audio_hidden_states = audio_hidden_states.add(&attn_a_out.mul(&a_gate_msa)?)?;
 
-        // ---- 2. Video/Audio Cross-Attention with text ----
+        // ---- 2. Video/Audio Cross-Attention with text (AdaLN modulated) ----
+        // Extract cross-attention modulation params (indices 6-8 of [9, dim] table)
+        let (v_shift_ca, v_scale_ca, v_gate_ca) =
+            self.compute_ada_params_ca(&self.scale_shift_table, temb, b, video_dim)?;
         let norm_h2 = rms_norm(&hidden_states, self.norm2_weight.as_ref(), self.eps)?;
-        let ca_out = self.attn2.forward(&norm_h2, Some(encoder_hidden_states), encoder_attention_mask, None, None)?;
-        hidden_states = hidden_states.add(&ca_out)?;
+        let mod_h2 = norm_h2.mul(&v_scale_ca.add_scalar(1.0)?)?.add(&v_shift_ca)?;
+        let ca_out = self.attn2.forward(&mod_h2, Some(encoder_hidden_states), encoder_attention_mask, None, None)?;
+        hidden_states = hidden_states.add(&ca_out.mul(&v_gate_ca)?)?;
 
+        let (a_shift_ca, a_scale_ca, a_gate_ca) =
+            self.compute_ada_params_ca(&self.audio_scale_shift_table, temb_audio, b, audio_dim)?;
         let norm_a2 = rms_norm(&audio_hidden_states, self.audio_norm2_weight.as_ref(), self.eps)?;
-        let ca_a_out = self.audio_attn2.forward(&norm_a2, Some(audio_encoder_hidden_states), audio_encoder_attention_mask, None, None)?;
-        audio_hidden_states = audio_hidden_states.add(&ca_a_out)?;
+        let mod_a2 = norm_a2.mul(&a_scale_ca.add_scalar(1.0)?)?.add(&a_shift_ca)?;
+        let ca_a_out = self.audio_attn2.forward(&mod_a2, Some(audio_encoder_hidden_states), audio_encoder_attention_mask, None, None)?;
+        audio_hidden_states = audio_hidden_states.add(&ca_a_out.mul(&a_gate_ca)?)?;
+
 
         // ---- 3. Audio-to-Video / Video-to-Audio Cross-Attention ----
         let norm_a2v = rms_norm(&hidden_states, self.audio_to_video_norm_weight.as_ref(), self.eps)?;
