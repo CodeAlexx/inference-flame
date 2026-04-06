@@ -76,6 +76,36 @@ impl DequantBuffer {
     }
 }
 
+/// Pre-allocated BF16 weight buffer. Single GPU allocation reused for every
+/// weight in every block across all denoise steps. Zero new GPU allocations
+/// during forward pass.
+pub struct PersistentBlockBuf {
+    /// Single shared BF16 buffer on GPU, sized to the largest FP8 weight.
+    pub buf_ptr: cudarc::driver::CudaSlice<u16>,
+    pub capacity: usize, // max elements
+    pub bufs: HashMap<String, Tensor>, // unused, kept for compatibility
+}
+
+impl PersistentBlockBuf {
+    /// Create persistent buffer sized to hold ALL FP8 weights in one block
+    /// simultaneously (they must all be alive during forward pass).
+    pub fn new(block: &ResidentBlock, device: &Arc<CudaDevice>) -> Result<Self> {
+        let mut total_numel = 0usize;
+        for (_name, raw) in &block.weights {
+            if let RawWeight::FP8 { shape, .. } = raw {
+                let numel: usize = shape.iter().product();
+                total_numel += numel;
+            }
+        }
+
+        if total_numel == 0 { total_numel = 1; } // avoid zero alloc
+        let buf_ptr: CudaSlice<u16> = unsafe { device.alloc(total_numel)? };
+        log::info!("[PersistentBlockBuf] Allocated {:.1}MB shared buffer ({} elements, all FP8 weights)",
+            total_numel as f64 * 2.0 / 1e6, total_numel);
+        Ok(Self { buf_ptr, capacity: total_numel, bufs: HashMap::new() })
+    }
+}
+
 impl ResidentBlock {
     /// Convert all weights to BF16 Tensors for one forward pass.
     /// **All 2D weight matrices are pre-transposed** to [in, out] layout
@@ -94,7 +124,7 @@ impl ResidentBlock {
             let tensor = match raw {
                 RawWeight::BF16 { tensor } => tensor.clone(), // Already pre-transposed at load
                 RawWeight::FP8 { data, shape, numel: _, scale } => {
-                    // Dequant to BF16
+                    // Dequant to BF16 (allocates new tensor each time)
                     let t = flame_core::ops::fused_inference::dequant_fp8_to_bf16(
                         data, *scale, Shape::from_dims(shape), device,
                     )?;
@@ -109,6 +139,106 @@ impl ResidentBlock {
             result.insert(name.clone(), tensor);
         }
 
+        for (name, tensor) in &self.f32_tensors {
+            result.insert(name.clone(), tensor.clone());
+        }
+
+        Ok(result)
+    }
+
+    /// Convert FP8 weights to BF16 using the persistent shared buffer.
+    /// **True zero-alloc**: all FP8 dequant writes into the persistent buffer,
+    /// then we create non-owning view tensors via `view_from_buffer`.
+    ///
+    /// Each FP8 weight gets a view into the shared buffer at sequential offsets.
+    /// The buffer is large enough for ALL FP8 weights in one block simultaneously
+    /// (they're consumed during forward, so we need them all alive at once).
+    ///
+    /// BF16 weights: Arc clone (zero copy).
+    /// F32 tensors: Arc clone (zero copy).
+    pub fn to_bf16_block_reuse(
+        &self,
+        persistent: &PersistentBlockBuf,
+        device: &Arc<CudaDevice>,
+    ) -> Result<HashMap<String, Tensor>> {
+        let mut result = HashMap::with_capacity(self.weights.len() + self.f32_tensors.len());
+
+        // Compute total FP8 elements needed to see if they fit in the shared buf
+        let mut fp8_entries: Vec<(&String, &CudaSlice<u8>, &[usize], f32, bool)> = Vec::new();
+        let mut total_needed = 0usize;
+        for (name, raw) in &self.weights {
+            if let RawWeight::FP8 { data, shape, scale, .. } = raw {
+                let transpose = needs_transpose(name, shape);
+                let numel: usize = shape.iter().product();
+                fp8_entries.push((name, data, shape, *scale, transpose));
+                total_needed += numel;
+            }
+        }
+
+        let use_shared = total_needed <= persistent.capacity;
+        if !use_shared {
+            log::warn!(
+                "[fp8_resident] FP8 total {} > buf capacity {}, falling back to per-weight alloc",
+                total_needed, persistent.capacity
+            );
+        }
+
+        let buf_base_ptr = *persistent.buf_ptr.device_ptr() as *mut u16;
+        let mut offset = 0usize;
+
+        // Process FP8 weights
+        for (name, fp8_data, shape, scale, transpose) in &fp8_entries {
+            let numel: usize = shape.iter().product();
+
+            let tensor = if use_shared {
+                // Create a view into the shared buffer at current offset
+                let view_ptr = unsafe { buf_base_ptr.add(offset) };
+                let (view_shape, out_shape_dims) = if *transpose {
+                    (Shape::from_dims(&[shape[1], shape[0]]), vec![shape[1], shape[0]])
+                } else {
+                    (Shape::from_dims(shape), shape.to_vec())
+                };
+                let view = unsafe {
+                    Tensor::view_from_buffer(view_ptr, view_shape, device.clone())
+                };
+
+                if *transpose {
+                    flame_core::ops::fused_inference::dequant_fp8_transpose_into(
+                        fp8_data, *scale, &view, shape[0], shape[1],
+                    )?;
+                } else {
+                    flame_core::ops::fused_inference::dequant_fp8_to_bf16_into(
+                        fp8_data, *scale, &view,
+                    )?;
+                }
+                offset += numel;
+                view
+            } else {
+                // Fallback: allocate per-weight
+                if *transpose {
+                    let out_shape = Shape::from_dims(&[shape[1], shape[0]]);
+                    let output = Tensor::zeros_dtype(out_shape, DType::BF16, device.clone())?;
+                    flame_core::ops::fused_inference::dequant_fp8_transpose_into(
+                        fp8_data, *scale, &output, shape[0], shape[1],
+                    )?;
+                    output
+                } else {
+                    flame_core::ops::fused_inference::dequant_fp8_to_bf16(
+                        fp8_data, *scale, Shape::from_dims(shape), device,
+                    )?
+                }
+            };
+            result.insert((*name).clone(), tensor);
+        }
+
+        // BF16 weights: zero-copy Arc clone
+        for (name, raw) in &self.weights {
+            if let RawWeight::BF16 { tensor } = raw {
+                result.insert(name.clone(), tensor.clone());
+            }
+        }
+
+        // F32 tensors: zero-copy Arc clone
         for (name, tensor) in &self.f32_tensors {
             result.insert(name.clone(), tensor.clone());
         }

@@ -24,8 +24,8 @@ const LTX_CHECKPOINT: &str = "/home/alex/.serenity/models/checkpoints/ltx-2.3-22
 const OUTPUT_DIR: &str = "/home/alex/EriDiffusion/inference-flame/output";
 
 // Generation params
-const PROMPT: &str = "A majestic eagle soaring through dramatic clouds at golden hour, cinematic lighting, rays of sunlight breaking through the sky, epic orchestral music";
-const NUM_FRAMES: usize = 9;
+const PROMPT: &str = "A close-up frames a woman pressed flat against a cold metal locker in a dark storage bay, her face half-lit by a single flickering overhead light. Condensation drips down riveted steel walls as she holds her breath, eyes wide, listening. She whispers to herself in a trembling, barely audible voice, Think. Think. The airlock is two decks down. She swallows hard, closing her eyes as a slow, wet scraping sound passes on the other side of the wall. Her lips move again, voice cracking, It can hear you. It can hear your heartbeat. Stop shaking. The camera drifts slowly from her face down to her hands gripping a makeshift weapon, a sharpened length of pipe wrapped in electrical tape, knuckles white. A distant metallic clang echoes through the bay and her eyes snap open. She exhales in a shuddering whisper, Move now or die here, and pushes off the wall, the camera tracking low behind her as she crouches into the darkness between cargo containers. The ambient hum of the ship s failing life support drones beneath the silence.";
+const NUM_FRAMES: usize = 257; // 8*32+1 = 257 frames → 10.28s at 25fps
 const WIDTH: usize = 480;
 const HEIGHT: usize = 288;
 const SEED: u64 = 42;
@@ -134,11 +134,27 @@ fn main() -> anyhow::Result<()> {
     )?;
     println!("  Audio context: {:?}", audio_context.dims());
 
-    // Free Gemma to reclaim VRAM
+    // Free Gemma + feature extraction to reclaim ALL VRAM for DiT
     drop(encoder);
     drop(all_hidden);
     drop(agg_weights);
-    println!("  Text encoding total: {:.1}s", t0.elapsed().as_secs_f32());
+    drop(audio_agg_weights);
+    drop(mask_out);
+    // Force CUDA memory pool to release cached allocations
+    let _ = device.synchronize();
+    // Trim the CUDA memory pool to free cached blocks
+    unsafe {
+        extern "C" {
+            fn cudaMemPoolTrimTo(pool: *mut std::ffi::c_void, min_bytes: usize) -> i32;
+            fn cudaDeviceGetDefaultMemPool(pool: *mut *mut std::ffi::c_void, device: i32) -> i32;
+        }
+        let mut pool: *mut std::ffi::c_void = std::ptr::null_mut();
+        let _ = cudaDeviceGetDefaultMemPool(&mut pool, 0);
+        if !pool.is_null() {
+            let _ = cudaMemPoolTrimTo(pool, 0);
+        }
+    }
+    println!("  Text encoding total: {:.1}s (VRAM freed)", t0.elapsed().as_secs_f32());
 
     // ========================================
     // Stage 2: Load LTX-2 Transformer
@@ -156,6 +172,11 @@ fn main() -> anyhow::Result<()> {
             model.init_swap()?;
             println!("  FlameSwap initialized in {:.1}s", t0.elapsed().as_secs_f32());
         }
+    }
+    // Print VRAM after model load
+    if let Ok((free, total)) = cudarc::driver::result::mem_get_info() {
+        println!("  VRAM: {:.1}GB used / {:.1}GB total ({:.1}GB free)",
+            (total - free) as f64 / 1e9, total as f64 / 1e9, free as f64 / 1e9);
     }
 
     // ========================================
@@ -286,7 +307,35 @@ fn simple_tokenize(text: &str, max_len: usize) -> anyhow::Result<(Vec<i32>, Vec<
         }
     }
 
-    // Fallback: use the single reference token file
+    // Scan ALL token files in bench dir for matching prompt
+    if let Ok(entries) = std::fs::read_dir(bench_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().map(|e| e == "json").unwrap_or(false)
+                && path.file_name().map(|n| n.to_str().unwrap_or("").starts_with("tokens")).unwrap_or(false)
+            {
+                if let Ok(token_json) = std::fs::read_to_string(&path) {
+                    if let Ok(tokens) = serde_json::from_str::<serde_json::Value>(&token_json) {
+                        let stored = tokens["prompt"].as_str().unwrap_or("");
+                        // Fuzzy match: compare first 60 chars to handle quote differences
+                        if stored.len() > 60 && text.len() > 60 && stored[..60] == text[..60] {
+                            let input_ids: Vec<i32> = tokens["input_ids"]
+                                .as_array().unwrap()
+                                .iter().map(|v| v.as_i64().unwrap() as i32)
+                                .collect();
+                            let attention_mask: Vec<i32> = tokens["attention_mask"]
+                                .as_array().unwrap()
+                                .iter().map(|v| v.as_i64().unwrap() as i32)
+                                .collect();
+                            eprintln!("  Matched token file: {:?}", path.file_name());
+                            return Ok((input_ids, attention_mask));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let ref_path = "/home/alex/ltx2-refs/gemma3/tokens.json";
     if std::path::Path::new(ref_path).exists() {
         let token_json = std::fs::read_to_string(ref_path)?;

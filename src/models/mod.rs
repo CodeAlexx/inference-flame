@@ -12,3 +12,5 @@ pub mod mistral_encoder;
 pub mod clip_encoder;
 pub mod t5_encoder;
 pub mod flux1_dit;
+pub mod ltx2_upsampler;
+pub mod lora_loader;

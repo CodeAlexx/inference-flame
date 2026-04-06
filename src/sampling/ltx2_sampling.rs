@@ -10,6 +10,12 @@ pub const LTX2_DISTILLED_SIGMAS: [f32; 9] = [
     1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0,
 ];
 
+/// Stage 2 refinement sigmas for two-stage pipeline (3 denoise steps).
+/// Applied after spatial upsampling to refine the upscaled latent.
+pub const LTX2_STAGE2_DISTILLED_SIGMAS: [f32; 4] = [
+    0.909375, 0.725, 0.421875, 0.0,
+];
+
 /// Build token-dependent sigma schedule for dev model (25 steps).
 ///
 /// Shifts sigmas based on latent token count using Flux-style exponential shift.
