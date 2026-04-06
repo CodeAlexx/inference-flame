@@ -2,10 +2,15 @@
 
 Pure Rust diffusion model inference using [flame-core](https://github.com/CodeAlexx/Flame). No Python, no diffusers, no ONNX.
 
-| Klein 9B | Z-Image | Anima 2B | SDXL |
-|---|---|---|---|
-| ![Klein 9B Sample](docs/klein9b_sample.png) | ![Z-Image Sample](docs/zimage_sample.png) | ![Anima Sample](docs/anima_sample.png) | ![SDXL Sample](docs/sdxl_sample.png) |
-| *1024x1024, 50 steps, CFG 4.0* | *1024x1024, 8 steps, turbo* | *1024x1024, 30 steps, CFG 4.5* | *1024x1024, 30 steps, CFG 7.5* |
+| Klein 9B | Z-Image | Anima 2B |
+|---|---|---|
+| ![Klein 9B](docs/klein9b_sample.png) | ![Z-Image](docs/zimage_sample.png) | ![Anima 2B](docs/anima_sample.png) |
+| *50 steps, CFG 4.0* | *8 steps, turbo* | *30 steps, CFG 4.5* |
+
+| SDXL | | |
+|---|---|---|
+| ![SDXL](docs/sdxl_sample.png) | | |
+| *30 steps, CFG 7.5* | | |
 
 ## Performance
 
