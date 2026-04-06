@@ -110,17 +110,13 @@ enum SlotState {
 // Pending DMA
 // ---------------------------------------------------------------------------
 
-struct PendingTensor {
-    name: String,
-    offset: usize,    // byte offset into gpu_buf[slot]
-    numel: usize,     // BF16 elements
-    shape: Vec<usize>,
-}
-
-struct Pending {
+/// In Phase 3 prefetch only registers a staging request and remembers which
+/// (block, slot) pair await_block should pick up.  No DMA happens until
+/// await_block.
+#[derive(Clone, Copy)]
+struct PendingRequest {
     block_idx: usize,
     slot: Slot,
-    tensors: Vec<PendingTensor>,
 }
 
 // ---------------------------------------------------------------------------
@@ -173,8 +169,16 @@ pub struct FlameSwap {
     max_staging_bytes: usize,
     max_gpu_bytes: usize,
     transfer: Stream,
-    event: Event,
-    pending: Option<Pending>,
+    /// Per-slot "data is ready on GPU" event.  Recorded on the transfer
+    /// stream after DMA + dequant; the default stream waits on it before
+    /// caller-issued compute kernels run.
+    ready_event: [Event; 2],
+    /// Per-slot "compute on this slot's data has been submitted to default
+    /// stream" event.  Recorded on the default stream by the next prefetch
+    /// that wants to reuse the slot, then the transfer stream waits on it
+    /// before overwriting the slot.
+    done_event: [Event; 2],
+    pending: Option<PendingRequest>,
     next_slot: Slot,
     state: Arc<(Mutex<StagingState>, Condvar)>,
     stage_thread: Option<thread::JoinHandle<()>>,
@@ -356,7 +360,10 @@ impl FlameSwap {
         });
 
         let transfer = Stream::new()?;
-        let event = Event::new()?;
+        let ready_a = Event::new()?;
+        let ready_b = Event::new()?;
+        let done_a = Event::new()?;
+        let done_b = Event::new()?;
 
         Ok(Self {
             mmaps,
@@ -369,7 +376,8 @@ impl FlameSwap {
             max_staging_bytes,
             max_gpu_bytes,
             transfer,
-            event,
+            ready_event: [ready_a, ready_b],
+            done_event: [done_a, done_b],
             pending: None,
             next_slot: Slot::A,
             state,
@@ -380,54 +388,73 @@ impl FlameSwap {
 
     pub fn num_blocks(&self) -> usize { self.blocks.len() }
 
+    /// Submit a staging request for `idx` and return immediately.  No DMA,
+    /// no kernel launches.  Slot reuse hazards are guarded by `done_event`:
+    /// if the chosen slot is still flagged InCompute from the previous
+    /// round, we record the done_event on the default stream (capturing all
+    /// caller-issued kernels submitted up to now) and tell the transfer
+    /// stream to wait on it before any subsequent DMA fires.
     pub fn prefetch(&mut self, idx: usize) -> Result<(), Box<dyn std::error::Error>> {
         assert!(idx < self.blocks.len(), "block index {idx} out of range");
-
-        // Drain any leftover pending from a prior call.  In Phase 1 the DMA
-        // is on the default stream so it is already serialized with the
-        // caller's compute, but we still drop the slot record.
-        if self.pending.is_some() {
-            self.pending = None;
-        }
+        assert!(
+            self.pending.is_none(),
+            "prefetch({idx}) called before await_block consumed the previous prefetch"
+        );
 
         let slot = self.next_slot;
-
-        // Slot reuse safety: in Phase 1 all DMA + compute is on the default
-        // stream which serializes naturally.  Both Idle (first use) and
-        // InCompute (caller has finished launching kernels that read this
-        // slot) are valid starting states; subsequent default-stream DMA
-        // will execute after those kernels complete in stream order.
         let prior = self.slot_state[slot.idx()];
         assert!(
             prior == SlotState::Idle || prior == SlotState::InCompute,
             "slot {slot:?} not reusable: state = {prior:?}",
         );
-        self.slot_state[slot.idx()] = SlotState::Idle;
 
+        if prior == SlotState::InCompute {
+            // Snapshot the default stream's progress and gate the transfer
+            // stream behind it so the upcoming H2D + dequant cannot stomp on
+            // memory the caller is still reading from.
+            self.done_event[slot.idx()].record_default()?;
+            self.transfer.wait_event(&self.done_event[slot.idx()])?;
+        }
         self.slot_state[slot.idx()] = SlotState::StagingRequested;
+
         self.request_staging(idx, slot);
+
+        self.pending = Some(PendingRequest { block_idx: idx, slot });
+        self.next_slot = slot.flip();
+        Ok(())
+    }
+
+    /// Wait for the staging copy to land in the pinned buffer, then issue
+    /// the H2D copies + FP8 dequant kernels on the transfer stream, gate the
+    /// default stream behind a ready_event, and return non-owning Tensor
+    /// views into gpu_buf[slot].  No host-side `cudaStreamSynchronize` is
+    /// performed — the caller's subsequent default-stream kernels (and any
+    /// to_vec/D2H copies) will automatically wait on ready_event.
+    pub fn await_block(&mut self, idx: usize) -> Result<HashMap<String, Tensor>, Box<dyn std::error::Error>> {
+        let req = self.pending.take()
+            .ok_or("await_block called without a prior prefetch")?;
+        assert_eq!(req.block_idx, idx);
+        let slot = req.slot;
+        debug_assert_eq!(self.slot_state[slot.idx()], SlotState::StagingRequested);
+
         self.wait_staging(idx, slot)?;
         self.slot_state[slot.idx()] = SlotState::Staged;
 
         let block = &self.blocks[idx];
         let layout = &self.layouts[idx];
         let gpu_layout = &self.gpu_layouts[idx];
-        let mut pending_tensors = Vec::with_capacity(block.tensors.len());
 
         self.slot_state[slot.idx()] = SlotState::Transferring;
         let gpu_base = *self.gpu_buf[slot.idx()].device_ptr();
         let host_base = self.staging[slot.idx()].as_ptr();
+        let transfer_raw = self.transfer.as_raw();
         for ((t_meta, sl), gl) in block.tensors.iter().zip(layout.iter()).zip(gpu_layout.iter()) {
             debug_assert_eq!(sl.raw_bytes, gl.raw_bytes);
-            // 1. H2D: pinned staging → gpu_buf raw region.
-            //    For BF16/F32 this lands directly in the final region; for FP8
-            //    this fills a transient region the dequant kernel reads from.
             unsafe {
                 let dst = (gpu_base + gl.raw_offset as u64) as *mut c_void;
                 let src = host_base.add(sl.offset) as *const c_void;
-                ffi::flame_cuda_memcpy_async(dst, src, gl.raw_bytes, 1, std::ptr::null_mut());
+                ffi::flame_cuda_memcpy_async(dst, src, gl.raw_bytes, 1, transfer_raw);
             }
-            // 2. If FP8, dispatch the GPU dequant kernel from raw → final.
             if let SourceDtype::F8E4M3 { scale } = gl.src_dtype {
                 let raw_ptr = (gpu_base + gl.raw_offset as u64) as *const c_void;
                 let final_ptr = (gpu_base + gl.final_offset as u64) as *mut c_void;
@@ -437,50 +464,30 @@ impl FlameSwap {
                         final_ptr,
                         scale,
                         gl.final_numel,
-                        std::ptr::null_mut(),
+                        transfer_raw,
                     )
                 };
                 if ret != 0 {
                     return Err(format!("flame_fp8_to_bf16 failed for {} ({})", t_meta.name, ret).into());
                 }
             }
-            pending_tensors.push(PendingTensor {
-                name: t_meta.name.clone(),
-                offset: gl.final_offset,
-                numel: gl.final_numel,
-                shape: t_meta.shape.clone(),
-            });
         }
+
+        // Publish "data ready" so the default stream waits before reading.
+        self.ready_event[slot.idx()].record(&self.transfer)?;
+        ffi::default_stream_wait_event(&self.ready_event[slot.idx()])?;
         self.slot_state[slot.idx()] = SlotState::Ready;
 
-        self.pending = Some(Pending { block_idx: idx, slot, tensors: pending_tensors });
-        self.next_slot = slot.flip();
-        if idx + 1 < self.blocks.len() {
-            self.request_staging(idx + 1, self.next_slot);
-        }
-        Ok(())
-    }
-
-    pub fn await_block(&mut self, idx: usize) -> Result<HashMap<String, Tensor>, Box<dyn std::error::Error>> {
-        let pending = self.pending.take()
-            .ok_or("await_block called without a prior prefetch")?;
-        assert_eq!(pending.block_idx, idx);
-        let slot = pending.slot;
-        debug_assert_eq!(self.slot_state[slot.idx()], SlotState::Ready);
-
-        let gpu_base = *self.gpu_buf[slot.idx()].device_ptr();
-        let mut weights = HashMap::with_capacity(pending.tensors.len());
-        for pt in pending.tensors {
-            let shape = Shape::new(pt.shape);
-            let ptr = (gpu_base + pt.offset as u64) as *mut u16;
+        // Build non-owning Tensor views over the gpu_buf region.
+        let mut weights = HashMap::with_capacity(block.tensors.len());
+        for (t_meta, gl) in block.tensors.iter().zip(gpu_layout.iter()) {
+            let shape = Shape::new(t_meta.shape.clone());
+            let ptr = (gpu_base + gl.final_offset as u64) as *mut u16;
             let tensor = unsafe {
                 Tensor::view_from_buffer(ptr, shape, Arc::clone(&self.device))
             };
-            weights.insert(pt.name, tensor);
+            weights.insert(t_meta.name.clone(), tensor);
         }
-        // Caller now owns non-owning views into gpu_buf[slot]; mark slot as
-        // in compute so the next prefetch knows to wait for default-stream
-        // serialization (Phase 1) or the done event (Phase 3).
         self.slot_state[slot.idx()] = SlotState::InCompute;
         Ok(weights)
     }

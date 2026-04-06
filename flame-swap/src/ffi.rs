@@ -144,6 +144,13 @@ impl Event {
     }
 }
 
+/// Make the default (null) stream wait until `event` is signaled.  Subsequent
+/// kernels launched on the default stream will not start until the work that
+/// recorded the event has completed.
+pub fn default_stream_wait_event(event: &Event) -> Result<(), CudaError> {
+    unsafe { check(cudaStreamWaitEvent(std::ptr::null_mut(), event.raw, 0)) }
+}
+
 impl Drop for Event {
     fn drop(&mut self) {
         unsafe { cudaEventDestroy(self.raw); }
