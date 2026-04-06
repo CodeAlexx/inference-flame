@@ -93,18 +93,44 @@ struct StagingLayout {
     numel: usize,
 }
 
+/// Pre-computed layout for a tensor inside a pre-allocated GPU buffer.
+///
+/// Phase 1: every output tensor is BF16, so `final_offset` is byte-addressed
+/// into `gpu_buf[slot]` and `numel * 2` bytes are written there.
+#[derive(Debug, Clone)]
+struct GpuTensorLayout {
+    final_offset: usize, // byte offset into gpu_buf[slot]
+    numel: usize,        // BF16 element count
+}
+
+// ---------------------------------------------------------------------------
+// Slot state machine
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SlotState {
+    Idle,
+    StagingRequested,
+    Staged,
+    Transferring,
+    Ready,
+    InCompute,
+}
+
 // ---------------------------------------------------------------------------
 // Pending DMA
 // ---------------------------------------------------------------------------
 
 struct PendingTensor {
     name: String,
-    gpu: CudaSlice<u16>,
+    offset: usize,    // byte offset into gpu_buf[slot]
+    numel: usize,     // BF16 elements
     shape: Vec<usize>,
 }
 
 struct Pending {
     block_idx: usize,
+    slot: Slot,
     tensors: Vec<PendingTensor>,
 }
 
@@ -141,7 +167,11 @@ pub struct FlameSwap {
     mmaps: Arc<Vec<Mmap>>,
     blocks: Vec<BlockMeta>,
     layouts: Vec<Vec<StagingLayout>>,
+    gpu_layouts: Vec<Vec<GpuTensorLayout>>,
     staging: [PinnedHostBuffer<u16>; 2],
+    gpu_buf: [CudaSlice<u8>; 2],
+    slot_state: [SlotState; 2],
+    max_block_bytes: usize,
     transfer: Stream,
     event: Event,
     pending: Option<Pending>,
@@ -232,15 +262,36 @@ impl FlameSwap {
             })
             .collect();
 
+        // Phase 1: every output tensor is BF16 (= 2 bytes per element).
+        // Pack tensors sequentially in gpu_buf at byte offsets.
+        let gpu_layouts: Vec<Vec<GpuTensorLayout>> = blocks
+            .iter()
+            .map(|block| {
+                let mut offset_bytes = 0usize;
+                block.tensors.iter().map(|t| {
+                    let layout = GpuTensorLayout { final_offset: offset_bytes, numel: t.numel };
+                    offset_bytes += t.numel * 2;
+                    layout
+                }).collect()
+            })
+            .collect();
+
         let mmaps = Arc::new(mmaps);
 
         let max_u16s = blocks.iter().map(|b| b.total_u16s).max().unwrap_or(1);
+        let max_block_bytes = max_u16s * 2;
         let staging_a = PinnedHostBuffer::<u16>::with_capacity_elems(max_u16s, PinnedAllocFlags::DEFAULT)?;
         let staging_b = PinnedHostBuffer::<u16>::with_capacity_elems(max_u16s, PinnedAllocFlags::DEFAULT)?;
 
-        eprintln!("[FlameSwap] {} blocks, {:.1}MB max block, {:.1}MB pinned total",
-            num_blocks, max_u16s as f64 * 2.0 / 1e6,
-            (staging_a.len() + staging_b.len()) as f64 * 2.0 / 1e6);
+        // Pre-allocate two GPU staging buffers, one per slot. After load(), no
+        // per-block device.alloc happens in the hot path.
+        let gpu_buf_a: CudaSlice<u8> = unsafe { device.alloc::<u8>(max_block_bytes)? };
+        let gpu_buf_b: CudaSlice<u8> = unsafe { device.alloc::<u8>(max_block_bytes)? };
+
+        eprintln!("[FlameSwap] {} blocks, {:.1}MB max block, {:.1}MB pinned total, {:.1}MB GPU staging total",
+            num_blocks, max_block_bytes as f64 / 1e6,
+            (staging_a.len() + staging_b.len()) as f64 * 2.0 / 1e6,
+            (max_block_bytes * 2) as f64 / 1e6);
 
         let state = Arc::new((
             Mutex::new(StagingState { request: None, complete: None, shutdown: false }),
@@ -270,7 +321,11 @@ impl FlameSwap {
             mmaps,
             blocks,
             layouts,
+            gpu_layouts,
             staging: [staging_a, staging_b],
+            gpu_buf: [gpu_buf_a, gpu_buf_b],
+            slot_state: [SlotState::Idle, SlotState::Idle],
+            max_block_bytes,
             transfer,
             event,
             pending: None,
@@ -286,33 +341,58 @@ impl FlameSwap {
     pub fn prefetch(&mut self, idx: usize) -> Result<(), Box<dyn std::error::Error>> {
         assert!(idx < self.blocks.len(), "block index {idx} out of range");
 
+        // Drain any leftover pending from a prior call.  In Phase 1 the DMA
+        // is on the default stream so it is already serialized with the
+        // caller's compute, but we still drop the slot record.
         if self.pending.is_some() {
-            self.transfer.synchronize()?;
             self.pending = None;
         }
 
         let slot = self.next_slot;
+
+        // Slot reuse safety: in Phase 1 all DMA + compute is on the default
+        // stream which serializes naturally.  Both Idle (first use) and
+        // InCompute (caller has finished launching kernels that read this
+        // slot) are valid starting states; subsequent default-stream DMA
+        // will execute after those kernels complete in stream order.
+        let prior = self.slot_state[slot.idx()];
+        assert!(
+            prior == SlotState::Idle || prior == SlotState::InCompute,
+            "slot {slot:?} not reusable: state = {prior:?}",
+        );
+        self.slot_state[slot.idx()] = SlotState::Idle;
+
+        self.slot_state[slot.idx()] = SlotState::StagingRequested;
         self.request_staging(idx, slot);
         self.wait_staging(idx, slot)?;
+        self.slot_state[slot.idx()] = SlotState::Staged;
 
         let block = &self.blocks[idx];
         let layout = &self.layouts[idx];
+        let gpu_layout = &self.gpu_layouts[idx];
         let mut pending_tensors = Vec::with_capacity(block.tensors.len());
 
-        for (t_meta, sl) in block.tensors.iter().zip(layout.iter()) {
-            let gpu: CudaSlice<u16> = unsafe { self.device.alloc::<u16>(sl.numel)? };
+        self.slot_state[slot.idx()] = SlotState::Transferring;
+        let gpu_base = *self.gpu_buf[slot.idx()].device_ptr();
+        let host_base = self.staging[slot.idx()].as_ptr();
+        for ((t_meta, sl), gl) in block.tensors.iter().zip(layout.iter()).zip(gpu_layout.iter()) {
+            debug_assert_eq!(sl.numel, gl.numel);
             unsafe {
-                let dst = *gpu.device_ptr() as *mut c_void;
-                let src = self.staging[slot.idx()].as_ptr().add(sl.offset) as *const c_void;
-                let bytes = sl.numel * std::mem::size_of::<u16>();
+                let dst = (gpu_base + gl.final_offset as u64) as *mut c_void;
+                let src = host_base.add(sl.offset) as *const c_void;
+                let bytes = gl.numel * std::mem::size_of::<u16>();
                 ffi::flame_cuda_memcpy_async(dst, src, bytes, 1, std::ptr::null_mut());
             }
             pending_tensors.push(PendingTensor {
-                name: t_meta.name.clone(), gpu, shape: t_meta.shape.clone(),
+                name: t_meta.name.clone(),
+                offset: gl.final_offset,
+                numel: gl.numel,
+                shape: t_meta.shape.clone(),
             });
         }
+        self.slot_state[slot.idx()] = SlotState::Ready;
 
-        self.pending = Some(Pending { block_idx: idx, tensors: pending_tensors });
+        self.pending = Some(Pending { block_idx: idx, slot, tensors: pending_tensors });
         self.next_slot = slot.flip();
         if idx + 1 < self.blocks.len() {
             self.request_staging(idx + 1, self.next_slot);
@@ -324,13 +404,23 @@ impl FlameSwap {
         let pending = self.pending.take()
             .ok_or("await_block called without a prior prefetch")?;
         assert_eq!(pending.block_idx, idx);
+        let slot = pending.slot;
+        debug_assert_eq!(self.slot_state[slot.idx()], SlotState::Ready);
 
+        let gpu_base = *self.gpu_buf[slot.idx()].device_ptr();
         let mut weights = HashMap::with_capacity(pending.tensors.len());
         for pt in pending.tensors {
             let shape = Shape::new(pt.shape);
-            let tensor = Tensor::from_bf16_slice_gpu(pt.gpu, shape, Arc::clone(&self.device));
+            let ptr = (gpu_base + pt.offset as u64) as *mut u16;
+            let tensor = unsafe {
+                Tensor::view_from_buffer(ptr, shape, Arc::clone(&self.device))
+            };
             weights.insert(pt.name, tensor);
         }
+        // Caller now owns non-owning views into gpu_buf[slot]; mark slot as
+        // in compute so the next prefetch knows to wait for default-stream
+        // serialization (Phase 1) or the done event (Phase 3).
+        self.slot_state[slot.idx()] = SlotState::InCompute;
         Ok(weights)
     }
 
