@@ -262,8 +262,111 @@ fn main() -> anyhow::Result<()> {
         println!("  Stage 1 audio latents: nan={}/{}", nan_count, v.len());
     }
 
-    // Skip upsampler — save raw stage 1 output directly
-    println!("\n--- Saving raw stage 1 latents (no upsampler, no stage 2) ---");
+    // ========================================
+    // Spatial Upsampler: 2x video latent
+    // ========================================
+    println!("\n--- Spatial Upsampler (2x) ---");
+    let t0 = Instant::now();
+
+    let vae_weights = flame_core::serialization::load_file_filtered(
+        std::path::Path::new(VAE_PATH), &device,
+        |key| key == "latents_mean" || key == "latents_std",
+    )?;
+    let latents_mean = vae_weights.get("latents_mean")
+        .ok_or_else(|| anyhow::anyhow!("Missing latents_mean"))?;
+    let latents_std = vae_weights.get("latents_std")
+        .ok_or_else(|| anyhow::anyhow!("Missing latents_std"))?;
+
+    // Un-normalize: x * std + mean
+    let mean_5d = latents_mean.reshape(&[1, LATENT_CHANNELS, 1, 1, 1])?;
+    let std_5d = latents_std.reshape(&[1, LATENT_CHANNELS, 1, 1, 1])?;
+    let video_unnorm = video_x.mul(&std_5d)?.add(&mean_5d)?;
+    drop(video_x);
+
+    let upsampler = LTX2LatentUpsampler::load(UPSAMPLER_PATH, &device)?;
+    println!("  Upsampler loaded in {:.1}s", t0.elapsed().as_secs_f32());
+
+    let video_upscaled = upsampler.forward(&video_unnorm)?;
+    drop(upsampler);
+    drop(video_unnorm);
+    println!("  Upscaled: {:?} in {:.1}s", video_upscaled.shape().dims(), t0.elapsed().as_secs_f32());
+
+    // Re-normalize: (x - mean) / std
+    let s2_mean = latents_mean.reshape(&[1, LATENT_CHANNELS, 1, 1, 1])?;
+    let s2_std = latents_std.reshape(&[1, LATENT_CHANNELS, 1, 1, 1])?;
+    let mut video_x = video_upscaled.sub(&s2_mean)?.div(&s2_std)?;
+    drop(vae_weights);
+
+    // ========================================
+    // Stage 2: Refine at FULL resolution (FlameSwap)
+    // ========================================
+    let s2_sigmas = LTX2_STAGE2_DISTILLED_SIGMAS.to_vec();
+    let s2_steps = s2_sigmas.len() - 1;
+    println!("\n--- Stage 2: Refine at {}x{} ({} steps) ---", TARGET_WIDTH, TARGET_HEIGHT, s2_steps);
+    let t0 = Instant::now();
+
+    // Add noise at stage 2 starting sigma
+    let noise_scale = s2_sigmas[0];
+    let s2_video_numel = LATENT_CHANNELS * latent_f * s2_latent_h * s2_latent_w;
+    let noise = make_noise(s2_video_numel, SEED + 100,
+        &[1, LATENT_CHANNELS, latent_f, s2_latent_h, s2_latent_w], &device)?;
+    video_x = video_x.mul_scalar(1.0 - noise_scale)?.add(&noise.mul_scalar(noise_scale)?)?;
+    drop(noise);
+
+    let audio_noise = make_noise(audio_numel, SEED + 101,
+        &[1, AUDIO_CHANNELS, audio_frames, AUDIO_MEL_BINS], &device)?;
+    audio_x = audio_x.mul_scalar(1.0 - noise_scale)?.add(&audio_noise.mul_scalar(noise_scale)?)?;
+    drop(audio_noise);
+
+    for step in 0..s2_steps {
+        let sigma = s2_sigmas[step];
+        let sigma_next = s2_sigmas[step + 1];
+        let t_step = Instant::now();
+
+        let sigma_t = Tensor::from_f32_to_bf16(
+            vec![sigma], Shape::from_dims(&[1]), device.clone(),
+        )?;
+
+        let (video_vel, audio_vel) = model.forward_audio_video(
+            &video_x, &audio_x, &sigma_t,
+            &video_context, &audio_context,
+            FRAME_RATE,
+        )?;
+
+        if sigma_next == 0.0 {
+            video_x = video_x.sub(&video_vel.mul_scalar(sigma)?)?;
+            audio_x = audio_x.sub(&audio_vel.mul_scalar(sigma)?)?;
+        } else {
+            let dt = sigma_next - sigma;
+            video_x = video_x.add(&video_vel.mul_scalar(dt)?)?;
+            audio_x = audio_x.add(&audio_vel.mul_scalar(dt)?)?;
+        }
+
+        // NaN check
+        if let Ok(v) = video_x.to_vec() {
+            let nan_count = v.iter().filter(|x| x.is_nan()).count();
+            if nan_count > 0 {
+                println!("  WARNING: {} NaN in video_x after stage 2 step {}", nan_count, step + 1);
+            }
+        }
+
+        println!("  Step {}/{} sigma={:.4} dt={:.1}s",
+            step + 1, s2_steps, sigma, t_step.elapsed().as_secs_f32());
+    }
+    println!("  Stage 2 done in {:.1}s ({:.1}s/step)", t0.elapsed().as_secs_f32(),
+        t0.elapsed().as_secs_f32() / s2_steps as f32);
+
+    // Final latent stats
+    if let Ok(v) = video_x.to_vec() {
+        let nan_count = v.iter().filter(|x| x.is_nan()).count();
+        let valid: Vec<f32> = v.iter().filter(|x| !x.is_nan()).copied().collect();
+        if !valid.is_empty() {
+            let mean: f32 = valid.iter().sum::<f32>() / valid.len() as f32;
+            println!("  Final video latents: mean={:.4} std={:.4} nan={}/{}",
+                mean, (valid.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / valid.len() as f32).sqrt(),
+                nan_count, v.len());
+        }
+    }
 
     // ========================================
     // Save latents
