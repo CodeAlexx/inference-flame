@@ -2121,9 +2121,11 @@ impl LTX2StreamingModel {
             .ok();
         let av_v_gate = load_ada_layer_norm_single(&globals, "av_cross_attn_video_a2v_gate", 1)
             .or_else(|_| load_ada_layer_norm_single(&globals, "av_ca_video_a2v_gate_adaln_single", 1))
+            .or_else(|_| load_ada_layer_norm_single(&globals, "av_ca_a2v_gate_adaln_single", 1))
             .ok();
         let av_a_gate = load_ada_layer_norm_single(&globals, "av_cross_attn_audio_v2a_gate", 1)
             .or_else(|_| load_ada_layer_norm_single(&globals, "av_ca_audio_v2a_gate_adaln_single", 1))
+            .or_else(|_| load_ada_layer_norm_single(&globals, "av_ca_v2a_gate_adaln_single", 1))
             .ok();
 
         let has_audio = audio_proj_in_w.is_some();
@@ -2237,8 +2239,9 @@ impl LTX2StreamingModel {
                 if k == "__metadata__" || !k.starts_with(&block_prefix) { continue; }
                 if k.ends_with("_scale") || k.ends_with("input_scale") { continue; }
 
-                // Keep FP8 audio on GPU (1 byte/param, cheap).
-                // Skip BF16 audio from boundary blocks (loaded per-block from disk — only 4 blocks).
+                // Skip only LARGE BF16 2D audio weight matrices from boundary blocks
+                // (these are loaded per-block from disk during forward to avoid OOM).
+                // Keep biases (1D), norms (1D), and F32 scale_shift_tables for all blocks.
                 let stripped_key = k.strip_prefix(&block_prefix).unwrap_or(k);
                 let is_audio_key = stripped_key.starts_with("audio_")
                     || stripped_key.starts_with("video_to_audio")
@@ -2246,7 +2249,13 @@ impl LTX2StreamingModel {
                     || stripped_key.contains("scale_shift_table_a2v")
                     || stripped_key.starts_with("audio_prompt_scale_shift");
                 let dtype_str = v["dtype"].as_str().unwrap_or("?");
-                if is_audio_key && dtype_str != "F8_E4M3" {
+                let empty_arr = vec![];
+                let shape_arr = v["shape"].as_array().unwrap_or(&empty_arr);
+                let is_large_2d = shape_arr.len() == 2
+                    && shape_arr.iter().all(|s| s.as_u64().unwrap_or(0) > 1);
+                // Only skip large 2D BF16 audio weights (boundary block matrices).
+                // Keep biases, norms, F32 tables, and FP8 weights.
+                if is_audio_key && dtype_str == "BF16" && is_large_2d {
                     continue;
                 }
 
@@ -2317,6 +2326,13 @@ impl LTX2StreamingModel {
 
         self.fp8_blocks = blocks;
         Ok(())
+    }
+
+    /// Drop FP8 resident weights to free GPU memory.
+    /// Call before switching to FlameSwap for a higher-resolution stage.
+    pub fn drop_fp8_resident(&mut self) {
+        self.fp8_blocks.clear();
+        log::info!("[LTX2] FP8 resident weights dropped");
     }
 
     /// Initialize FlameSwap for async double-buffered block streaming.
@@ -2549,11 +2565,13 @@ impl LTX2StreamingModel {
                 .ok_or_else(|| flame_core::Error::InvalidInput(format!("Missing: {pfx}.scale_shift_table")))?,
             audio_scale_shift_table: block_weights.get(&format!("{pfx}.audio_scale_shift_table"))
                 .cloned()
-                .unwrap_or(dummy_2d(6, ad)?),
+                .unwrap_or(dummy_2d(9, ad)?),
             video_a2v_cross_attn_scale_shift_table: block_weights.get(&format!("{pfx}.video_a2v_cross_attn_scale_shift_table"))
+                .or_else(|| block_weights.get(&format!("{pfx}.scale_shift_table_a2v_ca_video")))
                 .cloned()
                 .unwrap_or(dummy_2d(5, config.inner_dim())?),
             audio_a2v_cross_attn_scale_shift_table: block_weights.get(&format!("{pfx}.audio_a2v_cross_attn_scale_shift_table"))
+                .or_else(|| block_weights.get(&format!("{pfx}.scale_shift_table_a2v_ca_audio")))
                 .cloned()
                 .unwrap_or(dummy_2d(5, ad)?),
             prompt_scale_shift_table: get_opt(&format!("{pfx}.prompt_scale_shift_table")),
@@ -2754,11 +2772,13 @@ impl LTX2StreamingModel {
                 .ok_or_else(|| flame_core::Error::InvalidInput(format!("Missing: {pfx}.scale_shift_table")))?,
             audio_scale_shift_table: block_weights.get(&format!("{pfx}.audio_scale_shift_table"))
                 .cloned()
-                .unwrap_or(dummy_2d(6, ad)?),
+                .unwrap_or(dummy_2d(9, ad)?),
             video_a2v_cross_attn_scale_shift_table: block_weights.get(&format!("{pfx}.video_a2v_cross_attn_scale_shift_table"))
+                .or_else(|| block_weights.get(&format!("{pfx}.scale_shift_table_a2v_ca_video")))
                 .cloned()
                 .unwrap_or(dummy_2d(5, config.inner_dim())?),
             audio_a2v_cross_attn_scale_shift_table: block_weights.get(&format!("{pfx}.audio_a2v_cross_attn_scale_shift_table"))
+                .or_else(|| block_weights.get(&format!("{pfx}.scale_shift_table_a2v_ca_audio")))
                 .cloned()
                 .unwrap_or(dummy_2d(5, ad)?),
             prompt_scale_shift_table: get_opt(&format!("{pfx}.prompt_scale_shift_table")),
@@ -2879,8 +2899,8 @@ impl LTX2StreamingModel {
             // FP8 resident path: dequant each block on-the-fly, no disk I/O.
             // Uses persistent BF16 buffers to eliminate per-block GPU allocation.
             log::info!("[LTX2] FP8 resident forward ({} blocks, persistent bufs)", num_layers);
-            // Use block 2 for buffer sizing (blocks 0-1 may be BF16-only)
-            let buf_idx = if num_layers > 2 { 2 } else { 0 };
+            // Use inner block for buffer sizing (boundary blocks 0-3,47 may have fewer FP8 weights)
+            let buf_idx = if num_layers > 5 { 5 } else { 0 };
             let persistent = super::fp8_resident::PersistentBlockBuf::new(
                 &self.fp8_blocks[buf_idx], &device,
             )?;
@@ -3182,14 +3202,48 @@ impl LTX2StreamingModel {
         if !self.fp8_blocks.is_empty() {
             // FP8 resident path: video weights on GPU, audio weights loaded per-block from disk
             log::info!("[LTX2] AV FP8 resident forward ({} blocks, audio from disk)", num_layers);
-            let buf_idx = if num_layers > 2 { 2 } else { 0 };
+            // Use inner block (not boundary) for buffer sizing — inner blocks have FP8 audio
+            let buf_idx = if num_layers > 5 { 5 } else { 0 };
             let persistent = super::fp8_resident::PersistentBlockBuf::new(
                 &self.fp8_blocks[buf_idx], &device,
             )?;
 
             for i in 0..num_layers {
                 let t_block = std::time::Instant::now();
-                let block_weights = self.fp8_blocks[i].to_bf16_block_reuse(&persistent, &device)?;
+                let mut block_weights = self.fp8_blocks[i].to_bf16_block_reuse(&persistent, &device)?;
+
+                // Boundary blocks (0-3, 47) have BF16 audio/A2V/V2A weights that
+                // aren't in fp8_blocks (skipped to avoid OOM). Load from disk.
+                let has_audio = block_weights.contains_key(
+                    &format!("transformer_blocks.{i}.audio_attn1.to_q.weight"));
+                if !has_audio {
+                    let key_prefix = detect_key_prefix(&self.checkpoint_path)?;
+                    let pfx = format!("{key_prefix}transformer_blocks.{i}.");
+                    let audio_weights = flame_core::serialization::load_file_filtered(
+                        &self.checkpoint_path, &device,
+                        |key| {
+                            if !key.starts_with(&pfx) { return false; }
+                            let stripped = key.strip_prefix(&pfx).unwrap_or(key);
+                            stripped.starts_with("audio_")
+                                || stripped.starts_with("video_to_audio")
+                                || stripped.starts_with("audio_to_video")
+                                || stripped.contains("scale_shift_table")
+                        },
+                    )?;
+                    for (k, v) in audio_weights {
+                        let stripped = k.strip_prefix(&key_prefix).unwrap_or(&k).to_string();
+                        // Pre-transpose 2D weight matrices
+                        let shape = v.shape().dims().to_vec();
+                        let v = if super::fp8_resident::needs_transpose(&stripped, &shape) {
+                            v.transpose()?
+                        } else {
+                            v
+                        };
+                        block_weights.insert(stripped, v);
+                    }
+                    log::info!("[LTX2] Block {}: loaded BF16 audio weights from disk", i);
+                }
+
                 let block = Self::load_block_from_weights_pretransposed(&config_clone, i, block_weights)?;
                 let (new_hs, new_ahs) = block.forward(
                     &hs, &ahs,
@@ -3206,7 +3260,7 @@ impl LTX2StreamingModel {
                 hs = new_hs;
                 ahs = new_ahs;
                 drop(block);
-                if (i + 1) % 12 == 0 || i + 1 == num_layers {
+                if (i + 1) % 12 == 0 || i + 1 == num_layers || i < 4 || i == num_layers - 1 {
                     log::info!("[LTX2] AV Block {}/{}: {}ms",
                         i + 1, num_layers, t_block.elapsed().as_millis());
                 }
