@@ -1,17 +1,23 @@
-//! Triple-pipelined async block swapper for FLAME inference.
+//! CPU-cached block swapper for FLAME inference.
+//!
+//! All block weights are pre-dequanted to BF16 in CPU RAM at init time.
+//! At runtime, a background staging thread memcpys from CPU cache → pinned
+//! buffer, then async DMA copies pinned → GPU. No per-element conversion
+//! at runtime — just fast memcpy.
 //!
 //! Three-stage pipeline, all overlapped:
-//!   CPU thread:  mmap → pinned[A]  |  mmap → pinned[B]  |  mmap → pinned[A]
-//!   DMA stream:       pinned[A]→GPU |  pinned[B]→GPU     |  pinned[A]→GPU
-//!   GPU compute:           block 0  |  block 1           |  block 2
+//!   CPU thread:  cache[N+1] → pinned[B]  |  cache[N+2] → pinned[A]
+//!   DMA stream:  pinned[A] → GPU          |  pinned[B] → GPU
+//!   GPU compute: block N                  |  block N+1
 //!
 //! Two pinned staging buffers (~2GB each). While GPU computes block N from
-//! buffer A, a CPU thread copies block N+1 from mmap into buffer B, and DMA
-//! transfers it to GPU. Everything overlaps.
+//! buffer A, the staging thread copies block N+1 from CPU cache into buffer B,
+//! and DMA transfers it to GPU. Everything overlaps.
 //!
-//! Peak pinned memory: ~4GB (two blocks) instead of 44GB.
+//! Peak CPU RAM: ~33GB (all blocks pre-dequanted to BF16).
+//! Peak pinned memory: ~4GB (two staging buffers).
 //!
-//! # Usage (unchanged from original)
+//! # Usage
 //! ```ignore
 //! let mut swap = FlameSwap::load(&["model.safetensors"], &device, block_fn)?;
 //! swap.prefetch(0)?;
@@ -39,7 +45,6 @@ use crate::ffi::{self, Event, Stream};
 
 /// Convert a single FP8 E4M3 byte to f32.
 /// E4M3: 1 sign bit, 4 exponent bits (bias=7), 3 mantissa bits.
-/// Special: exponent=0b1111 with mantissa=0b111 is NaN, all others are normal/subnormal.
 #[inline]
 fn fp8_e4m3_to_f32(bits: u8) -> f32 {
     let sign = (bits >> 7) & 1;
@@ -54,10 +59,8 @@ fn fp8_e4m3_to_f32(bits: u8) -> f32 {
     }
 
     let (effective_exp, effective_mant) = if exp == 0 {
-        // Subnormal: exponent = 1 - bias, mantissa has no implicit leading 1
         (-6i32, mant as f32 / 8.0)
     } else {
-        // Normal: exponent = exp - bias, mantissa has implicit leading 1
         (exp as i32 - 7, 1.0 + mant as f32 / 8.0)
     };
 
@@ -155,10 +158,12 @@ unsafe impl Send for SendPtr {}
 // ---------------------------------------------------------------------------
 
 pub struct FlameSwap {
-    /// Memory-mapped safetensors files.
-    mmaps: Arc<Vec<Mmap>>,
+    /// Pre-dequanted block data in CPU RAM. Each entry is a flat BF16 buffer
+    /// matching the staging layout for that block. All FP8→BF16 conversion
+    /// happens at init, never at runtime.
+    cpu_blocks: Arc<Vec<Vec<u8>>>,
 
-    /// Per-block metadata.
+    /// Per-block metadata (tensor names, shapes, layouts).
     blocks: Vec<BlockMeta>,
 
     /// Per-block staging layouts: offset + numel per tensor.
@@ -201,21 +206,25 @@ impl FlameSwap {
         // ----- 1. Parse headers, build block metadata -----------------------
         let mut all_tensors: HashMap<usize, Vec<TensorMeta>> = HashMap::new();
 
-        for (file_idx, path) in paths.iter().enumerate() {
-            let file = std::fs::File::open(path)?;
-            let mmap = unsafe { Mmap::map(&file)? };
-            let header_entries = parse_safetensors_header(&mmap)?;
+        // Open mmaps for header parsing + data reading
+        let mmaps: Vec<Mmap> = paths
+            .iter()
+            .map(|p| {
+                let f = std::fs::File::open(p)?;
+                unsafe { Mmap::map(&f) }.map_err(Into::into)
+            })
+            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
 
-            // Build a map of scale values for FP8 tensors
-            // Scale key: "foo.weight_scale" → applies to "foo.weight"
+        for (file_idx, mmap) in mmaps.iter().enumerate() {
+            let header_entries = parse_safetensors_header(mmap)?;
+
+            // Build scale map for FP8 tensors
             let mut scale_map: HashMap<String, f32> = HashMap::new();
             for entry in &header_entries {
                 if entry.name.ends_with("_scale") && entry.shape.is_empty() {
-                    // Scalar F32 scale — read from mmap
                     let bytes = &mmap[entry.data_offset..entry.data_offset + 4];
                     let scale = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-                    // "foo.weight_scale" → "foo.weight"
-                    let target = entry.name[..entry.name.len() - 6].to_string(); // strip "_scale"
+                    let target = entry.name[..entry.name.len() - 6].to_string();
                     scale_map.insert(target, scale);
                 }
             }
@@ -223,7 +232,6 @@ impl FlameSwap {
             for entry in &header_entries {
                 if let Some(block_idx) = block_fn(&entry.name) {
                     let numel: usize = entry.shape.iter().product();
-                    // Resolve FP8 scale
                     let src_dtype = match entry.src_dtype {
                         SourceDtype::F8E4M3 { .. } => {
                             let scale = scale_map.get(&entry.name).copied().unwrap_or(1.0);
@@ -274,16 +282,103 @@ impl FlameSwap {
             })
             .collect();
 
-        // ----- 3. Keep mmaps alive ------------------------------------------
-        let mmaps: Arc<Vec<Mmap>> = Arc::new(
-            paths
-                .iter()
-                .map(|p| {
-                    let f = std::fs::File::open(p)?;
-                    unsafe { Mmap::map(&f) }.map_err(Into::into)
-                })
-                .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?,
+        // ----- 3. Pre-dequant ALL blocks to BF16 in CPU RAM ----------------
+        // This is a one-time cost at init. All FP8→BF16 conversion happens here.
+        // At runtime, the staging thread just does fast memcpy.
+        let t0 = std::time::Instant::now();
+        eprintln!("[FlameSwap] Pre-caching {} blocks to CPU RAM (FP8→BF16 dequant)...", num_blocks);
+
+        // Prepare per-block work items for parallel processing
+        let block_work: Vec<(usize, &BlockMeta, &Vec<StagingLayout>)> = blocks
+            .iter()
+            .zip(layouts.iter())
+            .enumerate()
+            .map(|(i, (b, l))| (i, b, l))
+            .collect();
+
+        // Use std::thread::scope for parallel pre-dequant (up to 8 threads)
+        let num_threads = 8usize.min(num_blocks);
+        let chunks: Vec<Vec<(usize, &BlockMeta, &Vec<StagingLayout>)>> = {
+            let chunk_size = (block_work.len() + num_threads - 1) / num_threads;
+            block_work.chunks(chunk_size).map(|c| c.to_vec()).collect()
+        };
+
+        let mmaps_ref = &mmaps;
+        let mut cpu_blocks: Vec<Vec<u8>> = vec![Vec::new(); num_blocks];
+
+        thread::scope(|s| {
+            let mut handles = Vec::new();
+            for chunk in &chunks {
+                let handle = s.spawn(move || {
+                    let mut results: Vec<(usize, Vec<u8>)> = Vec::new();
+                    for &(block_idx, block, layout) in chunk {
+                        let byte_len = block.total_u16s * 2;
+                        let mut buf = vec![0u8; byte_len];
+
+                        for (t, sl) in block.tensors.iter().zip(layout.iter()) {
+                            let dst_byte_offset = sl.offset * 2;
+                            let dst_u16 = unsafe {
+                                std::slice::from_raw_parts_mut(
+                                    buf[dst_byte_offset..].as_mut_ptr() as *mut u16,
+                                    sl.numel,
+                                )
+                            };
+
+                            match t.src_dtype {
+                                SourceDtype::F8E4M3 { scale } => {
+                                    let src = &mmaps_ref[t.file_idx]
+                                        [t.file_offset..t.file_offset + t.numel];
+                                    for (d, &byte) in dst_u16.iter_mut().zip(src.iter()) {
+                                        let f = fp8_e4m3_to_f32(byte) * scale;
+                                        *d = half::bf16::from_f32(f).to_bits();
+                                    }
+                                }
+                                SourceDtype::F32 => {
+                                    let src_bytes = &mmaps_ref[t.file_idx]
+                                        [t.file_offset..t.file_offset + t.numel * 4];
+                                    let src_f32 = unsafe {
+                                        std::slice::from_raw_parts(
+                                            src_bytes.as_ptr() as *const f32,
+                                            t.numel,
+                                        )
+                                    };
+                                    for (d, &f) in dst_u16.iter_mut().zip(src_f32.iter()) {
+                                        *d = half::bf16::from_f32(f).to_bits();
+                                    }
+                                }
+                                SourceDtype::BF16 => {
+                                    let src = &mmaps_ref[t.file_idx]
+                                        [t.file_offset..t.file_offset + t.numel * 2];
+                                    let dst_bytes = &mut buf[dst_byte_offset..dst_byte_offset + sl.numel * 2];
+                                    dst_bytes.copy_from_slice(src);
+                                }
+                            }
+                        }
+                        results.push((block_idx, buf));
+                    }
+                    results
+                });
+                handles.push(handle);
+            }
+
+            for handle in handles {
+                let results = handle.join().unwrap();
+                for (idx, buf) in results {
+                    cpu_blocks[idx] = buf;
+                }
+            }
+        });
+
+        let total_cached_mb: f64 = cpu_blocks.iter().map(|b| b.len() as f64).sum::<f64>() / 1e6;
+        eprintln!(
+            "[FlameSwap] CPU cache ready: {} blocks, {:.1}MB total, {:.1}s (8 threads)",
+            num_blocks, total_cached_mb, t0.elapsed().as_secs_f32()
         );
+
+        // Drop mmaps — no longer needed, all data is in cpu_blocks
+        drop(mmaps);
+
+        let cpu_blocks = Arc::new(cpu_blocks);
 
         // ----- 4. Two pinned staging buffers --------------------------------
         let max_u16s = blocks.iter().map(|b| b.total_u16s).max().unwrap_or(1);
@@ -306,17 +401,14 @@ impl FlameSwap {
             SendPtr(staging_a.as_ptr() as *mut u16),
             SendPtr(staging_b.as_ptr() as *mut u16),
         ];
-        let thread_mmaps = Arc::clone(&mmaps);
-        let thread_blocks: Vec<Vec<TensorMeta>> =
-            blocks.iter().map(|b| b.tensors.clone()).collect();
-        let thread_layouts = layouts.clone();
+        let thread_cpu_blocks = Arc::clone(&cpu_blocks);
+        let thread_block_sizes: Vec<usize> = blocks.iter().map(|b| b.total_u16s).collect();
         let thread_state = Arc::clone(&state);
 
         let stage_thread = thread::spawn(move || {
             staging_thread_main(
-                thread_mmaps,
-                thread_blocks,
-                thread_layouts,
+                thread_cpu_blocks,
+                thread_block_sizes,
                 [ptrs[0].0, ptrs[1].0],
                 thread_state,
             );
@@ -327,7 +419,7 @@ impl FlameSwap {
         let event = Event::new()?;
 
         Ok(Self {
-            mmaps,
+            cpu_blocks,
             blocks,
             layouts,
             staging: [staging_a, staging_b],
@@ -347,9 +439,9 @@ impl FlameSwap {
 
     /// Begin async prefetch of block `idx` to GPU.
     ///
-    /// Internally: requests CPU staging on the current slot (if not already
-    /// done), waits for it, then starts async DMA to GPU. Immediately kicks
-    /// off CPU staging for `idx+1` on the other slot for overlap.
+    /// Internally: requests CPU staging on the current slot (fast memcpy from
+    /// pre-cached CPU data), waits for it, then starts async DMA to GPU.
+    /// Immediately kicks off CPU staging for `idx+1` on the other slot.
     pub fn prefetch(&mut self, idx: usize) -> Result<(), Box<dyn std::error::Error>> {
         assert!(idx < self.blocks.len(), "block index {idx} out of range");
 
@@ -361,12 +453,12 @@ impl FlameSwap {
 
         let slot = self.next_slot;
 
-        // Request staging for this block (no-op if already requested)
+        // Request staging for this block
         self.request_staging(idx, slot);
-        // Wait for CPU staging to complete
+        // Wait for CPU staging to complete (fast — just a memcpy now)
         self.wait_staging(idx, slot)?;
 
-        // DMA: staging[slot] → GPU (async on transfer stream)
+        // DMA: staging[slot] → GPU (async on default stream)
         let block = &self.blocks[idx];
         let layout = &self.layouts[idx];
         let mut pending_tensors = Vec::with_capacity(block.tensors.len());
@@ -378,7 +470,6 @@ impl FlameSwap {
                 let dst = *gpu.device_ptr() as *mut c_void;
                 let src = self.staging[slot.idx()].as_ptr().add(sl.offset) as *const c_void;
                 let bytes = sl.numel * std::mem::size_of::<u16>();
-                // Use default (null) stream so H2D is ordered with compute — no sync needed
                 ffi::flame_cuda_memcpy_async(dst, src, bytes, 1, std::ptr::null_mut());
             }
 
@@ -446,6 +537,11 @@ impl FlameSwap {
         (self.staging[0].len() + self.staging[1].len()) * std::mem::size_of::<u16>()
     }
 
+    /// Total CPU RAM used by pre-cached blocks (bytes).
+    pub fn cached_bytes(&self) -> usize {
+        self.cpu_blocks.iter().map(|b| b.len()).sum()
+    }
+
     // -- Internal staging coordination ------------------------------------
 
     fn request_staging(&self, block_idx: usize, slot: Slot) {
@@ -490,13 +586,12 @@ impl Drop for FlameSwap {
 }
 
 // ---------------------------------------------------------------------------
-// CPU staging thread
+// CPU staging thread — fast memcpy from pre-cached BF16 data
 // ---------------------------------------------------------------------------
 
 fn staging_thread_main(
-    mmaps: Arc<Vec<Mmap>>,
-    block_tensors: Vec<Vec<TensorMeta>>,
-    layouts: Vec<Vec<StagingLayout>>,
+    cpu_blocks: Arc<Vec<Vec<u8>>>,
+    block_sizes: Vec<usize>, // total_u16s per block
     staging_ptrs: [*mut u16; 2],
     state: Arc<(Mutex<StagingState>, Condvar)>,
 ) {
@@ -513,50 +608,18 @@ fn staging_thread_main(
         let (block_idx, slot) = guard.request.take().unwrap();
         drop(guard); // release lock during copy
 
-        // Copy mmap → pinned staging buffer
-        let dst_base = staging_ptrs[slot.idx()];
-        let tensors = &block_tensors[block_idx];
-        let layout = &layouts[block_idx];
-
-        for (t, sl) in tensors.iter().zip(layout.iter()) {
-            let dst = unsafe {
-                std::slice::from_raw_parts_mut(dst_base.add(sl.offset), sl.numel)
-            };
-            match t.src_dtype {
-                SourceDtype::F8E4M3 { scale } => {
-                    // FP8 E4M3 → BF16: read 1 byte per element, dequant with scale
-                    let src = &mmaps[t.file_idx][t.file_offset..t.file_offset + t.numel];
-                    for (d, &byte) in dst.iter_mut().zip(src.iter()) {
-                        // E4M3: 1 sign, 4 exponent, 3 mantissa
-                        // Convert via f32: reinterpret as float8, scale
-                        let f = fp8_e4m3_to_f32(byte) * scale;
-                        *d = half::bf16::from_f32(f).to_bits();
-                    }
-                }
-                SourceDtype::F32 => {
-                    // F32 → BF16 conversion
-                    let byte_len = t.numel * 4;
-                    let src = &mmaps[t.file_idx][t.file_offset..t.file_offset + byte_len];
-                    let src_f32 =
-                        unsafe { std::slice::from_raw_parts(src.as_ptr() as *const f32, t.numel) };
-                    for (d, &f) in dst.iter_mut().zip(src_f32.iter()) {
-                        *d = half::bf16::from_f32(f).to_bits();
-                    }
-                }
-                SourceDtype::BF16 => {
-                    // BF16: direct memcpy
-                    let byte_len = t.numel * 2;
-                    let src = &mmaps[t.file_idx][t.file_offset..t.file_offset + byte_len];
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            src.as_ptr(),
-                            dst.as_mut_ptr() as *mut u8,
-                            byte_len,
-                        );
-                    }
-                }
-            }
-        }
+        // Fast memcpy: pre-cached BF16 → pinned staging buffer
+        let src = &cpu_blocks[block_idx];
+        let byte_len = block_sizes[block_idx] * 2; // u16 → bytes
+        let dst = unsafe {
+            std::slice::from_raw_parts_mut(
+                staging_ptrs[slot.idx()] as *mut u8,
+                byte_len,
+            )
+        };
+        // src.len() should equal byte_len, but be safe
+        let copy_len = src.len().min(byte_len);
+        dst[..copy_len].copy_from_slice(&src[..copy_len]);
 
         // Signal completion
         let mut guard = lock.lock().unwrap();
@@ -616,7 +679,7 @@ fn parse_safetensors_header(mmap: &[u8]) -> Result<Vec<HeaderEntry>, Box<dyn std
         let src_dtype = match dtype.as_str() {
             "BF16" => SourceDtype::BF16,
             "F32" => SourceDtype::F32,
-            "F8_E4M3" => SourceDtype::F8E4M3 { scale: 1.0 }, // scale filled in later
+            "F8_E4M3" => SourceDtype::F8E4M3 { scale: 1.0 },
             _ => continue,
         };
 
