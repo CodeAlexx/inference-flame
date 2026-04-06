@@ -87,16 +87,16 @@ impl ResBlock {
                 .ok_or_else(|| Error::InvalidInput(format!("Missing key: {key}")))
         };
 
-        let mut conv1 = Conv2d::new(in_ch, out_ch, 3, 1, 1, device.clone())?;
+        let mut conv1 = Conv2d::new_with_bias(in_ch, out_ch, 3, 1, 1, device.clone(), true)?;
         conv1.copy_weight_from(get(&format!("{prefix}.conv1.weight"))?)?;
         conv1.copy_bias_from(get(&format!("{prefix}.conv1.bias"))?)?;
 
-        let mut conv2 = Conv2d::new(out_ch, out_ch, 3, 1, 1, device.clone())?;
+        let mut conv2 = Conv2d::new_with_bias(out_ch, out_ch, 3, 1, 1, device.clone(), true)?;
         conv2.copy_weight_from(get(&format!("{prefix}.conv2.weight"))?)?;
         conv2.copy_bias_from(get(&format!("{prefix}.conv2.bias"))?)?;
 
         let shortcut = if in_ch != out_ch {
-            let mut s = Conv2d::new(in_ch, out_ch, 1, 1, 0, device.clone())?;
+            let mut s = Conv2d::new_with_bias(in_ch, out_ch, 1, 1, 0, device.clone(), true)?;
             s.copy_weight_from(get(&format!("{prefix}.nin_shortcut.weight"))?)?;
             s.copy_bias_from(get(&format!("{prefix}.nin_shortcut.bias"))?)?;
             Some(s)
@@ -318,7 +318,7 @@ impl UpBlock {
         }
 
         let upsample_conv = if has_upsample {
-            let mut conv = Conv2d::new(out_ch, out_ch, 3, 1, 1, device.clone())?;
+            let mut conv = Conv2d::new_with_bias(out_ch, out_ch, 3, 1, 1, device.clone(), true)?;
             conv.copy_weight_from(get(&format!("{prefix}.upsample.conv.weight"))?)?;
             conv.copy_bias_from(get(&format!("{prefix}.upsample.conv.bias"))?)?;
             Some(conv)
@@ -369,6 +369,105 @@ pub struct LdmVAEDecoder {
     shift_factor: f32,
 }
 
+/// Remap diffusers-format VAE keys to LDM-format.
+///
+/// Diffusers:  decoder.mid_block.resnets.0.*      → LDM: decoder.mid.block_1.*
+/// Diffusers:  decoder.mid_block.attentions.0.*    → LDM: decoder.mid.attn_1.*
+/// Diffusers:  decoder.up_blocks.N.resnets.M.*     → LDM: decoder.up.N.block.M.*
+/// Diffusers:  decoder.up_blocks.N.upsamplers.0.*  → LDM: decoder.up.N.upsample.*
+/// Diffusers:  decoder.conv_norm_out.*              → LDM: decoder.norm_out.*
+fn remap_diffusers_to_ldm(w: HashMap<String, Tensor>) -> HashMap<String, Tensor> {
+    // Check if keys are diffusers-format (presence of "mid_block" or "up_blocks")
+    let is_diffusers = w.keys().any(|k| k.contains("mid_block") || k.contains("up_blocks"));
+    if !is_diffusers {
+        return w;
+    }
+
+    println!("[LdmVAE] Remapping diffusers keys to LDM format");
+    let mut out = HashMap::with_capacity(w.len());
+    for (key, val) in w {
+        let new_key = remap_one_key(&key);
+        out.insert(new_key, val);
+    }
+    out
+}
+
+fn remap_one_key(key: &str) -> String {
+    let k = key.to_string();
+
+    // decoder.conv_norm_out.* → decoder.norm_out.*
+    if k.starts_with("decoder.conv_norm_out.") {
+        return k.replace("decoder.conv_norm_out.", "decoder.norm_out.");
+    }
+
+    // decoder.mid_block.resnets.0.* → decoder.mid.block_1.*
+    // decoder.mid_block.resnets.1.* → decoder.mid.block_2.*
+    if k.starts_with("decoder.mid_block.resnets.") {
+        let rest = &k["decoder.mid_block.resnets.".len()..];
+        if let Some(dot) = rest.find('.') {
+            let idx: usize = rest[..dot].parse().unwrap_or(0);
+            let suffix = &rest[dot + 1..];
+            return format!("decoder.mid.block_{}.{suffix}", idx + 1);
+        }
+    }
+
+    // decoder.mid_block.attentions.0.group_norm.* → decoder.mid.attn_1.norm.*
+    if k.starts_with("decoder.mid_block.attentions.0.group_norm.") {
+        let suffix = &k["decoder.mid_block.attentions.0.group_norm.".len()..];
+        return format!("decoder.mid.attn_1.norm.{suffix}");
+    }
+    // decoder.mid_block.attentions.0.to_q.* → decoder.mid.attn_1.q.*
+    if k.starts_with("decoder.mid_block.attentions.0.to_q.") {
+        let suffix = &k["decoder.mid_block.attentions.0.to_q.".len()..];
+        return format!("decoder.mid.attn_1.q.{suffix}");
+    }
+    if k.starts_with("decoder.mid_block.attentions.0.to_k.") {
+        let suffix = &k["decoder.mid_block.attentions.0.to_k.".len()..];
+        return format!("decoder.mid.attn_1.k.{suffix}");
+    }
+    if k.starts_with("decoder.mid_block.attentions.0.to_v.") {
+        let suffix = &k["decoder.mid_block.attentions.0.to_v.".len()..];
+        return format!("decoder.mid.attn_1.v.{suffix}");
+    }
+    // decoder.mid_block.attentions.0.to_out.0.* → decoder.mid.attn_1.proj_out.*
+    if k.starts_with("decoder.mid_block.attentions.0.to_out.0.") {
+        let suffix = &k["decoder.mid_block.attentions.0.to_out.0.".len()..];
+        return format!("decoder.mid.attn_1.proj_out.{suffix}");
+    }
+
+    // decoder.up_blocks.N.resnets.M.* → decoder.up.(3-N).block.M.*
+    // Diffusers up_blocks are in reverse order vs LDM up blocks
+    if k.starts_with("decoder.up_blocks.") {
+        let rest = &k["decoder.up_blocks.".len()..];
+        if let Some(dot) = rest.find('.') {
+            let diff_idx: usize = rest[..dot].parse().unwrap_or(0);
+            let ldm_idx = 3 - diff_idx; // reverse: 0→3, 1→2, 2→1, 3→0
+            let block_idx = ldm_idx.to_string();
+            let inner = &rest[dot + 1..];
+
+            if inner.starts_with("resnets.") {
+                let rr = &inner["resnets.".len()..];
+                if let Some(dot2) = rr.find('.') {
+                    let resnet_idx = &rr[..dot2];
+                    let suffix = &rr[dot2 + 1..];
+                    // conv_shortcut → nin_shortcut
+                    let suffix = suffix.replace("conv_shortcut.", "nin_shortcut.");
+                    return format!("decoder.up.{block_idx}.block.{resnet_idx}.{suffix}");
+                }
+            }
+
+            // decoder.up_blocks.N.upsamplers.0.conv.* → decoder.up.N.upsample.conv.*
+            if inner.starts_with("upsamplers.0.conv.") {
+                let suffix = &inner["upsamplers.0.conv.".len()..];
+                return format!("decoder.up.{block_idx}.upsample.conv.{suffix}");
+            }
+        }
+    }
+
+    // Unchanged (conv_in, conv_out, etc.)
+    k
+}
+
 impl LdmVAEDecoder {
     /// Load decoder from safetensors file (mmap, decoder keys only).
     ///
@@ -400,6 +499,8 @@ impl LdmVAEDecoder {
             w.insert(k, val);
         }
         println!("[LdmVAE] Loaded {} decoder weight tensors", w.len());
+        // Remap diffusers-format keys to LDM-format if needed
+        let w = remap_diffusers_to_ldm(w);
         Self::from_weights(w, in_channels, scaling_factor, shift_factor, device)
     }
 
@@ -423,7 +524,7 @@ impl LdmVAEDecoder {
         let top_ch = ch * ch_mult[3]; // 512
 
         // conv_in: in_channels -> 512ch
-        let mut conv_in = Conv2d::new(in_channels, top_ch, 3, 1, 1, device.clone())?;
+        let mut conv_in = Conv2d::new_with_bias(in_channels, top_ch, 3, 1, 1, device.clone(), true)?;
         conv_in.copy_weight_from(get("decoder.conv_in.weight")?)?;
         conv_in.copy_bias_from(get("decoder.conv_in.bias")?)?;
 
@@ -449,7 +550,7 @@ impl LdmVAEDecoder {
         }
 
         // norm_out + conv_out
-        let mut conv_out = Conv2d::new(ch, 3, 3, 1, 1, device.clone())?;
+        let mut conv_out = Conv2d::new_with_bias(ch, 3, 3, 1, 1, device.clone(), true)?;
         conv_out.copy_weight_from(get("decoder.conv_out.weight")?)?;
         conv_out.copy_bias_from(get("decoder.conv_out.bias")?)?;
 

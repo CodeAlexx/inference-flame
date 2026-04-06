@@ -38,10 +38,10 @@ pub fn euler_step(
         if cfg_scale > 1.0 {
             // Unconditional prediction
             let pred_uncond = model.forward(x, &sigma_tensor, uncond_feats)?;
-            // CFG: pred = pred_uncond + cfg_scale * (pred_cond - pred_uncond)
+            // CFG: pred = pred_cond + cfg_scale * (pred_cond - pred_uncond)
             let diff = pred_cond.sub(&pred_uncond)?;
             let scaled = diff.mul_scalar(cfg_scale)?;
-            pred_uncond.add(&scaled)?
+            pred_cond.add(&scaled)?
         } else {
             pred_cond
         }
