@@ -90,6 +90,10 @@ name = "swap_v2_parity"
 path = "src/bin/swap_v2_parity.rs"
 
 [[bin]]
+name = "klein_swap_e2e"
+path = "src/bin/klein_swap_e2e.rs"
+
+[[bin]]
 name = "full_weight_diff"
 path = "src/bin/full_weight_diff.rs"
 

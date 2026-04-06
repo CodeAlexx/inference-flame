@@ -1049,6 +1049,144 @@ impl KleinOffloaded {
     }
 
     pub fn config(&self) -> &KleinConfig { &self.config }
+
+    /// Forward pass that pulls block weights through a FlameSwap instead of
+    /// the in-process CPU staging dictionary.
+    ///
+    /// `swap` must have been initialised with the SAME safetensors file and
+    /// the standard Klein block_fn:
+    ///   - `double_blocks.{i}` → swap idx `i`
+    ///   - `single_blocks.{i}` → swap idx `num_double + i`
+    ///
+    /// `swap` is left in a clean state on success.
+    pub fn forward_with_swap(
+        &self,
+        img: &Tensor,
+        txt: &Tensor,
+        timesteps: &Tensor,
+        img_ids: &Tensor,
+        txt_ids: &Tensor,
+        swap: &mut flame_swap::FlameSwap,
+    ) -> Result<Tensor> {
+        let w = &self.shared;
+        let cfg = &self.config;
+
+        let mut img = linear3d(img, &w["img_in.weight"])?;
+        let mut txt = linear3d(txt, &w["txt_in.weight"])?;
+
+        let t_emb = timestep_embedding(timesteps, cfg.timestep_dim, 1000.0)?;
+        let t_emb_bf16 = t_emb.to_dtype(DType::BF16)?;
+        let vec = {
+            let h = linear3d(&t_emb_bf16, &w["time_in.in_layer.weight"])?;
+            let h = h.silu()?;
+            linear3d(&h, &w["time_in.out_layer.weight"])?
+        };
+
+        let (pe_cos, pe_sin) = build_rope_2d(img_ids, txt_ids, &cfg.axes_dims, cfg.theta)?;
+
+        let vec_silu = vec.silu()?;
+        let img_mods_arr: [Tensor; 6] = vec_to_arr6(
+            shared_modulation_from_silu(&vec_silu, &w["double_stream_modulation_img.lin.weight"], 6)?
+        )?;
+        let txt_mods_arr: [Tensor; 6] = vec_to_arr6(
+            shared_modulation_from_silu(&vec_silu, &w["double_stream_modulation_txt.lin.weight"], 6)?
+        )?;
+        let single_mods_arr: [Tensor; 3] = vec_to_arr3(
+            shared_modulation_from_silu(&vec_silu, &w["single_stream_modulation.lin.weight"], 3)?
+        )?;
+
+        let total_blocks = cfg.num_double + cfg.num_single;
+        if swap.num_blocks() != total_blocks {
+            return Err(flame_core::Error::InvalidInput(format!(
+                "FlameSwap has {} blocks, expected {} (={} double + {} single)",
+                swap.num_blocks(), total_blocks, cfg.num_double, cfg.num_single,
+            )));
+        }
+
+        // Helper: take the raw views FlameSwap returned, copy each 2D `.weight`
+        // tensor through transpose2d_bf16 (which produces an owned BF16 tensor
+        // backed by its own GPU storage) and pass 1D `.scale` weights through
+        // unchanged.  After this, the original views can be dropped — the
+        // swap slot's data has been read by the transpose kernel and the
+        // next prefetch will gate behind it via done_event.
+        let materialize = |raw: HashMap<String, Tensor>| -> Result<HashMap<String, Tensor>> {
+            let mut out = HashMap::with_capacity(raw.len());
+            for (k, t) in raw {
+                let owned = if k.ends_with(".weight") && !k.ends_with(".scale") && t.shape().dims().len() == 2 {
+                    flame_core::bf16_elementwise::transpose2d_bf16(&t)?
+                } else {
+                    // 1D weights: copy to a fresh tensor so the result no
+                    // longer aliases the swap slot.
+                    let bytes = t.to_vec_bf16()?;
+                    let mut owned = Tensor::zeros_dtype(
+                        t.shape().clone(), DType::BF16, t.device().clone(),
+                    )?;
+                    owned.copy_from_bf16_slice(&bytes)?;
+                    owned
+                };
+                out.insert(k, owned);
+            }
+            Ok(out)
+        };
+
+        // Kick off staging for the very first block (double_blocks.0).
+        swap.prefetch(0).map_err(|e| flame_core::Error::InvalidInput(format!("swap prefetch(0): {e}")))?;
+
+        for i in 0..cfg.num_double {
+            let raw = swap.await_block(i)
+                .map_err(|e| flame_core::Error::InvalidInput(format!("swap await({i}): {e}")))?;
+            // Pre-fetch the next block while we materialize this one.
+            let next = i + 1;
+            if next < total_blocks {
+                swap.prefetch(next)
+                    .map_err(|e| flame_core::Error::InvalidInput(format!("swap prefetch({next}): {e}")))?;
+            }
+            let block_w = materialize(raw)?;
+            let (new_img, new_txt) = double_block_forward(
+                &block_w, i, &img, &txt,
+                &img_mods_arr, &txt_mods_arr,
+                &pe_cos, &pe_sin,
+                cfg.num_heads, cfg.head_dim,
+            )?;
+            img = new_img;
+            txt = new_txt;
+        }
+
+        let mut x = Tensor::cat(&[&txt, &img], 1)?;
+        let txt_len = txt.shape().dims()[1];
+
+        for i in 0..cfg.num_single {
+            let swap_idx = cfg.num_double + i;
+            let raw = swap.await_block(swap_idx)
+                .map_err(|e| flame_core::Error::InvalidInput(format!("swap await({swap_idx}): {e}")))?;
+            let next = swap_idx + 1;
+            if next < total_blocks {
+                swap.prefetch(next)
+                    .map_err(|e| flame_core::Error::InvalidInput(format!("swap prefetch({next}): {e}")))?;
+            }
+            let block_w = materialize(raw)?;
+            x = single_block_forward(
+                &block_w, i, &x,
+                &single_mods_arr,
+                &pe_cos, &pe_sin,
+                cfg.num_heads, cfg.head_dim,
+                cfg.inner_dim, cfg.mlp_hidden,
+            )?;
+        }
+
+        let total_len = x.shape().dims()[1];
+        let img_out = x.narrow(1, txt_len, total_len - txt_len)?;
+
+        let final_mod = linear3d(&vec_silu, &w["final_layer.adaLN_modulation.1.weight"])?;
+        let last_dim = *final_mod.shape().dims().last().unwrap();
+        let half_mod = last_dim / 2;
+        let ndim = final_mod.shape().dims().len();
+        let shift = final_mod.narrow(ndim - 1, 0, half_mod)?;
+        let scale = final_mod.narrow(ndim - 1, half_mod, half_mod)?;
+
+        let img_out = modulate_pre(&img_out, &shift, &scale)?;
+        linear3d(&img_out, &w["final_layer.linear.weight"])
+    }
 }
 
 // ---------------------------------------------------------------------------
