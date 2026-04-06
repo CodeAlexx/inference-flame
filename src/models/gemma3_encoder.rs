@@ -222,25 +222,35 @@ impl Gemma3Encoder {
     // Helpers
     // -----------------------------------------------------------------------
 
-    /// Gemma3 RMSNorm: output = rms_norm(x) * (1 + weight)
+    /// Gemma3 RMSNorm: output = rms_norm(x.float()) * (1 + weight.float())
     ///
     /// Different from standard RMSNorm which uses just `weight`.
+    /// Must match PyTorch's FP32 precision: norm in F32, multiply in F32, cast to BF16.
     /// See: https://github.com/huggingface/transformers/pull/29402
+    ///
+    /// ## PyTorch reference:
+    /// ```python
+    /// output = self._norm(x.float())                    # F32 norm
+    /// output = output * (1.0 + self.weight.float())     # F32 multiply
+    /// return output.type_as(x)                          # back to BF16
+    /// ```
     fn gemma3_rms_norm(x: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
-        // Standard RMSNorm: x * rsqrt(mean(x^2) + eps)
         let dims = x.shape().dims().to_vec();
         let hidden = *dims.last().unwrap();
         let batch: usize = dims[..dims.len() - 1].iter().product();
 
         let x_2d = x.reshape(&[batch, hidden])?;
-        // flame_core rms_norm applies: norm(x) * weight
-        // But Gemma3 needs: norm(x) * (1 + weight)
-        // So we do: norm(x) without weight, then multiply by (1 + weight)
-        let normed = flame_core::cuda_ops_bf16::rms_norm_bf16(&x_2d, None, eps)?;
 
-        // (1 + weight): weight is [hidden], broadcast over batch dim
-        let one_plus_w = weight.add_scalar(1.0)?;
-        let result = normed.mul(&one_plus_w.unsqueeze(0)?.expand(&[batch, hidden])?)?;
+        // Step 1: RMS normalize BF16 → F32 (no weight, full F32 precision output)
+        let normed_f32 = flame_core::cuda_ops_bf16::rms_norm_bf16_to_f32(&x_2d, eps)?;
+
+        // Step 2: (1 + weight) in F32
+        let weight_f32 = weight.to_dtype(DType::F32)?;
+        let one_plus_w = weight_f32.add_scalar(1.0)?;
+
+        // Step 3: multiply in F32, then cast to BF16
+        let result_f32 = normed_f32.mul(&one_plus_w.unsqueeze(0)?.expand(&[batch, hidden])?)?;
+        let result = result_f32.to_dtype(DType::BF16)?;
         result.reshape(&dims)
     }
 
@@ -299,30 +309,31 @@ impl Gemma3Encoder {
     // Build masks
     // -----------------------------------------------------------------------
 
-    /// Build causal mask [1, 1, seq, seq].
-    /// For full attention: standard causal mask.
-    /// For sliding attention: causal + sliding window.
+    /// Build causal + padding mask [1, 1, seq, seq].
+    ///
+    /// Uses the actual attention_mask (1=real, 0=pad) to handle left-padding.
+    /// Convention: 1.0 = attend, 0.0 = masked (flame_sdpa converts to additive).
+    ///
+    /// For full attention: causal + real-token mask.
+    /// For sliding attention: additionally restrict to window size.
     fn build_causal_mask(
-        seq_len: usize,
-        real_len: usize,
+        attention_mask: &[i32],
         sliding_window: Option<usize>,
         device: &Arc<CudaDevice>,
     ) -> Result<Tensor> {
+        let seq_len = attention_mask.len();
         let mut data = vec![0.0f32; seq_len * seq_len];
-        let min_val = f32::MIN; // Large negative for masked positions
 
         for i in 0..seq_len {
             for j in 0..seq_len {
                 let is_causal = j <= i;
-                let is_real = j < real_len;
+                let is_real = attention_mask[j] != 0;
                 let in_window = sliding_window
                     .map(|w| i.saturating_sub(w) <= j)
                     .unwrap_or(true);
 
                 if is_causal && is_real && in_window {
-                    data[i * seq_len + j] = 0.0; // attend
-                } else {
-                    data[i * seq_len + j] = min_val; // mask out
+                    data[i * seq_len + j] = 1.0;
                 }
             }
         }
@@ -427,9 +438,9 @@ impl Gemma3Encoder {
         } else {
             (&self.rope_local_cos, &self.rope_local_sin)
         };
-        // Narrow to actual seq_len
-        let cos = cos.narrow(1, 0, n)?;
-        let sin = sin.narrow(1, 0, n)?;
+        // Narrow to actual seq_len (dim 2 of [1, 1, max_seq, half])
+        let cos = cos.narrow(2, 0, n)?;
+        let sin = sin.narrow(2, 0, n)?;
         let q = Self::apply_rope(&q, &cos, &sin)?;
         let k = Self::apply_rope(&k, &cos, &sin)?;
 
@@ -438,14 +449,12 @@ impl Gemma3Encoder {
         let v = Self::repeat_kv(&v, n_rep)?;
 
         // 6. Scaled dot-product attention
-        // Gemma3 scaling: 1/sqrt(query_pre_attn_scalar) = 1/sqrt(256) = 1/16
-        // SDPA handles scaling internally via q * scale, but flame_sdpa might not.
-        // We scale Q before passing to SDPA.
-        let attn_scale = (cfg.query_pre_attn_scalar as f32).powf(-0.5);
-        let q_scaled = q.mul_scalar(attn_scale)?;
-
+        // flame_sdpa applies 1/sqrt(d_q) internally, where d_q = head_dim = 256.
+        // Gemma3 uses query_pre_attn_scalar = 256 → scaling = 1/sqrt(256) = 1/16.
+        // Since head_dim == query_pre_attn_scalar == 256, flame_sdpa's built-in
+        // scaling matches Gemma3's. No additional scaling needed.
         let mask = if is_full { full_mask } else { sliding_mask };
-        let attn_out = flame_sdpa(&q_scaled, &k, &v, Some(mask))?;
+        let attn_out = flame_sdpa(&q, &k, &v, Some(mask))?;
 
         // [B, H, N, D] → [B, N, H*D]
         let attn_out = attn_out.permute(&[0, 2, 1, 3])?.reshape(&[b, n, h * d])?;
@@ -496,14 +505,17 @@ impl Gemma3Encoder {
     }
 
     /// Gemma3 RMSNorm for 2D tensors (already [batch, hidden]).
+    /// Same FP32 precision path as gemma3_rms_norm.
     fn gemma3_rms_norm_2d(x: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
         let dims = x.shape().dims().to_vec();
         let hidden = dims[1];
         let batch = dims[0];
 
-        let normed = flame_core::cuda_ops_bf16::rms_norm_bf16(x, None, eps)?;
-        let one_plus_w = weight.add_scalar(1.0)?;
-        normed.mul(&one_plus_w.unsqueeze(0)?.expand(&[batch, hidden])?)
+        let normed_f32 = flame_core::cuda_ops_bf16::rms_norm_bf16_to_f32(x, eps)?;
+        let weight_f32 = weight.to_dtype(DType::F32)?;
+        let one_plus_w = weight_f32.add_scalar(1.0)?;
+        let result_f32 = normed_f32.mul(&one_plus_w.unsqueeze(0)?.expand(&[batch, hidden])?)?;
+        result_f32.to_dtype(DType::BF16)
     }
 
     // -----------------------------------------------------------------------
@@ -562,9 +574,9 @@ impl Gemma3Encoder {
         let mut hidden = self.embed_tokens(token_ids)?;
 
         // 2. Build attention masks (full + sliding)
-        let full_mask = Self::build_causal_mask(seq_len, real_len, None, &self.device)?;
+        let full_mask = Self::build_causal_mask(attention_mask, None, &self.device)?;
         let sliding_mask = Self::build_causal_mask(
-            seq_len, real_len, Some(cfg.sliding_window), &self.device,
+            attention_mask, Some(cfg.sliding_window), &self.device,
         )?;
 
         // 3. Collect all hidden states
@@ -576,15 +588,15 @@ impl Gemma3Encoder {
             .map_err(|e| flame_core::Error::InvalidInput(format!("prefetch: {e}")))?;
 
         for i in 0..cfg.num_layers {
-            // Prefetch next block
+            // Wait for current block's weights
+            let raw_weights = self.swap.await_block(i)
+                .map_err(|e| flame_core::Error::InvalidInput(format!("await_block: {e}")))?;
+
+            // Prefetch next block (AFTER await, FlameSwap requires sequential prefetch→await)
             if i + 1 < cfg.num_layers {
                 self.swap.prefetch(i + 1)
                     .map_err(|e| flame_core::Error::InvalidInput(format!("prefetch: {e}")))?;
             }
-
-            // Wait for current block's weights and strip key prefix
-            let raw_weights = self.swap.await_block(i)
-                .map_err(|e| flame_core::Error::InvalidInput(format!("await_block: {e}")))?;
 
             // FlameSwap returns keys with full safetensors names, e.g.
             // "language_model.model.layers.5.self_attn.q_proj.weight"
@@ -597,6 +609,12 @@ impl Gemma3Encoder {
                     (stripped, v)
                 })
                 .collect();
+
+            if i == 0 {
+                let mut keys: Vec<&String> = weights.keys().collect();
+                keys.sort();
+                log::info!("[Gemma3] Block 0 keys ({} total): {:?}", keys.len(), keys);
+            }
 
             hidden = self.layer_forward(&hidden, &weights, i, &full_mask, &sliding_mask)?;
 
@@ -653,19 +671,21 @@ impl Gemma3Encoder {
 // RoPE table construction
 // ---------------------------------------------------------------------------
 
-/// Build RoPE cos/sin tables [1, max_seq_len, head_dim].
+/// Build RoPE cos/sin tables [1, 1, max_seq_len, head_dim/2].
+///
+/// Shape matches `rope_halfsplit_bf16` expectations: half-dim cos/sin.
+/// The kernel applies: q * cos + rotate_half(q) * sin internally.
 ///
 /// ## PyTorch reference (Gemma3RotaryEmbedding.forward):
 /// ```python
-/// inv_freq_expanded = self.inv_freq[None, :, None].float()
-/// position_ids_expanded = position_ids[:, None, :].float()
-/// freqs = (inv_freq_expanded @ position_ids_expanded).transpose(1, 2)
-/// emb = torch.cat((freqs, freqs), dim=-1)
-/// cos = emb.cos() * self.attention_scaling
-/// sin = emb.sin() * self.attention_scaling
+/// inv_freq = 1/(theta^(arange(0,dim,2)/dim))
+/// freqs = outer(positions, inv_freq)  # [seq, dim/2]
+/// emb = cat((freqs, freqs), dim=-1)   # [seq, dim] — but we only need half
+/// cos = emb.cos() * attention_scaling
+/// sin = emb.sin() * attention_scaling
 /// ```
 ///
-/// For "linear" rope_type: inv_freq = 1/(theta^(i/dim)) and attention_scaling = 1/factor.
+/// For "linear" rope_type: attention_scaling = 1/factor.
 fn build_rope_table(
     max_seq_len: usize,
     head_dim: usize,
@@ -682,32 +702,30 @@ fn build_rope_table(
         inv_freq[i] = 1.0 / theta.powf((2 * i) as f64 / head_dim as f64);
     }
 
-    // freqs: [max_seq_len, half] = pos * inv_freq
-    let mut cos_data = vec![0.0f32; max_seq_len * head_dim];
-    let mut sin_data = vec![0.0f32; max_seq_len * head_dim];
+    // Build [max_seq_len, half] cos/sin
+    let mut cos_data = vec![0.0f32; max_seq_len * half];
+    let mut sin_data = vec![0.0f32; max_seq_len * half];
 
     for pos in 0..max_seq_len {
         for i in 0..half {
             let angle = (pos as f64) * inv_freq[i];
             let c = (angle.cos() * attention_scaling) as f32;
             let s = (angle.sin() * attention_scaling) as f32;
-            // cat((freqs, freqs), dim=-1): duplicate across full head_dim
-            cos_data[pos * head_dim + i] = c;
-            cos_data[pos * head_dim + half + i] = c;
-            sin_data[pos * head_dim + i] = s;
-            sin_data[pos * head_dim + half + i] = s;
+            cos_data[pos * half + i] = c;
+            sin_data[pos * half + i] = s;
         }
     }
 
+    // Shape: [1, 1, max_seq_len, half] — matches rope_halfsplit_bf16 expectations
     let cos = Tensor::from_vec(
         cos_data,
-        Shape::from_dims(&[1, max_seq_len, head_dim]),
+        Shape::from_dims(&[1, 1, max_seq_len, half]),
         device.clone(),
     )?.to_dtype(DType::BF16)?;
 
     let sin = Tensor::from_vec(
         sin_data,
-        Shape::from_dims(&[1, max_seq_len, head_dim]),
+        Shape::from_dims(&[1, 1, max_seq_len, half]),
         device.clone(),
     )?.to_dtype(DType::BF16)?;
 

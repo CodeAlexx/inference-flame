@@ -685,13 +685,17 @@ impl LTX2TransformerBlock {
         let (shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp) =
             self.compute_ada_params_6(&self.scale_shift_table, temb, b, dim)?;
 
-        // 1. Self-Attention with AdaLN-Zero
-        let norm_h = rms_norm(hidden_states, self.norm1_weight.as_ref(), self.eps)?;
-        let mod_h = norm_h.mul(&scale_msa.add_scalar(1.0)?.to_dtype(DType::BF16)?)?.add(&shift_msa)?;
+        // 1. Self-Attention with AdaLN-Zero (fused: rms_norm+modulate → 1 kernel, residual+gate → 1 kernel)
+        let mod_h = if let Some(w) = self.norm1_weight.as_ref() {
+            fused_rms_norm_modulate(hidden_states, w, &scale_msa, &shift_msa, self.eps)?
+        } else {
+            let norm_h = rms_norm(hidden_states, None, self.eps)?;
+            fused_modulate(&norm_h, &scale_msa, &shift_msa)?
+        };
         let t_adaln = t0.elapsed().as_millis();
         let attn_out = self.attn1.forward(&mod_h, None, None, video_rotary_emb, None)?;
         let t_sa = t0.elapsed().as_millis() - t_adaln;
-        let mut hs = hidden_states.add(&attn_out.mul(&gate_msa)?)?;
+        let mut hs = fused_residual_gate(hidden_states, &attn_out, &gate_msa)?;
 
         // 2. Cross-Attention (text) — with or without adaln modulation
         if num_ada_params >= 9 {
@@ -699,10 +703,13 @@ impl LTX2TransformerBlock {
             let (shift_ca_q, scale_ca_q, gate_ca) =
                 self.compute_ada_params_ca(&self.scale_shift_table, temb, b, dim)?;
 
-            // Modulate query: rms_norm(x) * (1 + scale_q) + shift_q
-            let attn_input = rms_norm(&hs, self.norm2_weight.as_ref(), self.eps)?
-                .mul(&scale_ca_q.add_scalar(1.0)?.to_dtype(DType::BF16)?)?
-                .add(&shift_ca_q)?;
+            // Modulate query: fused rms_norm + modulate → 1 kernel
+            let attn_input = if let Some(w) = self.norm2_weight.as_ref() {
+                fused_rms_norm_modulate(&hs, w, &scale_ca_q, &shift_ca_q, self.eps)?
+            } else {
+                let norm_h2 = rms_norm(&hs, None, self.eps)?;
+                fused_modulate(&norm_h2, &scale_ca_q, &shift_ca_q)?
+            };
 
             // Modulate context (KV) using prompt_scale_shift_table + prompt_timestep
             let modulated_context = if let (Some(psst), Some(pt)) =
@@ -718,8 +725,8 @@ impl LTX2TransformerBlock {
                 let combined = psst_bc.add(&pt_4d)?.to_dtype(DType::BF16)?;
                 let shift_kv = combined.narrow(2, 0, 1)?.squeeze_dim(2)?; // [B, seq, dim]
                 let scale_kv = combined.narrow(2, 1, 1)?.squeeze_dim(2)?; // [B, seq, dim]
-                // context * (1 + scale_kv) + shift_kv
-                encoder_hidden_states.mul(&scale_kv.add_scalar(1.0)?.to_dtype(DType::BF16)?)?.add(&shift_kv)?
+                // context * (1 + scale_kv) + shift_kv — fused modulate
+                fused_modulate(encoder_hidden_states, &scale_kv, &shift_kv)?
             } else {
                 encoder_hidden_states.clone()
             };
@@ -727,7 +734,7 @@ impl LTX2TransformerBlock {
             let ca_out = self.attn2.forward(
                 &attn_input, Some(&modulated_context), encoder_attention_mask, None, None,
             )?;
-            hs = hs.add(&ca_out.mul(&gate_ca)?)?;
+            hs = fused_residual_gate(&hs, &ca_out, &gate_ca)?;
         } else {
             // Legacy 6-param path: no cross-attn modulation
             let norm_h2 = rms_norm(&hs, self.norm2_weight.as_ref(), self.eps)?;
@@ -739,11 +746,15 @@ impl LTX2TransformerBlock {
 
         let t_ca = t0.elapsed().as_millis() - t_adaln - t_sa;
 
-        // 3. FeedForward with AdaLN-Zero
-        let norm_ff = rms_norm(&hs, self.norm3_weight.as_ref(), self.eps)?;
-        let mod_ff = norm_ff.mul(&scale_mlp.add_scalar(1.0)?.to_dtype(DType::BF16)?)?.add(&shift_mlp)?;
+        // 3. FeedForward with AdaLN-Zero (fused: rms_norm+modulate → 1 kernel, residual+gate → 1 kernel)
+        let mod_ff = if let Some(w) = self.norm3_weight.as_ref() {
+            fused_rms_norm_modulate(&hs, w, &scale_mlp, &shift_mlp, self.eps)?
+        } else {
+            let norm_ff = rms_norm(&hs, None, self.eps)?;
+            fused_modulate(&norm_ff, &scale_mlp, &shift_mlp)?
+        };
         let ff_out = self.ff.forward(&mod_ff)?;
-        hs = hs.add(&ff_out.mul(&gate_mlp)?)?;
+        hs = fused_residual_gate(&hs, &ff_out, &gate_mlp)?;
         let t_ff = t0.elapsed().as_millis() - t_adaln - t_sa - t_ca;
         log::info!("[PERF] adaln={}ms sa={}ms ca={}ms ff={}ms total={}ms",
             t_adaln, t_sa, t_ca, t_ff, t0.elapsed().as_millis());
@@ -1659,6 +1670,55 @@ fn build_video_coords(
     )
 }
 
+/// Build audio coordinate grid for RoPE. Audio has temporal-only coords.
+/// Returns [B, 1, num_audio_tokens, 2] with (start, end) pairs for each token.
+fn build_audio_coords(
+    batch_size: usize,
+    audio_frames: usize,
+    audio_freq: usize,
+    audio_scale_factor: usize,
+    vae_temporal_scale: usize,
+    causal_offset: usize,
+    frame_rate: f32,
+    device: std::sync::Arc<flame_core::CudaDevice>,
+) -> Result<Tensor> {
+    let num_tokens = audio_frames * audio_freq;
+    let mut coords_data = vec![0.0f32; batch_size * 1 * num_tokens * 2];
+
+    for b in 0..batch_size {
+        for t in 0..audio_frames {
+            for f in 0..audio_freq {
+                let token_idx = t * audio_freq + f;
+                let base = b * 1 * num_tokens * 2;
+
+                // Audio temporal coords: scaled by audio_scale_factor * vae_temporal_scale
+                let scale = (audio_scale_factor * vae_temporal_scale) as f32;
+                let t_start = (t as f32 * scale);
+                let t_end = ((t + 1) as f32 * scale);
+
+                // Causal fix
+                let vae_t = vae_temporal_scale as f32;
+                let t_start_causal = (t_start + causal_offset as f32 - vae_t).max(0.0);
+                let t_end_causal = (t_end + causal_offset as f32 - vae_t).max(0.0);
+
+                // Frame-rate scaling
+                let t_start_scaled = t_start_causal / frame_rate;
+                let t_end_scaled = t_end_causal / frame_rate;
+
+                coords_data[base + token_idx * 2] = t_start_scaled;
+                coords_data[base + token_idx * 2 + 1] = t_end_scaled;
+            }
+        }
+    }
+
+    Tensor::from_vec_dtype(
+        coords_data,
+        Shape::from_dims(&[batch_size, 1, num_tokens, 2]),
+        device,
+        DType::F32,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // VideoEmbeddingsConnector (ComfyUI LTX-2.3)
 // ---------------------------------------------------------------------------
@@ -1890,7 +1950,7 @@ pub struct LTX2StreamingModel {
     pub config: LTX2Config,
     pub checkpoint_path: String,
 
-    // Global params on GPU
+    // Video global params on GPU
     pub proj_in_weight: Tensor,
     pub proj_in_bias: Tensor,
     pub caption_projection: Option<CaptionProjection>,
@@ -1903,6 +1963,20 @@ pub struct LTX2StreamingModel {
     pub scale_shift_table: Tensor,  // [2, inner_dim]
     pub proj_out_weight: Tensor,
     pub proj_out_bias: Tensor,
+
+    // Audio global params on GPU (None = audio not loaded)
+    pub audio_proj_in_weight: Option<Tensor>,
+    pub audio_proj_in_bias: Option<Tensor>,
+    pub audio_caption_projection: Option<CaptionProjection>,
+    pub audio_time_embed: Option<AdaLayerNormSingle>,
+    pub audio_scale_shift_table: Option<Tensor>,  // [2, audio_inner_dim]
+    pub audio_proj_out_weight: Option<Tensor>,
+    pub audio_proj_out_bias: Option<Tensor>,
+    // AV cross-attention global modulation
+    pub av_cross_attn_video_scale_shift: Option<AdaLayerNormSingle>,
+    pub av_cross_attn_audio_scale_shift: Option<AdaLayerNormSingle>,
+    pub av_cross_attn_video_a2v_gate: Option<AdaLayerNormSingle>,
+    pub av_cross_attn_audio_v2a_gate: Option<AdaLayerNormSingle>,
 
     // Block weight cache: pre-parsed block weights stored as raw tensors on GPU.
     // Populated by preload_blocks(). When present, load_block() reads from cache
@@ -1946,12 +2020,14 @@ impl LTX2StreamingModel {
                     return false;
                 }
                 let k = key.strip_prefix(&prefix).unwrap_or(key);
-                !k.contains("audio")
-                    && !k.starts_with("transformer_blocks.")
-                    // Skip connector + aggregate_embed to save ~3.6GB VRAM
-                    // (not needed when using pre-processed 4096-dim embeddings)
-                    && !k.starts_with("video_embeddings_connector.")
-                    && !k.contains("aggregate_embed")
+                // Skip per-block weights (loaded later by FP8 resident or FlameSwap)
+                if k.starts_with("transformer_blocks.") { return false; }
+                // Skip connector + aggregate_embed to save ~3.6GB VRAM
+                // (not needed when using pre-processed 4096-dim embeddings)
+                if k.starts_with("video_embeddings_connector.") { return false; }
+                if k.contains("aggregate_embed") { return false; }
+                // Load both video and audio globals
+                true
             },
         )?;
 
@@ -2021,6 +2097,30 @@ impl LTX2StreamingModel {
 
         let agg_w_t = agg_w.as_ref().map(|w| pre_transpose_weight(w)).transpose()?;
 
+        // Audio globals (optional — None if keys not found)
+        let audio_proj_in_w = globals.get("audio_proj_in.weight")
+            .map(|w| pre_transpose_weight(w)).transpose()?;
+        let audio_proj_in_b = globals.get("audio_proj_in.bias").cloned();
+        let audio_caption_proj = load_caption_projection(&globals, "audio_caption_projection").ok();
+        let audio_time_emb = load_ada_layer_norm_single(&globals, "audio_time_embed", 6).ok();
+        let audio_sst = globals.get("audio_scale_shift_table").cloned();
+        let audio_proj_out_w = globals.get("audio_proj_out.weight")
+            .map(|w| pre_transpose_weight(w)).transpose()?;
+        let audio_proj_out_b = globals.get("audio_proj_out.bias").cloned();
+
+        // AV cross-attention global modulation
+        let av_v_ss = load_ada_layer_norm_single(&globals, "av_cross_attn_video_scale_shift", 4).ok();
+        let av_a_ss = load_ada_layer_norm_single(&globals, "av_cross_attn_audio_scale_shift", 4).ok();
+        let av_v_gate = load_ada_layer_norm_single(&globals, "av_cross_attn_video_a2v_gate", 1).ok();
+        let av_a_gate = load_ada_layer_norm_single(&globals, "av_cross_attn_audio_v2a_gate", 1).ok();
+
+        let has_audio = audio_proj_in_w.is_some();
+        if has_audio {
+            log::info!("[LTX2] Audio globals loaded (audio_proj_in, audio_time_embed, etc.)");
+        } else {
+            log::info!("[LTX2] No audio globals found (video-only mode)");
+        }
+
         Ok(Self {
             config: config.clone(),
             checkpoint_path: path.to_string(),
@@ -2035,6 +2135,18 @@ impl LTX2StreamingModel {
             scale_shift_table: get("scale_shift_table")?,
             proj_out_weight: pre_transpose_weight(&get("proj_out.weight")?)?,
             proj_out_bias: get("proj_out.bias")?,
+            // Audio globals
+            audio_proj_in_weight: audio_proj_in_w,
+            audio_proj_in_bias: audio_proj_in_b,
+            audio_caption_projection: audio_caption_proj,
+            audio_time_embed: audio_time_emb,
+            audio_scale_shift_table: audio_sst,
+            audio_proj_out_weight: audio_proj_out_w,
+            audio_proj_out_bias: audio_proj_out_b,
+            av_cross_attn_video_scale_shift: av_v_ss,
+            av_cross_attn_audio_scale_shift: av_a_ss,
+            av_cross_attn_video_a2v_gate: av_v_gate,
+            av_cross_attn_audio_v2a_gate: av_a_gate,
             block_cache: Vec::new(),
             swap: None,
             key_prefix: prefix,
@@ -2111,8 +2223,7 @@ impl LTX2StreamingModel {
 
             for (k, v) in meta {
                 if k == "__metadata__" || !k.starts_with(&block_prefix) { continue; }
-                if k.contains("audio") && !k.contains("audio_to_video") { continue; }
-                if k.contains("video_to_audio") { continue; }
+                // Load ALL block weights including audio, A2V, V2A
                 if k.ends_with("_scale") || k.ends_with("input_scale") { continue; }
 
                 let dtype = v["dtype"].as_str().unwrap_or("?");
@@ -2136,7 +2247,7 @@ impl LTX2StreamingModel {
                         });
                     }
                     "BF16" => {
-                        // Load directly as BF16 Tensor — zero-copy on use
+                        // Load as BF16 Tensor, pre-transpose weight matrices
                         let bf16_data: Vec<u16> = mmap[start..end].chunks_exact(2)
                             .map(|c| u16::from_le_bytes([c[0], c[1]]))
                             .collect();
@@ -2145,6 +2256,13 @@ impl LTX2StreamingModel {
                         )?;
                         tensor.copy_from_bf16_slice(&bf16_data)?;
                         total_gpu_bytes += bf16_data.len() * 2;
+                        // Pre-transpose 2D weight matrices at load time (once)
+                        // so forward pass never calls transpose()
+                        let tensor = if super::fp8_resident::needs_transpose(&stripped, &shape) {
+                            tensor.transpose()?
+                        } else {
+                            tensor
+                        };
                         weights.insert(stripped, RawWeight::BF16 { tensor });
                     }
                     "F32" => {
@@ -2382,6 +2500,207 @@ impl LTX2StreamingModel {
         })
     }
 
+    /// Like `load_block_from_weights_static` but assumes all 2D weight
+    /// matrices are **already pre-transposed** to [in, out] layout.
+    /// Skips all `pre_transpose_weight` calls → zero GPU transposes.
+    pub fn load_block_from_weights_pretransposed(
+        config: &LTX2Config,
+        block_idx: usize,
+        block_weights: HashMap<String, Tensor>,
+    ) -> Result<LTX2TransformerBlock> {
+        let device = flame_core::global_cuda_device();
+
+        let eps = config.norm_eps;
+        let num_heads = config.num_attention_heads;
+        let head_dim = config.attention_head_dim;
+        let ad = config.audio_inner_dim();
+
+        let get_opt = |key: &str| -> Option<Tensor> { block_weights.get(key).cloned() };
+
+        let dummy_1d = |sz: usize| Tensor::zeros_dtype(
+            Shape::from_dims(&[sz]), DType::BF16, device.clone(),
+        );
+        let dummy_2d = |r: usize, c: usize| Tensor::zeros_dtype(
+            Shape::from_dims(&[r, c]), DType::BF16, device.clone(),
+        );
+
+        let dummy_attn = || -> Result<LTX2Attention> {
+            Ok(LTX2Attention {
+                to_q_weight: dummy_2d(ad, ad)?, to_q_bias: dummy_1d(ad)?,
+                to_k_weight: dummy_2d(ad, ad)?, to_k_bias: dummy_1d(ad)?,
+                to_v_weight: dummy_2d(ad, ad)?, to_v_bias: dummy_1d(ad)?,
+                norm_q_weight: dummy_1d(ad)?, norm_k_weight: dummy_1d(ad)?,
+                to_out_weight: dummy_2d(ad, ad)?, to_out_bias: dummy_1d(ad)?,
+                to_gate_logits_weight: None, to_gate_logits_bias: None,
+                num_heads: config.audio_num_attention_heads,
+                head_dim: config.audio_attention_head_dim, eps,
+            })
+        };
+
+        let dummy_ff = || -> Result<FeedForward> {
+            let affn = config.audio_ffn_hidden();
+            Ok(FeedForward {
+                gelu_proj_weight: dummy_2d(ad, affn)?,
+                gelu_proj_bias: dummy_1d(affn)?,
+                out_weight: dummy_2d(affn, ad)?,
+                out_bias: dummy_1d(ad)?,
+            })
+        };
+
+        let pfx = format!("transformer_blocks.{block_idx}");
+
+        // Attention/FF loaders that skip pre_transpose_weight
+        let load_attn_pt = |prefix: &str| -> Result<LTX2Attention> {
+            let get = |key: &str| -> Result<Tensor> {
+                block_weights.get(key).cloned().ok_or_else(||
+                    flame_core::Error::InvalidInput(format!("Missing weight: {}", key)))
+            };
+            let gate_weight = block_weights.get(&format!("{prefix}.to_gate_logits.weight")).cloned();
+            Ok(LTX2Attention {
+                to_q_weight: get(&format!("{prefix}.to_q.weight"))?,
+                to_q_bias: get(&format!("{prefix}.to_q.bias"))?,
+                to_k_weight: get(&format!("{prefix}.to_k.weight"))?,
+                to_k_bias: get(&format!("{prefix}.to_k.bias"))?,
+                to_v_weight: get(&format!("{prefix}.to_v.weight"))?,
+                to_v_bias: get(&format!("{prefix}.to_v.bias"))?,
+                norm_q_weight: get(&format!("{prefix}.norm_q.weight"))
+                    .or_else(|_| get(&format!("{prefix}.q_norm.weight")))?,
+                norm_k_weight: get(&format!("{prefix}.norm_k.weight"))
+                    .or_else(|_| get(&format!("{prefix}.k_norm.weight")))?,
+                to_out_weight: get(&format!("{prefix}.to_out.0.weight"))?,
+                to_out_bias: get(&format!("{prefix}.to_out.0.bias"))?,
+                to_gate_logits_weight: gate_weight,
+                to_gate_logits_bias: block_weights.get(&format!("{prefix}.to_gate_logits.bias")).cloned(),
+                num_heads,
+                head_dim,
+                eps,
+            })
+        };
+
+        let load_ff_pt = |prefix: &str| -> Result<FeedForward> {
+            let get = |key: &str| -> Result<Tensor> {
+                block_weights.get(key).cloned().ok_or_else(||
+                    flame_core::Error::InvalidInput(format!("Missing weight: {}", key)))
+            };
+            Ok(FeedForward {
+                gelu_proj_weight: get(&format!("{prefix}.net.0.proj.weight"))?,
+                gelu_proj_bias: get(&format!("{prefix}.net.0.proj.bias"))?,
+                out_weight: get(&format!("{prefix}.net.2.weight"))?,
+                out_bias: get(&format!("{prefix}.net.2.bias"))?,
+            })
+        };
+
+        // Audio attention loader (uses audio dimensions)
+        let a_heads = config.audio_num_attention_heads;
+        let a_head_dim = config.audio_attention_head_dim;
+        let load_audio_attn_pt = |prefix: &str| -> Result<LTX2Attention> {
+            let get = |key: &str| -> Result<Tensor> {
+                block_weights.get(key).cloned().ok_or_else(||
+                    flame_core::Error::InvalidInput(format!("Missing weight: {}", key)))
+            };
+            let gate_weight = block_weights.get(&format!("{prefix}.to_gate_logits.weight")).cloned();
+            Ok(LTX2Attention {
+                to_q_weight: get(&format!("{prefix}.to_q.weight"))?,
+                to_q_bias: get(&format!("{prefix}.to_q.bias"))?,
+                to_k_weight: get(&format!("{prefix}.to_k.weight"))?,
+                to_k_bias: get(&format!("{prefix}.to_k.bias"))?,
+                to_v_weight: get(&format!("{prefix}.to_v.weight"))?,
+                to_v_bias: get(&format!("{prefix}.to_v.bias"))?,
+                norm_q_weight: get(&format!("{prefix}.norm_q.weight"))
+                    .or_else(|_| get(&format!("{prefix}.q_norm.weight")))?,
+                norm_k_weight: get(&format!("{prefix}.norm_k.weight"))
+                    .or_else(|_| get(&format!("{prefix}.k_norm.weight")))?,
+                to_out_weight: get(&format!("{prefix}.to_out.0.weight"))?,
+                to_out_bias: get(&format!("{prefix}.to_out.0.bias"))?,
+                to_gate_logits_weight: gate_weight,
+                to_gate_logits_bias: block_weights.get(&format!("{prefix}.to_gate_logits.bias")).cloned(),
+                num_heads: a_heads,
+                head_dim: a_head_dim,
+                eps,
+            })
+        };
+
+        let load_audio_ff_pt = |prefix: &str| -> Result<FeedForward> {
+            let get = |key: &str| -> Result<Tensor> {
+                block_weights.get(key).cloned().ok_or_else(||
+                    flame_core::Error::InvalidInput(format!("Missing weight: {}", key)))
+            };
+            Ok(FeedForward {
+                gelu_proj_weight: get(&format!("{prefix}.net.0.proj.weight"))?,
+                gelu_proj_bias: get(&format!("{prefix}.net.0.proj.bias"))?,
+                out_weight: get(&format!("{prefix}.net.2.weight"))?,
+                out_bias: get(&format!("{prefix}.net.2.bias"))?,
+            })
+        };
+
+        // Try loading audio weights; fall back to dummies if not present
+        let has_audio = block_weights.contains_key(&format!("{pfx}.audio_attn1.to_q.weight"));
+
+        let (audio_n1, audio_a1) = if has_audio {
+            (get_opt(&format!("{pfx}.audio_norm1.weight")),
+             load_audio_attn_pt(&format!("{pfx}.audio_attn1"))?)
+        } else {
+            (None, dummy_attn()?)
+        };
+        let (audio_n2, audio_a2) = if has_audio {
+            (get_opt(&format!("{pfx}.audio_norm2.weight")),
+             load_audio_attn_pt(&format!("{pfx}.audio_attn2"))?)
+        } else {
+            (None, dummy_attn()?)
+        };
+        let (a2v_norm, a2v_attn) = if has_audio {
+            (get_opt(&format!("{pfx}.audio_to_video_norm.weight")),
+             load_attn_pt(&format!("{pfx}.audio_to_video_attn"))?)
+        } else {
+            (None, dummy_attn()?)
+        };
+        let (v2a_norm, v2a_attn) = if has_audio {
+            (get_opt(&format!("{pfx}.video_to_audio_norm.weight")),
+             load_audio_attn_pt(&format!("{pfx}.video_to_audio_attn"))?)
+        } else {
+            (None, dummy_attn()?)
+        };
+        let (audio_n3, audio_ffn) = if has_audio {
+            (get_opt(&format!("{pfx}.audio_norm3.weight")),
+             load_audio_ff_pt(&format!("{pfx}.audio_ff"))?)
+        } else {
+            (None, dummy_ff()?)
+        };
+
+        Ok(LTX2TransformerBlock {
+            norm1_weight: get_opt(&format!("{pfx}.norm1.weight")),
+            attn1: load_attn_pt(&format!("{pfx}.attn1"))?,
+            audio_norm1_weight: audio_n1,
+            audio_attn1: audio_a1,
+            norm2_weight: get_opt(&format!("{pfx}.norm2.weight")),
+            attn2: load_attn_pt(&format!("{pfx}.attn2"))?,
+            audio_norm2_weight: audio_n2,
+            audio_attn2: audio_a2,
+            audio_to_video_norm_weight: a2v_norm,
+            audio_to_video_attn: a2v_attn,
+            video_to_audio_norm_weight: v2a_norm,
+            video_to_audio_attn: v2a_attn,
+            norm3_weight: get_opt(&format!("{pfx}.norm3.weight")),
+            ff: load_ff_pt(&format!("{pfx}.ff"))?,
+            audio_norm3_weight: audio_n3,
+            audio_ff: audio_ffn,
+            scale_shift_table: block_weights.get(&format!("{pfx}.scale_shift_table"))
+                .cloned()
+                .ok_or_else(|| flame_core::Error::InvalidInput(format!("Missing: {pfx}.scale_shift_table")))?,
+            audio_scale_shift_table: block_weights.get(&format!("{pfx}.audio_scale_shift_table"))
+                .cloned()
+                .unwrap_or(dummy_2d(6, ad)?),
+            video_a2v_cross_attn_scale_shift_table: block_weights.get(&format!("{pfx}.video_a2v_cross_attn_scale_shift_table"))
+                .cloned()
+                .unwrap_or(dummy_2d(5, config.inner_dim())?),
+            audio_a2v_cross_attn_scale_shift_table: block_weights.get(&format!("{pfx}.audio_a2v_cross_attn_scale_shift_table"))
+                .cloned()
+                .unwrap_or(dummy_2d(5, ad)?),
+            prompt_scale_shift_table: get_opt(&format!("{pfx}.prompt_scale_shift_table")),
+            eps,
+        })
+    }
+
     /// Video-only forward with block streaming from disk.
     ///
     /// Each block is loaded from the safetensors checkpoint, executed,
@@ -2492,8 +2811,10 @@ impl LTX2StreamingModel {
         let checkpoint_path = self.checkpoint_path.clone();
 
         if !self.fp8_blocks.is_empty() {
-            // FP8 resident path: dequant each block on-the-fly, no disk I/O
-            log::info!("[LTX2] FP8 resident forward ({} blocks)", num_layers);
+            // FP8 resident path: dequant each block on-the-fly, no disk I/O.
+            // Weights are pre-transposed (BF16 at load, FP8 at dequant) so
+            // load_block_from_weights_pretransposed skips all GPU transposes.
+            log::info!("[LTX2] FP8 resident forward ({} blocks, pre-transposed)", num_layers);
             let mut dequant_buf = super::fp8_resident::DequantBuffer::new(
                 4096 * 16384, // largest weight: FFN [16384, 4096]
                 &device,
@@ -2502,7 +2823,7 @@ impl LTX2StreamingModel {
                 let t_block = std::time::Instant::now();
                 let block_weights = self.fp8_blocks[i].to_bf16_block(&device, &mut dequant_buf)?;
                 let t_dequant = t_block.elapsed().as_millis();
-                let block = Self::load_block_from_weights_static(&config_clone, i, block_weights)?;
+                let block = Self::load_block_from_weights_pretransposed(&config_clone, i, block_weights)?;
                 let t_load = t_block.elapsed().as_millis();
                 hs = block.forward_video_only(
                     &hs, &enc_hs, &v_timestep,
@@ -2611,6 +2932,239 @@ impl LTX2StreamingModel {
         // 9. Unpatchify
         let output = output.permute(&[0, 2, 1])?;
         output.reshape(&[batch_size, channels, num_frames, height, width])
+    }
+
+    /// Audio+video forward pass with FP8 resident block streaming.
+    /// Returns (video_output, audio_output) velocity tensors.
+    ///
+    /// `audio_x`: [B, audio_channels, audio_frames] (NOT 5D — audio has no spatial dims)
+    /// `audio_context`: [B, seq_len, caption_channels] text embeddings for audio
+    pub fn forward_audio_video(
+        &mut self,
+        x: &Tensor,              // [B, C, F, H, W] video latent
+        audio_x: &Tensor,        // [B, audio_C, audio_T, audio_F] audio latent
+        timestep: &Tensor,       // [B] sigma
+        context: &Tensor,        // [B, seq, caption_channels] text for video
+        audio_context: &Tensor,  // [B, seq, caption_channels] text for audio
+        frame_rate: f32,
+    ) -> Result<(Tensor, Tensor)> {
+        // Verify audio globals are loaded
+        let audio_proj_in_w = self.audio_proj_in_weight.as_ref()
+            .ok_or_else(|| flame_core::Error::InvalidInput("Audio globals not loaded".into()))?;
+        let audio_proj_in_b = self.audio_proj_in_bias.as_ref()
+            .ok_or_else(|| flame_core::Error::InvalidInput("Missing audio_proj_in_bias".into()))?;
+        let audio_time_emb = self.audio_time_embed.as_ref()
+            .ok_or_else(|| flame_core::Error::InvalidInput("Missing audio_time_embed".into()))?;
+        let audio_cap_proj = self.audio_caption_projection.as_ref()
+            .ok_or_else(|| flame_core::Error::InvalidInput("Missing audio_caption_projection".into()))?;
+        let audio_sst = self.audio_scale_shift_table.as_ref()
+            .ok_or_else(|| flame_core::Error::InvalidInput("Missing audio_scale_shift_table".into()))?;
+        let audio_proj_out_w = self.audio_proj_out_weight.as_ref()
+            .ok_or_else(|| flame_core::Error::InvalidInput("Missing audio_proj_out_weight".into()))?;
+        let audio_proj_out_b = self.audio_proj_out_bias.as_ref()
+            .ok_or_else(|| flame_core::Error::InvalidInput("Missing audio_proj_out_bias".into()))?;
+
+        let x_dims = x.shape().dims().to_vec();
+        let (batch_size, channels, num_frames, height, width) =
+            (x_dims[0], x_dims[1], x_dims[2], x_dims[3], x_dims[4]);
+        let inner_dim = self.config.inner_dim();
+        let audio_inner_dim = self.config.audio_inner_dim();
+        let num_video_tokens = num_frames * height * width;
+
+        let audio_dims = audio_x.shape().dims().to_vec();
+        let audio_channels = audio_dims[1];
+        let audio_frames = audio_dims[2];
+        let audio_freq = audio_dims[3];
+        let num_audio_tokens = audio_frames * audio_freq;
+
+        let device = x.device().clone();
+
+        // 1. Patchify video: [B, C, F, H, W] → [B, F*H*W, C]
+        let v_flat = x.reshape(&[batch_size, channels, num_video_tokens])?
+            .permute(&[0, 2, 1])?;
+
+        // Patchify audio: [B, C, T, F] → [B, T*F, C]
+        let a_flat = audio_x.reshape(&[batch_size, audio_channels, num_audio_tokens])?
+            .permute(&[0, 2, 1])?;
+
+        // 2. Build RoPE coords
+        let vae_sf = &self.config.vae_scale_factors;
+        let video_coords = build_video_coords(
+            batch_size, num_frames, height, width,
+            vae_sf, self.config.causal_offset, frame_rate, device.clone(),
+        )?;
+
+        // Audio coords: temporal only [B, 1, audio_tokens, 2]
+        let audio_coords = build_audio_coords(
+            batch_size, audio_frames, audio_freq,
+            self.config.audio_scale_factor, vae_sf[0],
+            self.config.causal_offset, frame_rate, device.clone(),
+        )?;
+
+        // 3. Compute RoPE
+        let video_max_pos = [
+            self.config.pos_embed_max_pos as f64,
+            self.config.base_height as f64,
+            self.config.base_width as f64,
+        ];
+        let audio_max_pos = [self.config.pos_embed_max_pos as f64];
+
+        let (v_cos, v_sin) = compute_rope_frequencies(
+            &video_coords, inner_dim, &video_max_pos,
+            self.config.rope_theta, self.config.num_attention_heads,
+        )?;
+        let (a_cos, a_sin) = compute_rope_frequencies(
+            &audio_coords, audio_inner_dim, &audio_max_pos,
+            self.config.rope_theta, self.config.audio_num_attention_heads,
+        )?;
+
+        // Cross-attention RoPE (temporal only)
+        let video_temporal_coords = video_coords.narrow(1, 0, 1)?;
+        let ca_audio_dim = self.config.audio_cross_attention_dim;
+        let ca_max_pos = [self.config.pos_embed_max_pos as f64];
+        let (ca_v_cos, ca_v_sin) = compute_rope_frequencies(
+            &video_temporal_coords, ca_audio_dim, &ca_max_pos,
+            self.config.rope_theta, self.config.num_attention_heads,
+        )?;
+        let audio_temporal_coords = audio_coords.narrow(1, 0, 1)?;
+        let (ca_a_cos, ca_a_sin) = compute_rope_frequencies(
+            &audio_temporal_coords, ca_audio_dim, &ca_max_pos,
+            self.config.rope_theta, self.config.audio_num_attention_heads,
+        )?;
+
+        // 4. Input projections
+        let mut hs = linear3d(&v_flat, &self.proj_in_weight, Some(&self.proj_in_bias))?;
+        let mut ahs = linear3d(&a_flat, audio_proj_in_w, Some(audio_proj_in_b))?;
+
+        // 5. Timestep embeddings
+        let num_mod_params = self.time_embed.num_mod_params;
+        let ts_expanded = timestep.unsqueeze(1)?.expand(&[batch_size, num_video_tokens])?;
+        let ts_scaled = ts_expanded.mul_scalar(self.config.timestep_scale_multiplier as f32)?;
+        let ts_flat = ts_scaled.reshape(&[batch_size * num_video_tokens])?;
+        let (v_timestep, v_embedded) = self.time_embed.forward(&ts_flat)?;
+        let v_timestep = v_timestep.reshape(&[batch_size, num_video_tokens, num_mod_params * inner_dim])?;
+        let v_embedded = v_embedded.reshape(&[batch_size, num_video_tokens, inner_dim])?;
+
+        // Audio timestep
+        let audio_num_mod = audio_time_emb.num_mod_params;
+        let ats_expanded = timestep.unsqueeze(1)?.expand(&[batch_size, num_audio_tokens])?;
+        let ats_scaled = ats_expanded.mul_scalar(self.config.timestep_scale_multiplier as f32)?;
+        let ats_flat = ats_scaled.reshape(&[batch_size * num_audio_tokens])?;
+        let (a_timestep, a_embedded) = audio_time_emb.forward(&ats_flat)?;
+        let a_timestep = a_timestep.reshape(&[batch_size, num_audio_tokens, audio_num_mod * audio_inner_dim])?;
+        let a_embedded = a_embedded.reshape(&[batch_size, num_audio_tokens, audio_inner_dim])?;
+
+        // 6. AV cross-attention global modulation
+        let cross_gate_scale = (self.config.cross_attn_timestep_scale_multiplier
+            / self.config.timestep_scale_multiplier) as f32;
+
+        let v_ca_ss = if let Some(ref adaln) = self.av_cross_attn_video_scale_shift {
+            let (ss, _) = adaln.forward(&ts_flat.narrow(0, 0, batch_size)?)?;
+            ss.reshape(&[batch_size, 1, ss.shape().dims()[ss.shape().rank() - 1]])?
+        } else {
+            Tensor::zeros_dtype(Shape::from_dims(&[batch_size, 1, 4 * inner_dim]), DType::BF16, device.clone())?
+        };
+
+        let v_ca_gate = if let Some(ref adaln) = self.av_cross_attn_video_a2v_gate {
+            let scaled_ts = ts_flat.narrow(0, 0, batch_size)?.mul_scalar(cross_gate_scale)?;
+            let (g, _) = adaln.forward(&scaled_ts)?;
+            g.reshape(&[batch_size, 1, g.shape().dims()[g.shape().rank() - 1]])?
+        } else {
+            Tensor::zeros_dtype(Shape::from_dims(&[batch_size, 1, inner_dim]), DType::BF16, device.clone())?
+        };
+
+        let a_ca_ss = if let Some(ref adaln) = self.av_cross_attn_audio_scale_shift {
+            let (ss, _) = adaln.forward(&ats_flat.narrow(0, 0, batch_size)?)?;
+            ss.reshape(&[batch_size, 1, ss.shape().dims()[ss.shape().rank() - 1]])?
+        } else {
+            Tensor::zeros_dtype(Shape::from_dims(&[batch_size, 1, 4 * audio_inner_dim]), DType::BF16, device.clone())?
+        };
+
+        let a_ca_gate = if let Some(ref adaln) = self.av_cross_attn_audio_v2a_gate {
+            let scaled_ats = ats_flat.narrow(0, 0, batch_size)?.mul_scalar(cross_gate_scale)?;
+            let (g, _) = adaln.forward(&scaled_ats)?;
+            g.reshape(&[batch_size, 1, g.shape().dims()[g.shape().rank() - 1]])?
+        } else {
+            Tensor::zeros_dtype(Shape::from_dims(&[batch_size, 1, audio_inner_dim]), DType::BF16, device.clone())?
+        };
+
+        // 7. Text embeddings
+        let context_dim = context.shape().dims()[2];
+        let enc_hs = if context_dim == inner_dim {
+            context.clone()
+        } else if let Some(ref cap_proj) = self.caption_projection {
+            cap_proj.forward(context)?
+        } else {
+            return Err(flame_core::Error::InvalidInput("No video text projection".into()));
+        };
+
+        let audio_enc_hs = audio_cap_proj.forward(audio_context)?;
+
+        // 8. Stream blocks (FP8 resident only)
+        let num_layers = self.config.num_layers;
+        let config_clone = self.config.clone();
+
+        if self.fp8_blocks.is_empty() {
+            return Err(flame_core::Error::InvalidInput(
+                "forward_audio_video requires FP8 resident blocks".into()));
+        }
+
+        log::info!("[LTX2] AV FP8 resident forward ({} blocks)", num_layers);
+        let mut dequant_buf = super::fp8_resident::DequantBuffer::new(
+            4096 * 16384, &device,
+        )?;
+
+        for i in 0..num_layers {
+            let t_block = std::time::Instant::now();
+            let block_weights = self.fp8_blocks[i].to_bf16_block(&device, &mut dequant_buf)?;
+            let block = Self::load_block_from_weights_pretransposed(&config_clone, i, block_weights)?;
+            let (new_hs, new_ahs) = block.forward(
+                &hs, &ahs,
+                &enc_hs, &audio_enc_hs,
+                &v_timestep, &a_timestep,
+                &v_ca_ss, &a_ca_ss,
+                &v_ca_gate, &a_ca_gate,
+                Some((&v_cos, &v_sin)),
+                Some((&a_cos, &a_sin)),
+                Some((&ca_v_cos, &ca_v_sin)),
+                Some((&ca_a_cos, &ca_a_sin)),
+                None, None,
+            )?;
+            hs = new_hs;
+            ahs = new_ahs;
+            drop(block);
+            if (i + 1) % 12 == 0 || i + 1 == num_layers || i == 0 {
+                log::info!("[LTX2] AV Block {}/{}: {}ms",
+                    i + 1, num_layers, t_block.elapsed().as_millis());
+            }
+        }
+
+        // 9. Video output
+        let shift_scale = self.scale_shift_table.unsqueeze(0)?.unsqueeze(0)?;
+        let emb_4d = v_embedded.unsqueeze(2)?;
+        let final_ss = shift_scale.add(&emb_4d)?.to_dtype(DType::BF16)?;
+        let v_shift = final_ss.narrow(2, 0, 1)?.squeeze_dim(2)?;
+        let v_scale = final_ss.narrow(2, 1, 1)?.squeeze_dim(2)?;
+        let v_normed = layer_norm_no_affine(&hs, self.config.norm_eps)?;
+        let v_output = v_normed.mul(&v_scale.add_scalar(1.0)?.to_dtype(DType::BF16)?)?.add(&v_shift)?;
+        let v_output = linear3d(&v_output, &self.proj_out_weight, Some(&self.proj_out_bias))?;
+        let v_output = v_output.permute(&[0, 2, 1])?;
+        let v_output = v_output.reshape(&[batch_size, channels, num_frames, height, width])?;
+
+        // 10. Audio output
+        let a_ss = audio_sst.unsqueeze(0)?.unsqueeze(0)?;
+        let a_emb_4d = a_embedded.unsqueeze(2)?;
+        let a_final_ss = a_ss.add(&a_emb_4d)?.to_dtype(DType::BF16)?;
+        let a_shift = a_final_ss.narrow(2, 0, 1)?.squeeze_dim(2)?;
+        let a_scale = a_final_ss.narrow(2, 1, 1)?.squeeze_dim(2)?;
+        let a_normed = layer_norm_no_affine(&ahs, self.config.norm_eps)?;
+        let a_output = a_normed.mul(&a_scale.add_scalar(1.0)?.to_dtype(DType::BF16)?)?.add(&a_shift)?;
+        let a_output = linear3d(&a_output, audio_proj_out_w, Some(audio_proj_out_b))?;
+        // Unpatchify audio: [B, T*F, C] → [B, C, T, F]
+        let a_output = a_output.permute(&[0, 2, 1])?;
+        let a_output = a_output.reshape(&[batch_size, audio_channels, audio_frames, audio_freq])?;
+
+        Ok((v_output, a_output))
     }
 }
 

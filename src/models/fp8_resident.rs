@@ -1,9 +1,10 @@
 //! FP8 resident model: keep all block weights on GPU as raw bytes.
 //! Dequant each block to BF16 on-the-fly during forward pass.
+//! Weights are pre-transposed so the forward pass does zero transposes.
 //!
 //! Memory budget for LTX-2.3 22B FP8:
 //!   FP8 blocks (2-45): ~9GB raw
-//!   BF16 blocks (0,1,46,47): ~3GB raw
+//!   BF16 blocks (0,1,46,47): ~3GB raw (pre-transposed at load)
 //!   F32 tables: ~19MB
 //!   Globals: ~4GB
 //!   Per-block BF16 dequant: ~580MB temporary
@@ -13,6 +14,17 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use cudarc::driver::{CudaDevice, CudaSlice, DevicePtr};
 use flame_core::{DType, Result, Shape, Tensor};
+
+/// Returns true if this key is a 2D weight matrix that needs transposing
+/// from [out_features, in_features] → [in_features, out_features].
+/// Biases (1D), norms (1D), and scale_shift_tables (F32) don't need it.
+pub fn needs_transpose(key: &str, shape: &[usize]) -> bool {
+    shape.len() == 2 && key.ends_with(".weight")
+        && !key.contains("norm_q") && !key.contains("norm_k")
+        && !key.contains("q_norm") && !key.contains("k_norm")
+        && !key.contains("scale_shift")
+        && !key.contains("norm1") && !key.contains("norm2") && !key.contains("norm3")
+}
 
 /// One weight tensor stored on GPU — either FP8 (u8) or BF16 (u16).
 pub enum RawWeight {
@@ -66,45 +78,32 @@ impl DequantBuffer {
 
 impl ResidentBlock {
     /// Convert all weights to BF16 Tensors for one forward pass.
-    /// BF16 weights: Arc clone (zero GPU copy with shared_storage).
-    /// FP8 weights: dequant into pre-allocated buffer (zero alloc).
+    /// **All 2D weight matrices are pre-transposed** to [in, out] layout
+    /// so the forward pass can skip 576 GPU transpose kernels per step.
+    ///
+    /// BF16 weights: already pre-transposed at load time → Arc clone (zero copy).
+    /// FP8 weights: dequant + transpose (two kernels, but only once per step).
     pub fn to_bf16_block(
         &self,
         device: &Arc<CudaDevice>,
-        dequant_buf: &mut DequantBuffer,
+        _dequant_buf: &mut DequantBuffer,
     ) -> Result<HashMap<String, Tensor>> {
         let mut result = HashMap::with_capacity(self.weights.len() + self.f32_tensors.len());
 
         for (name, raw) in &self.weights {
             let tensor = match raw {
-                RawWeight::BF16 { tensor } => tensor.clone(), // Arc bump, zero copy
-                RawWeight::FP8 { data, shape, numel, scale } => {
-                    // Dequant into pre-allocated buffer
-                    assert!(*numel <= dequant_buf.capacity,
-                        "FP8 tensor {} has {} elems, buffer only {}", name, numel, dequant_buf.capacity);
-                    let stream = std::ptr::null_mut(); // default stream
-                    let ret = unsafe {
-                        flame_core::cuda::ffi::flame_fp8_to_bf16(
-                            *data.device_ptr() as *const _,
-                            *dequant_buf.buf.device_ptr() as *mut _,
-                            *scale,
-                            *numel,
-                            stream,
-                        )
-                    };
-                    if ret != 0 {
-                        return Err(flame_core::Error::Cuda(format!("dequant error: {ret}")));
-                    }
-                    // Wrap the buffer slice as a Tensor
-                    // IMPORTANT: this aliases the buffer — only one FP8 tensor can be
-                    // "active" at a time. The GEMM must consume it before next dequant.
-                    // For per-block forward this is fine: each weight is used then dropped.
-                    //
-                    // Actually, we can't alias — the Tensor takes ownership.
-                    // We need to allocate per-FP8-tensor. Keep using dequant_fp8_to_bf16.
-                    flame_core::ops::fused_inference::dequant_fp8_to_bf16(
+                RawWeight::BF16 { tensor } => tensor.clone(), // Already pre-transposed at load
+                RawWeight::FP8 { data, shape, numel: _, scale } => {
+                    // Dequant to BF16
+                    let t = flame_core::ops::fused_inference::dequant_fp8_to_bf16(
                         data, *scale, Shape::from_dims(shape), device,
-                    )?
+                    )?;
+                    // Transpose 2D weight matrices: [out, in] → [in, out]
+                    if needs_transpose(name, shape) {
+                        t.transpose()?
+                    } else {
+                        t
+                    }
                 }
             };
             result.insert(name.clone(), tensor);

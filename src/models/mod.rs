@@ -9,3 +9,6 @@ pub mod gemma3_encoder;
 pub mod feature_extractor;
 pub mod fp8_resident;
 pub mod mistral_encoder;
+pub mod clip_encoder;
+pub mod t5_encoder;
+pub mod flux1_dit;
