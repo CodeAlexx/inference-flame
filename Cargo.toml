@@ -26,6 +26,14 @@ cuda = []
 bf16_u16 = []
 
 [[bin]]
+name = "bench_flame"
+path = "bench/bench_flame.rs"
+
+[[bin]]
+name = "chroma_infer"
+path = "src/bin/chroma_infer.rs"
+
+[[bin]]
 name = "zimage_infer"
 path = "src/bin/zimage_infer.rs"
 
@@ -108,3 +116,7 @@ path = "src/bin/test_gemma_encoder.rs"
 [[bin]]
 name = "flux1_test"
 path = "src/bin/flux1_test.rs"
+
+[[bin]]
+name = "flux1_infer"
+path = "src/bin/flux1_infer.rs"

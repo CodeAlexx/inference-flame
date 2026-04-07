@@ -216,44 +216,64 @@ impl NextDiT {
         rope_sin: &Tensor,
         prefix: &str,
     ) -> Result<Tensor> {
+        // Sub-profiling: fires only on layer 0 when ZIMAGE_BLOCK_PROF=1.
+        let prof = (prefix.ends_with(".0") || prefix.ends_with("layers.0"))
+            && std::env::var("ZIMAGE_BLOCK_PROF").ok().as_deref() == Some("1");
+        let dev = x.device().clone();
+        let mark = |label: &str, t: std::time::Instant| {
+            if prof {
+                let _ = dev.synchronize();
+                eprintln!("[ZATTN]   {:<18} {:>6}ms", label, t.elapsed().as_millis());
+            }
+        };
+
         let dims = x.shape().dims().to_vec();
         let (b, seq, num_heads, head_dim) = (dims[0], dims[1], self.config.num_heads, self.config.head_dim);
 
-        // Fused QKV projection
+        let t = std::time::Instant::now();
         let qkv = self.linear_no_bias(x, &format!("{prefix}.attention.qkv.weight"))?;
         let chunks = qkv.chunk(3, 2)?;
         let q = chunks[0].reshape(&[b, seq, num_heads, head_dim])?;
         let k = chunks[1].reshape(&[b, seq, num_heads, head_dim])?;
         let v = chunks[2].reshape(&[b, seq, num_heads, head_dim])?;
+        mark("a.qkv_proj+chunk", t);
 
-        // QK RMSNorm per-head — fused kernel (flatten to [B*S*H, D])
+        let t = std::time::Instant::now();
         let q_w = self.w(&format!("{prefix}.attention.q_norm.weight"))?;
         let k_w = self.w(&format!("{prefix}.attention.k_norm.weight"))?;
         let q_flat = q.reshape(&[b * seq * num_heads, head_dim])?;
         let k_flat = k.reshape(&[b * seq * num_heads, head_dim])?;
         let q = fused_rms_norm(&q_flat, q_w, 1e-6)?.reshape(&[b, seq, num_heads, head_dim])?;
         let k = fused_rms_norm(&k_flat, k_w, 1e-6)?.reshape(&[b, seq, num_heads, head_dim])?;
+        mark("b.qk_rmsnorm", t);
 
-        // Permute to [B, H, S, D] for fused RoPE + SDPA
+        let t = std::time::Instant::now();
         let q = q.permute(&[0, 2, 1, 3])?;
         let k = k.permute(&[0, 2, 1, 3])?;
         let v = v.permute(&[0, 2, 1, 3])?;
+        mark("c.permute_qkv", t);
 
-        // Fused RoPE — single kernel, cos/sin need [1, 1, S, D/2]
+        let t = std::time::Instant::now();
         let half_d = head_dim / 2;
         let cos = rope_cos.reshape(&[1, 1, seq, half_d])?;
         let sin = rope_sin.reshape(&[1, 1, seq, half_d])?;
         let q = rope_fused_bf16(&q, &cos, &sin)?;
         let k = rope_fused_bf16(&k, &cos, &sin)?;
+        mark("d.rope", t);
 
-        // SDPA
+        let t = std::time::Instant::now();
         let out = sdpa(&q, &k, &v, None)?;
+        mark("e.sdpa", t);
 
-        // Back to [B, S, H*D]
+        let t = std::time::Instant::now();
         let out = out.permute(&[0, 2, 1, 3])?;
         let out = out.reshape(&[b, seq, num_heads * head_dim])?;
+        mark("f.permute_out", t);
 
-        self.linear_no_bias(&out, &format!("{prefix}.attention.out.weight"))
+        let t = std::time::Instant::now();
+        let r = self.linear_no_bias(&out, &format!("{prefix}.attention.out.weight"));
+        mark("g.out_proj", t);
+        r
     }
 
     // -- Transformer block (fused kernels) -----------------------------------
@@ -266,10 +286,22 @@ impl NextDiT {
         t_cond: Option<&Tensor>,
         prefix: &str,
     ) -> Result<Tensor> {
+        // Section profiler: fires when ZIMAGE_BLOCK_PROF=1 and only on block 0.
+        let prof = prefix.ends_with(".0") || prefix.ends_with("layers.0");
+        let prof = prof && std::env::var("ZIMAGE_BLOCK_PROF").ok().as_deref() == Some("1");
+        let dev = x.device().clone();
+        let mark = |label: &str, t: std::time::Instant| {
+            if prof {
+                let _ = dev.synchronize();
+                eprintln!("[ZBPROF] {:<22} {:>6}ms", label, t.elapsed().as_millis());
+            }
+        };
+        let t_block = std::time::Instant::now();
+
+        let t = std::time::Instant::now();
         let adaln_key = format!("{prefix}.adaLN_modulation.0.weight");
         let has_adaln = t_cond.is_some() && self.has_key(&adaln_key);
 
-        // Compute modulation outputs
         let (scale_msa, gate_msa, scale_mlp, gate_mlp) = if has_adaln {
             let t_cond = t_cond.unwrap();
             let mod_out = self.linear_with_bias(
@@ -283,37 +315,40 @@ impl NextDiT {
         } else {
             (None, None, None, None)
         };
+        mark("1.adaln_mod", t);
 
         // --- Attention branch ---
+        let t = std::time::Instant::now();
         let norm1_w = self.w(&format!("{prefix}.attention_norm1.weight"))?;
         let x_norm = fused_rms_norm(x, norm1_w, 1e-6)?;
-
         let x_norm = if let Some(ref scale) = scale_msa {
-            // (1 + scale) * x_norm — scale is [B, dim], x_norm is [B, N, dim]
             let scale_unsq = scale.unsqueeze(1)?;
             let factor = scale_unsq.add_scalar(1.0)?;
             x_norm.mul(&factor)?
         } else {
             x_norm
         };
+        mark("2.rms1+scale_msa", t);
 
+        let t = std::time::Instant::now();
         let attn_out = self.joint_attention(&x_norm, rope_cos, rope_sin, prefix)?;
+        mark("3.joint_attention", t);
 
+        let t = std::time::Instant::now();
         let norm2_w = self.w(&format!("{prefix}.attention_norm2.weight"))?;
         let attn_out = fused_rms_norm(&attn_out, norm2_w, 1e-6)?;
-
         let x_out = if let Some(ref gate) = gate_msa {
-            // x + tanh(gate) * attn_out — fused kernel
             let g = gate.tanh()?;
             gate_residual_fused_bf16(x, &g, &attn_out)?
         } else {
             x.add(&attn_out)?
         };
+        mark("4.rms2+gate1", t);
 
         // --- FFN branch ---
+        let t = std::time::Instant::now();
         let ffn_norm1_w = self.w(&format!("{prefix}.ffn_norm1.weight"))?;
         let ff_norm = fused_rms_norm(&x_out, ffn_norm1_w, 1e-6)?;
-
         let ff_norm = if let Some(ref scale) = scale_mlp {
             let scale_unsq = scale.unsqueeze(1)?;
             let factor = scale_unsq.add_scalar(1.0)?;
@@ -321,18 +356,27 @@ impl NextDiT {
         } else {
             ff_norm
         };
+        mark("5.rms3+scale_mlp", t);
 
+        let t = std::time::Instant::now();
         let ff_out = self.swiglu(&ff_norm, prefix)?;
+        mark("6.swiglu", t);
 
+        let t = std::time::Instant::now();
         let ffn_norm2_w = self.w(&format!("{prefix}.ffn_norm2.weight"))?;
         let ff_out = fused_rms_norm(&ff_out, ffn_norm2_w, 1e-6)?;
-
         let x_out = if let Some(ref gate) = gate_mlp {
             let g = gate.tanh()?;
             gate_residual_fused_bf16(&x_out, &g, &ff_out)?
         } else {
             x_out.add(&ff_out)?
         };
+        mark("7.rms4+gate2", t);
+
+        if prof {
+            let _ = dev.synchronize();
+            eprintln!("[ZBPROF] TOTAL                 {:>6}ms", t_block.elapsed().as_millis());
+        }
 
         Ok(x_out)
     }

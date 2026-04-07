@@ -23,7 +23,7 @@
 //!
 //! ⚠️ STANDALONE — does NOT connect to any inference pipeline.
 
-use flame_core::attention::sdpa as flame_sdpa;
+use flame_core::attention::sdpa_with_bias as flame_sdpa_with_bias;
 use flame_core::serialization::load_file_filtered;
 use flame_core::{CudaDevice, DType, Result, Shape, Tensor};
 use flame_swap::FlameSwap;
@@ -70,57 +70,54 @@ impl Default for T5Config {
 // T5 Encoder with FlameSwap
 // ---------------------------------------------------------------------------
 
-/// T5-XXL encoder. Uses FlameSwap for 24 transformer layers (~18GB BF16).
+/// T5-XXL encoder. Loads all 220 weights resident on GPU as BF16 (~9.7GB).
+///
+/// **Note:** FlameSwap was originally planned for the 24 transformer layers,
+/// but `flame-swap`'s safetensors parser only handles `BF16/F32/F8_E4M3` and
+/// silently skips `F16` tensors (`swap.rs:630 _ => continue`). The shipping
+/// `t5xxl_fp16.safetensors` is FP16, so swap loaded 0 blocks. T5-XXL fits on
+/// a 24GB card (~9.7GB BF16) before the DiT loads, and we drop it before the
+/// DiT swap is constructed in `flux1_infer`, so resident loading is safe.
 pub struct T5Encoder {
-    shared: HashMap<String, Tensor>,
-    swap: FlameSwap,
+    weights: HashMap<String, Tensor>,
     config: T5Config,
     device: Arc<CudaDevice>,
 }
 
 impl T5Encoder {
-    /// Load T5-XXL from safetensors.
+    /// Load T5-XXL from safetensors. Casts every tensor to BF16 (loader
+    /// upcasts F16 → F32; BF16 kernels need BF16).
     pub fn load(
         safetensors_path: &str,
         device: &Arc<CudaDevice>,
     ) -> Result<Self> {
         let config = T5Config::default();
 
-        // FlameSwap: "encoder.block.N.xxx" → block N
-        let swap = FlameSwap::load(
-            &[safetensors_path],
-            device,
-            |name| {
-                let rest = name.strip_prefix("encoder.block.")?;
-                rest.split('.').next()?.parse().ok()
-            },
-        ).map_err(|e| flame_core::Error::InvalidInput(format!("FlameSwap T5: {e}")))?;
-
-        // Load shared weights
-        let shared_keys = ["encoder.embed_tokens.weight", "encoder.final_layer_norm.weight", "shared.weight"];
-        let mut shared = HashMap::new();
-        let file_weights = load_file_filtered(
+        let raw = flame_core::serialization::load_file(
             Path::new(safetensors_path),
             device,
-            |key| shared_keys.contains(&key),
         )?;
-        for &sk in &shared_keys {
-            if let Some(t) = file_weights.get(sk) {
-                shared.insert(sk.to_string(), t.clone());
+
+        let mut weights: HashMap<String, Tensor> = HashMap::with_capacity(raw.len());
+        for (k, v) in raw {
+            let t = if v.dtype() == DType::BF16 {
+                v
+            } else {
+                v.to_dtype(DType::BF16)?
+            };
+            weights.insert(k, t);
+        }
+
+        // Some checkpoints use `shared.weight` as the embed table.
+        if !weights.contains_key("encoder.embed_tokens.weight") {
+            if let Some(sw) = weights.get("shared.weight").cloned() {
+                weights.insert("encoder.embed_tokens.weight".to_string(), sw);
             }
         }
 
-        // Use shared.weight as embed_tokens if embed_tokens not found
-        if !shared.contains_key("encoder.embed_tokens.weight") {
-            if let Some(sw) = shared.get("shared.weight") {
-                shared.insert("encoder.embed_tokens.weight".to_string(), sw.clone());
-            }
-        }
+        log::info!("[T5] Loaded: {} resident weights (BF16)", weights.len());
 
-        log::info!("[T5] Loaded: {} blocks via FlameSwap, {} shared weights",
-            swap.num_blocks(), shared.len());
-
-        Ok(Self { shared, swap, config, device: device.clone() })
+        Ok(Self { weights, config, device: device.clone() })
     }
 
     /// T5 LayerNorm (RMSNorm variant): norm(x) * weight
@@ -136,11 +133,39 @@ impl T5Encoder {
 
     /// Linear without bias: [B, N, C] x [out, in]^T → [B, N, out]
     fn linear(x: &Tensor, weight: &Tensor) -> Result<Tensor> {
+        let prof = std::env::var("FLUX1_LIN_PROF").ok().as_deref() == Some("1");
+        let dev = x.device();
+
+        if prof { let _ = dev.synchronize(); }
+        let t0 = std::time::Instant::now();
         let wt = flame_core::bf16_elementwise::transpose2d_bf16(weight)?;
+        if prof { let _ = dev.synchronize(); }
+        let trans_us = t0.elapsed().as_micros();
+
         let shape = x.shape().dims().to_vec();
         let (b, n, c) = (shape[0], shape[1], shape[2]);
         let x_2d = x.reshape(&[b * n, c])?;
+
+        if prof { let _ = dev.synchronize(); }
+        let t1 = std::time::Instant::now();
         let out = x_2d.matmul(&wt)?;
+        if prof { let _ = dev.synchronize(); }
+        let mm_us = t1.elapsed().as_micros();
+
+        if prof {
+            static mut COUNT: usize = 0;
+            unsafe {
+                if COUNT < 8 {
+                    eprintln!(
+                        "[LIN] x={:?} w={:?} wt_storage={:?}: transpose={}us matmul={}us",
+                        x.shape().dims(), weight.shape().dims(), wt.dtype(),
+                        trans_us, mm_us
+                    );
+                    COUNT += 1;
+                }
+            }
+        }
+
         let out_dim = out.shape().dims()[1];
         out.reshape(&[b, n, out_dim])
     }
@@ -154,7 +179,7 @@ impl T5Encoder {
     /// # Output: [1, num_heads, seq_len, seq_len]
     /// ```
     fn compute_relative_bias(
-        bias_weight: &Tensor, // [32, 64]
+        bias_weight: &Tensor, // [num_buckets=32, num_heads=64]
         seq_len: usize,
         num_buckets: usize,
         max_distance: usize,
@@ -162,18 +187,31 @@ impl T5Encoder {
     ) -> Result<Tensor> {
         let num_heads = bias_weight.shape().dims()[1];
 
-        // Compute relative positions: context_position - memory_position
-        // For encoder (bidirectional), use half buckets for positive, half for negative
-        let half_buckets = num_buckets / 2;
+        // ## HF reference (modeling_t5.py::compute_bias):
+        // ```python
+        // context_position = torch.arange(query_length)[:, None]
+        // memory_position = torch.arange(key_length)[None, :]
+        // relative_position = memory_position - context_position   # (Q, K)
+        // relative_position_bucket = self._relative_position_bucket(
+        //     relative_position,
+        //     bidirectional=(not self.is_decoder),   # True for encoder
+        //     num_buckets=self.relative_attention_num_buckets,  # 32
+        //     max_distance=self.relative_attention_max_distance, # 128
+        // )
+        // values = self.relative_attention_bias(relative_position_bucket)  # (Q, K, H)
+        // values = values.permute([2, 0, 1]).unsqueeze(0)                  # (1, H, Q, K)
+        // ```
+        //
+        // T5.H2 fix: pass ORIGINAL num_buckets (32) to the bucket fn; halving
+        // happens inside the bidirectional branch per HF.
         let mut bias_data = vec![0i32; seq_len * seq_len];
-
         for i in 0..seq_len {
             for j in 0..seq_len {
                 let relative_position = j as i64 - i as i64;
                 let bucket = t5_relative_position_bucket(
                     relative_position,
-                    true, // bidirectional
-                    half_buckets,
+                    true, // bidirectional (encoder)
+                    num_buckets,
                     max_distance,
                 );
                 bias_data[i * seq_len + j] = bucket as i32;
@@ -245,9 +283,18 @@ impl T5Encoder {
         let k = k.reshape(&[b, n, h, d])?.permute(&[0, 2, 1, 3])?;
         let v = v.reshape(&[b, n, h, d])?.permute(&[0, 2, 1, 3])?;
 
-        // Attention with position bias added to scores
-        // flame_sdpa adds mask to scores; position_bias acts as the "mask" here
-        let attn_out = flame_sdpa(&q, &k, &v, Some(position_bias))?;
+        // ## BFL/HF T5 reference (transformers/models/t5/modeling_t5.py):
+        // ```python
+        // scores = torch.matmul(query_states, key_states.transpose(3, 2))  # raw, NO 1/sqrt(d) scaling
+        // scores += position_bias_masked                                   # additive float bias
+        // attn_weights = nn.functional.softmax(scores.float(), dim=-1).type_as(scores)
+        // attn_output = torch.matmul(attn_weights, value_states)
+        // ```
+        //
+        // T5 does NOT scale Q·K^T — the scaling is absorbed into q_proj weight init
+        // (Mesh TF style). Pass `Some(1.0)` so flame skips the default 1/sqrt(d_kv).
+        // position_bias is an ADDITIVE float (not a binary mask) — use sdpa_with_bias.
+        let attn_out = flame_sdpa_with_bias(&q, &k, &v, Some(position_bias), Some(1.0))?;
 
         let attn_out = attn_out.permute(&[0, 2, 1, 3])?.reshape(&[b, n, h * d])?;
         let attn_out = Self::linear(&attn_out, w("layer.0.SelfAttention.o.weight")?)?;
@@ -264,35 +311,40 @@ impl T5Encoder {
         hidden.add(&ffn_out)
     }
 
-    /// Encode text → [1, seq_len, 4096] hidden states.
+    /// Encode text → [1, 512, 4096] hidden states.
+    ///
+    /// Pads/truncates `token_ids` to `config.max_seq_len` (512 for FLUX 1) to match
+    /// BFL's `padding="max_length", max_length=512` tokenizer contract. T5 pad_token_id
+    /// is 0. No attention mask is applied — BFL passes `attention_mask=None`.
     pub fn encode(&mut self, token_ids: &[i32]) -> Result<Tensor> {
         let cfg = self.config.clone();
-        let seq_len = token_ids.len();
+        let max_len = cfg.max_seq_len; // 512
 
-        log::info!("[T5] Encoding: seq_len={}", seq_len);
+        // T5.H1 fix: pad to 512 (T5 pad_token_id=0) or truncate.
+        // Matches BFL conditioner.py: `padding="max_length", max_length=512, truncation=True`.
+        let mut padded: Vec<i32> = token_ids.to_vec();
+        if padded.len() > max_len {
+            padded.truncate(max_len);
+        } else {
+            padded.resize(max_len, 0);
+        }
+        let seq_len = max_len;
+
+        log::info!("[T5] Encoding: seq_len={} (padded from {})", seq_len, token_ids.len());
 
         // 1. Token embeddings (no position embeddings — T5 uses relative bias)
-        let embed_w = self.shared.get("encoder.embed_tokens.weight")
+        let embed_w = self.weights.get("encoder.embed_tokens.weight")
             .ok_or_else(|| flame_core::Error::InvalidInput("Missing embed_tokens".into()))?;
         let ids = Tensor::from_vec(
-            token_ids.iter().map(|&id| id as f32).collect(),
+            padded.iter().map(|&id| id as f32).collect(),
             Shape::from_dims(&[seq_len]),
             self.device.clone(),
         )?.to_dtype(DType::I32)?;
         let mut hidden = embed_w.index_select0(&ids)?.unsqueeze(0)?; // [1, seq, 4096]
 
-        // 2. Compute relative position bias from layer 0
-        // Prefetch block 0 to get the bias weight
-        self.swap.prefetch(0)
-            .map_err(|e| flame_core::Error::InvalidInput(format!("prefetch: {e}")))?;
-        let raw_block0 = self.swap.await_block(0)
-            .map_err(|e| flame_core::Error::InvalidInput(format!("await: {e}")))?;
-        let block0: HashMap<String, Tensor> = raw_block0.into_iter()
-            .map(|(k, v)| (k, v))
-            .collect();
-
+        // 2. Compute relative position bias from layer 0 weight (shared across layers)
         let bias_key = "encoder.block.0.layer.0.SelfAttention.relative_attention_bias.weight";
-        let bias_weight = block0.get(bias_key)
+        let bias_weight = self.weights.get(bias_key)
             .ok_or_else(|| flame_core::Error::InvalidInput(format!("Missing {bias_key}")))?;
 
         let position_bias = Self::compute_relative_bias(
@@ -303,32 +355,16 @@ impl T5Encoder {
             &self.device,
         )?;
 
-        // 3. Forward through layer 0 (already loaded)
-        hidden = self.layer_forward(&hidden, &block0, 0, &position_bias)?;
-        log::info!("[T5] Layer 1/{} done", cfg.num_layers);
-
-        // 4. Forward through remaining layers
-        for i in 1..cfg.num_layers {
-            self.swap.prefetch(i)
-                .map_err(|e| flame_core::Error::InvalidInput(format!("prefetch: {e}")))?;
-            let raw = self.swap.await_block(i)
-                .map_err(|e| flame_core::Error::InvalidInput(format!("await: {e}")))?;
-
-            // Prefetch next
-            if i + 1 < cfg.num_layers {
-                // Can't prefetch next until await_block is done — FlameSwap constraint
-            }
-
-            let weights: HashMap<String, Tensor> = raw.into_iter().collect();
-            hidden = self.layer_forward(&hidden, &weights, i, &position_bias)?;
-
+        // 3. Forward through all layers (resident weights)
+        for i in 0..cfg.num_layers {
+            hidden = self.layer_forward(&hidden, &self.weights, i, &position_bias)?;
             if (i + 1) % 6 == 0 || i == cfg.num_layers - 1 {
                 log::info!("[T5] Layer {}/{} done", i + 1, cfg.num_layers);
             }
         }
 
-        // 5. Final layer norm
-        let final_norm_w = self.shared.get("encoder.final_layer_norm.weight")
+        // 4. Final layer norm
+        let final_norm_w = self.weights.get("encoder.final_layer_norm.weight")
             .ok_or_else(|| flame_core::Error::InvalidInput("Missing final_layer_norm".into()))?;
         hidden = Self::t5_layer_norm(&hidden, final_norm_w, cfg.layer_norm_eps)?;
 
@@ -342,40 +378,71 @@ impl T5Encoder {
 }
 
 /// T5 relative position bucket computation.
-/// Matches `transformers.models.t5.modeling_t5._relative_position_bucket`.
+///
+/// ## HF reference (transformers/models/t5/modeling_t5.py::_relative_position_bucket):
+/// ```python
+/// relative_buckets = 0
+/// if bidirectional:
+///     num_buckets //= 2
+///     relative_buckets += (relative_position > 0).to(torch.long) * num_buckets
+///     relative_position = torch.abs(relative_position)
+/// else:
+///     relative_position = -torch.min(relative_position, torch.zeros_like(relative_position))
+/// # now relative_position is in the range [0, inf)
+///
+/// max_exact = num_buckets // 2
+/// is_small = relative_position < max_exact
+///
+/// relative_position_if_large = max_exact + (
+///     torch.log(relative_position.float() / max_exact)
+///     / math.log(max_distance / max_exact)
+///     * (num_buckets - max_exact)
+/// ).to(torch.long)
+/// relative_position_if_large = torch.min(
+///     relative_position_if_large, torch.full_like(relative_position_if_large, num_buckets - 1)
+/// )
+///
+/// relative_buckets += torch.where(is_small, relative_position, relative_position_if_large)
+/// return relative_buckets
+/// ```
 fn t5_relative_position_bucket(
     relative_position: i64,
     bidirectional: bool,
     num_buckets: usize,
     max_distance: usize,
 ) -> usize {
-    let mut ret = 0usize;
-    let mut n = -(relative_position);
+    let mut relative_buckets: usize = 0;
+    let mut nb = num_buckets;
 
-    if bidirectional {
-        let num_buckets = num_buckets;
+    let rp: usize = if bidirectional {
+        nb /= 2;
         if relative_position > 0 {
-            ret += num_buckets;
-            n = -n;
+            relative_buckets += nb;
         }
-    } else if n < 0 {
-        n = 0;
-    }
-
-    let n = n as usize;
-    let half_buckets = num_buckets / 2;
-    let is_small = n < half_buckets;
-
-    if is_small {
-        ret += n;
+        relative_position.unsigned_abs() as usize
     } else {
-        let val = ((n as f64 / half_buckets as f64).ln()
-            / (max_distance as f64 / half_buckets as f64).ln()
-            * (half_buckets - 1) as f64) as usize;
-        ret += half_buckets + val.min(half_buckets - 1);
-    }
+        // relative_position = -min(relative_position, 0) = max(0, -relative_position)
+        if relative_position < 0 {
+            (-relative_position) as usize
+        } else {
+            0
+        }
+    };
 
-    ret
+    let max_exact = nb / 2;
+    let is_small = rp < max_exact;
+
+    let bucket = if is_small {
+        rp
+    } else {
+        let val = max_exact as f64
+            + ((rp as f64 / max_exact as f64).ln()
+                / (max_distance as f64 / max_exact as f64).ln())
+                * ((nb - max_exact) as f64);
+        (val as usize).min(nb - 1)
+    };
+
+    relative_buckets + bucket
 }
 
 #[cfg(test)]
@@ -393,11 +460,22 @@ mod tests {
 
     #[test]
     fn test_relative_position_bucket() {
-        // Same position → bucket 0
-        assert_eq!(t5_relative_position_bucket(0, true, 16, 128), 0);
-        // Small positive
-        assert_eq!(t5_relative_position_bucket(1, true, 16, 128), 16 + 1);
-        // Small negative
-        assert_eq!(t5_relative_position_bucket(-1, true, 16, 128), 1);
+        // Verified against HF transformers._relative_position_bucket
+        // with num_buckets=32, max_distance=128, bidirectional=True.
+        // For bidirectional: nb becomes 16 internally, max_exact=8.
+        // rp=0: small, bucket = 0 (+0 for non-positive) = 0
+        assert_eq!(t5_relative_position_bucket(0, true, 32, 128), 0);
+        // rp=1 (j>i, positive): +16 (positive offset), rp=1, small → 16+1 = 17
+        assert_eq!(t5_relative_position_bucket(1, true, 32, 128), 17);
+        // rp=-1 (j<i): +0, rp=1, small → 1
+        assert_eq!(t5_relative_position_bucket(-1, true, 32, 128), 1);
+        // rp=7 (j<i, negative): small (7<8) → 7
+        assert_eq!(t5_relative_position_bucket(-7, true, 32, 128), 7);
+        // rp=8 (j<i, negative): not small → log path
+        let b8 = t5_relative_position_bucket(-8, true, 32, 128);
+        assert!(b8 >= 8 && b8 < 16, "bucket for -8 = {}", b8);
+        // Far distance clamps to nb-1 = 15
+        assert_eq!(t5_relative_position_bucket(-1000, true, 32, 128), 15);
+        assert_eq!(t5_relative_position_bucket(1000, true, 32, 128), 16 + 15);
     }
 }

@@ -657,7 +657,8 @@ pub struct LTX2TransformerBlock {
     pub audio_a2v_cross_attn_scale_shift_table: Tensor, // [5, audio_dim]
 
     // Cross-attention adaln modulation (ComfyUI LTX-2.3)
-    pub prompt_scale_shift_table: Option<Tensor>,     // [2, dim] for context KV modulation
+    pub prompt_scale_shift_table: Option<Tensor>,     // [2, dim] for video CA context KV modulation
+    pub audio_prompt_scale_shift_table: Option<Tensor>, // [2, audio_dim] for audio CA context KV modulation
 
     pub eps: f32,
 }
@@ -763,6 +764,14 @@ impl LTX2TransformerBlock {
     }
 
     /// Forward pass for one block. Returns (video_hidden, audio_hidden).
+    ///
+    /// `video_prompt_timestep` / `audio_prompt_timestep`: optional `[B, seq, 2*dim]`
+    /// tensors produced by `prompt_adaln_single` / `audio_prompt_adaln_single`.
+    /// When present (and the matching `*_prompt_scale_shift_table` is loaded),
+    /// the cross-attention KV (text encoder hidden states) is modulated as
+    /// `context * (1 + scale_kv) + shift_kv` BEFORE the attention call. This
+    /// matches the Lightricks reference (transformer.py:380-398) and fixes the
+    /// "dark output / std=0.33" bug documented in LTX2_AV_BUGS.md.
     #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
@@ -782,6 +791,8 @@ impl LTX2TransformerBlock {
         ca_audio_rotary_emb: Option<(&Tensor, &Tensor)>,
         encoder_attention_mask: Option<&Tensor>,
         audio_encoder_attention_mask: Option<&Tensor>,
+        video_prompt_timestep: Option<&Tensor>, // [B, text_seq, 2*video_dim]
+        audio_prompt_timestep: Option<&Tensor>, // [B, audio_text_seq, 2*audio_dim]
     ) -> Result<(Tensor, Tensor)> {
         let b = hidden_states.shape().dims()[0];
         let video_dim = hidden_states.shape().dims()[2];
@@ -813,15 +824,53 @@ impl LTX2TransformerBlock {
             self.compute_ada_params_ca(&self.scale_shift_table, temb, b, video_dim)?;
         let norm_h2 = rms_norm(&hidden_states, self.norm2_weight.as_ref(), self.eps)?;
         let mod_h2 = norm_h2.mul(&v_scale_ca.add_scalar(1.0)?)?.add(&v_shift_ca)?;
-        let ca_out = self.attn2.forward(&mod_h2, Some(encoder_hidden_states), encoder_attention_mask, None, None)?;
+
+        // KV (text) context modulation — see LTX2_AV_BUGS.md Bug 2.
+        // Mirrors `apply_cross_attention_adaln` in the Lightricks reference.
+        let modulated_v_context = if let (Some(psst), Some(pt)) =
+            (&self.prompt_scale_shift_table, video_prompt_timestep)
+        {
+            // psst: [2, video_dim] → [1, 1, 2, video_dim]
+            let psst_bc = psst.unsqueeze(0)?.unsqueeze(0)?;
+            // pt:   [B, seq, 2*video_dim] → [B, seq, 2, video_dim]
+            let seq_len = pt.shape().dims()[1];
+            let pt_4d = pt.reshape(&[b, seq_len, 2, video_dim])?;
+            let combined = psst_bc.add(&pt_4d)?.to_dtype(DType::BF16)?;
+            let shift_kv = combined.narrow(2, 0, 1)?.squeeze_dim(2)?;
+            let scale_kv = combined.narrow(2, 1, 1)?.squeeze_dim(2)?;
+            // context * (1 + scale_kv) + shift_kv
+            fused_modulate(encoder_hidden_states, &scale_kv, &shift_kv)?
+        } else {
+            encoder_hidden_states.clone()
+        };
+
+        let ca_out = self.attn2.forward(&mod_h2, Some(&modulated_v_context), encoder_attention_mask, None, None)?;
         hidden_states = hidden_states.add(&ca_out.mul(&v_gate_ca)?)?;
+        drop(modulated_v_context);
 
         let (a_shift_ca, a_scale_ca, a_gate_ca) =
             self.compute_ada_params_ca(&self.audio_scale_shift_table, temb_audio, b, audio_dim)?;
         let norm_a2 = rms_norm(&audio_hidden_states, self.audio_norm2_weight.as_ref(), self.eps)?;
         let mod_a2 = norm_a2.mul(&a_scale_ca.add_scalar(1.0)?)?.add(&a_shift_ca)?;
-        let ca_a_out = self.audio_attn2.forward(&mod_a2, Some(audio_encoder_hidden_states), audio_encoder_attention_mask, None, None)?;
+
+        // Same KV modulation for the audio cross-attention.
+        let modulated_a_context = if let (Some(apsst), Some(apt)) =
+            (&self.audio_prompt_scale_shift_table, audio_prompt_timestep)
+        {
+            let apsst_bc = apsst.unsqueeze(0)?.unsqueeze(0)?;
+            let seq_len = apt.shape().dims()[1];
+            let apt_4d = apt.reshape(&[b, seq_len, 2, audio_dim])?;
+            let combined = apsst_bc.add(&apt_4d)?.to_dtype(DType::BF16)?;
+            let shift_kv = combined.narrow(2, 0, 1)?.squeeze_dim(2)?;
+            let scale_kv = combined.narrow(2, 1, 1)?.squeeze_dim(2)?;
+            fused_modulate(audio_encoder_hidden_states, &scale_kv, &shift_kv)?
+        } else {
+            audio_encoder_hidden_states.clone()
+        };
+
+        let ca_a_out = self.audio_attn2.forward(&mod_a2, Some(&modulated_a_context), audio_encoder_attention_mask, None, None)?;
         audio_hidden_states = audio_hidden_states.add(&ca_a_out.mul(&a_gate_ca)?)?;
+        drop(modulated_a_context);
 
 
         // ---- 3. Audio-to-Video / Video-to-Audio Cross-Attention ----
@@ -1170,6 +1219,11 @@ impl LTX2Model {
         let audio_enc_hs = audio_enc_hs.reshape(&[batch_size, audio_enc_hs.shape().dims()[1], audio_inner_dim])?;
 
         // 6. Run transformer blocks
+        // Legacy LTX2Model forward — does NOT carry the prompt_adaln_single
+        // path (that's only in LTX2StreamingModel::forward_audio_video).
+        // Pass None for the new prompt_timestep params so this path is
+        // unchanged in behavior; it'll fall back to the unmodulated KV path
+        // inside the block.
         for block in &self.blocks {
             let (new_hs, new_ahs) = block.forward(
                 &hs, &ahs,
@@ -1183,6 +1237,7 @@ impl LTX2Model {
                 Some((&ca_a_cos, &ca_a_sin)),
                 enc_mask.as_ref(),
                 audio_enc_mask.as_ref(),
+                None, None,
             )?;
             hs = new_hs;
             ahs = new_ahs;
@@ -1383,6 +1438,7 @@ fn load_transformer_block(
         audio_a2v_cross_attn_scale_shift_table: get(&format!("{prefix}.audio_a2v_cross_attn_scale_shift_table"))?,
 
         prompt_scale_shift_table: get_opt(&format!("{prefix}.prompt_scale_shift_table")),
+        audio_prompt_scale_shift_table: get_opt(&format!("{prefix}.audio_prompt_scale_shift_table")),
 
         eps,
     })
@@ -1961,7 +2017,8 @@ pub struct LTX2StreamingModel {
     pub proj_in_bias: Tensor,
     pub caption_projection: Option<CaptionProjection>,
     pub connector: Option<VideoEmbeddingsConnector>,  // ComfyUI: replaces caption_projection
-    pub prompt_adaln_single: Option<AdaLayerNormSingle>,  // ComfyUI: 2-param for cross-attn context
+    pub prompt_adaln_single: Option<AdaLayerNormSingle>,  // ComfyUI: 2-param for cross-attn context (video)
+    pub audio_prompt_adaln_single: Option<AdaLayerNormSingle>,  // ComfyUI: 2-param for cross-attn context (audio)
     // Text embedding projection: packed Gemma (188160-dim) → connector dim (4096)
     pub aggregate_embed_weight: Option<Tensor>,  // [4096, 188160]
     pub aggregate_embed_bias: Option<Tensor>,    // [4096]
@@ -2083,10 +2140,17 @@ impl LTX2StreamingModel {
             log::info!("[LTX2] Using CaptionProjection (diffusers format)");
         }
 
-        // prompt_adaln_single (ComfyUI LTX-2.3): 2-param conditioning for cross-attn context
+        // prompt_adaln_single (ComfyUI LTX-2.3): 2-param conditioning for cross-attn context (video)
         let prompt_adaln = load_ada_layer_norm_single(&globals, "prompt_adaln_single", 2).ok();
         if prompt_adaln.is_some() {
-            log::info!("[LTX2] Found prompt_adaln_single (cross-attn context modulation)");
+            log::info!("[LTX2] Found prompt_adaln_single (video cross-attn context modulation)");
+        }
+        // audio_prompt_adaln_single: same idea but for the audio cross-attention KV.
+        // Without this, audio CA context is timestep-independent and Bug 1+3 from
+        // LTX2_AV_BUGS.md fire (dark output, std=0.33).
+        let audio_prompt_adaln = load_ada_layer_norm_single(&globals, "audio_prompt_adaln_single", 2).ok();
+        if audio_prompt_adaln.is_some() {
+            log::info!("[LTX2] Found audio_prompt_adaln_single (audio cross-attn context modulation)");
         }
 
         // video_aggregate_embed: projects packed Gemma embeddings (188160-dim) → 4096
@@ -2151,6 +2215,7 @@ impl LTX2StreamingModel {
             caption_projection: caption_proj,
             connector,
             prompt_adaln_single: prompt_adaln,
+            audio_prompt_adaln_single: audio_prompt_adaln,
             aggregate_embed_weight: agg_w_t,
             aggregate_embed_bias: agg_b,
             time_embed: time_emb,
@@ -2583,6 +2648,7 @@ impl LTX2StreamingModel {
                 .cloned()
                 .unwrap_or(dummy_2d(5, ad)?),
             prompt_scale_shift_table: get_opt(&format!("{pfx}.prompt_scale_shift_table")),
+            audio_prompt_scale_shift_table: get_opt(&format!("{pfx}.audio_prompt_scale_shift_table")),
             eps,
         })
     }
@@ -2790,6 +2856,7 @@ impl LTX2StreamingModel {
                 .cloned()
                 .unwrap_or(dummy_2d(5, ad)?),
             prompt_scale_shift_table: get_opt(&format!("{pfx}.prompt_scale_shift_table")),
+            audio_prompt_scale_shift_table: get_opt(&format!("{pfx}.audio_prompt_scale_shift_table")),
             eps,
         })
     }
@@ -3203,6 +3270,37 @@ impl LTX2StreamingModel {
                 audio_context.shape().dims()[2], audio_inner_dim)));
         };
 
+        // 7b. Compute prompt_timestep tensors for cross-attention KV modulation
+        // (LTX2_AV_BUGS.md Bug 1 + 3). These are produced by the prompt_adaln_single
+        // / audio_prompt_adaln_single AdaLayerNormSingle layers and threaded into
+        // each block forward, where they're combined with the per-block
+        // prompt_scale_shift_table to modulate the text encoder hidden states
+        // before cross-attention.
+        let video_prompt_ts: Option<Tensor> = if let Some(ref padaln) = self.prompt_adaln_single {
+            let text_seq_len = enc_hs.shape().dims()[1];
+            let prompt_ts = timestep.unsqueeze(1)?.expand(&[batch_size, text_seq_len])?;
+            let prompt_ts_scaled = prompt_ts.mul_scalar(self.config.timestep_scale_multiplier as f32)?;
+            let prompt_ts_flat = prompt_ts_scaled.reshape(&[batch_size * text_seq_len])?;
+            let (prompt_mod, _) = padaln.forward(&prompt_ts_flat)?;
+            // prompt_mod is [B*seq, 2*inner_dim] — reshape to [B, seq, 2*inner_dim]
+            Some(prompt_mod.reshape(&[batch_size, text_seq_len, 2 * inner_dim])?)
+        } else {
+            None
+        };
+        let audio_prompt_ts: Option<Tensor> = if let Some(ref apadaln) = self.audio_prompt_adaln_single {
+            let text_seq_len = audio_enc_hs.shape().dims()[1];
+            let prompt_ts = timestep.unsqueeze(1)?.expand(&[batch_size, text_seq_len])?;
+            let prompt_ts_scaled = prompt_ts.mul_scalar(self.config.timestep_scale_multiplier as f32)?;
+            let prompt_ts_flat = prompt_ts_scaled.reshape(&[batch_size * text_seq_len])?;
+            let (prompt_mod, _) = apadaln.forward(&prompt_ts_flat)?;
+            Some(prompt_mod.reshape(&[batch_size, text_seq_len, 2 * audio_inner_dim])?)
+        } else {
+            None
+        };
+        if video_prompt_ts.is_some() && audio_prompt_ts.is_none() {
+            log::warn!("[LTX2 AV] video prompt_timestep loaded but audio_prompt_adaln_single missing — audio CA will be unmodulated");
+        }
+
         // 8. Stream blocks (FP8 resident or FlameSwap)
         let num_layers = self.config.num_layers;
         let config_clone = self.config.clone();
@@ -3264,6 +3362,8 @@ impl LTX2StreamingModel {
                     Some((&ca_v_cos, &ca_v_sin)),
                     Some((&ca_a_cos, &ca_a_sin)),
                     None, None,
+                    video_prompt_ts.as_ref(),
+                    audio_prompt_ts.as_ref(),
                 )?;
                 hs = new_hs;
                 ahs = new_ahs;
@@ -3313,6 +3413,8 @@ impl LTX2StreamingModel {
                     Some((&ca_v_cos, &ca_v_sin)),
                     Some((&ca_a_cos, &ca_a_sin)),
                     None, None,
+                    video_prompt_ts.as_ref(),
+                    audio_prompt_ts.as_ref(),
                 )?;
                 hs = new_hs;
                 ahs = new_ahs;
@@ -3521,6 +3623,7 @@ pub fn load_ltx2_model_video_only(
             audio_a2v_cross_attn_scale_shift_table: dummy_2d(5, ad)?,
 
             prompt_scale_shift_table: get_opt(&format!("{prefix}.prompt_scale_shift_table")),
+            audio_prompt_scale_shift_table: get_opt(&format!("{prefix}.audio_prompt_scale_shift_table")),
 
             eps,
         });

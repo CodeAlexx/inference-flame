@@ -145,6 +145,13 @@ fn main() -> Result<()> {
     let t_total = Instant::now();
     println!("=== ZImage NextDiT Inference (Pure Rust) ===\n");
 
+    // A/B test: disable autograd recording to measure its overhead on
+    // inference. When FLAME_AUTOGRAD_OFF=1, skip the tape entirely.
+    if std::env::var("FLAME_AUTOGRAD_OFF").ok().as_deref() == Some("1") {
+        println!("[+] AUTOGRAD DISABLED via FLAME_AUTOGRAD_OFF=1");
+        flame_core::AutogradContext::set_enabled(false);
+    }
+
     let args = parse_args();
 
     // Create CUDA device

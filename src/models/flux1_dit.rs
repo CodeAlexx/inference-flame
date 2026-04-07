@@ -113,7 +113,8 @@ impl Flux1DiT {
         checkpoint_path: &str,
         device: &Arc<CudaDevice>,
     ) -> Result<Self> {
-        let config = Flux1Config::dev(); // auto-detect later from keys
+        // H3 fix: default config will be patched after we see shared weight keys.
+        let mut config = Flux1Config::dev();
 
         // FlameSwap: classify blocks.
         // double_blocks.N → block N
@@ -145,6 +146,15 @@ impl Flux1DiT {
             |key| shared_prefixes.iter().any(|p| key.starts_with(p)),
         )?;
 
+        // H3: auto-detect Dev vs Schnell by presence of guidance_in.* weights.
+        //
+        // BFL reference — src/flux/model.py:58-60
+        //   self.guidance_in = (
+        //       MLPEmbedder(in_dim=256, hidden_dim=self.hidden_size) if params.guidance_embed else nn.Identity()
+        //   )
+        config.has_guidance = shared_weights.contains_key("guidance_in.in_layer.weight");
+        log::info!("[Flux1] has_guidance (autodetected) = {}", config.has_guidance);
+
         log::info!("[Flux1] Loaded: {} blocks via FlameSwap, {} shared weights",
             swap.num_blocks(), shared_weights.len());
 
@@ -165,25 +175,17 @@ impl Flux1DiT {
     // Helpers
     // -----------------------------------------------------------------------
 
+    /// 3D linear with fused bias epilogue via cuBLASLt.
+    /// Weight is in standard PyTorch `[Cout, Cin]` row-major layout (no
+    /// pre-transpose). The transpose happens inside the GEMM via TRANSA=T,
+    /// eliminating the per-call `transpose2d_bf16` pass and the separate
+    /// bias-add kernel that the previous version was paying.
     fn linear_bias(x: &Tensor, weight: &Tensor, bias: &Tensor) -> Result<Tensor> {
-        let wt = flame_core::bf16_elementwise::transpose2d_bf16(weight)?;
-        let shape = x.shape().dims().to_vec();
-        let (b, n, c) = (shape[0], shape[1], shape[2]);
-        let x_2d = x.reshape(&[b * n, c])?;
-        let out = x_2d.matmul(&wt)?;
-        let out_dim = out.shape().dims()[1];
-        let out = out.add(&bias.unsqueeze(0)?.expand(&[b * n, out_dim])?)?;
-        out.reshape(&[b, n, out_dim])
+        flame_core::ops::fused_inference::fused_linear3d_native(x, weight, Some(bias))
     }
 
     fn linear_nobias(x: &Tensor, weight: &Tensor) -> Result<Tensor> {
-        let wt = flame_core::bf16_elementwise::transpose2d_bf16(weight)?;
-        let shape = x.shape().dims().to_vec();
-        let (b, n, c) = (shape[0], shape[1], shape[2]);
-        let x_2d = x.reshape(&[b * n, c])?;
-        let out = x_2d.matmul(&wt)?;
-        let out_dim = out.shape().dims()[1];
-        out.reshape(&[b, n, out_dim])
+        flame_core::ops::fused_inference::fused_linear3d_native(x, weight, None)
     }
 
     /// RMSNorm: standard (not Gemma formulation).
@@ -222,34 +224,74 @@ impl Flux1DiT {
 
     /// Sinusoidal timestep embedding.
     ///
-    /// ## PyTorch reference:
+    /// ## BFL reference — src/flux/modules/layers.py:28-49
     /// ```python
-    /// t = time_factor * t  # time_factor=1000
-    /// freqs = exp(-ln(10000) * arange(half) / half)
-    /// args = t[:, None] * freqs[None]
-    /// return cat([cos(args), sin(args)], dim=-1)
+    /// def timestep_embedding(t: Tensor, dim, max_period=10000, time_factor: float = 1000.0):
+    ///     t = time_factor * t
+    ///     half = dim // 2
+    ///     freqs = torch.exp(-math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half).to(
+    ///         t.device
+    ///     )
+    ///
+    ///     args = t[:, None].float() * freqs[None]
+    ///     embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+    ///     if dim % 2:
+    ///         embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+    ///     if torch.is_floating_point(t):
+    ///         embedding = embedding.to(t)
+    ///     return embedding
     /// ```
+    ///
+    /// H1 fix: keep freqs and args in FP32, cast to input dtype once at the end.
     fn timestep_embedding(t: &Tensor, dim: usize, device: &Arc<CudaDevice>) -> Result<Tensor> {
-        let t_scaled = t.mul_scalar(1000.0)?; // time_factor
+        let in_dtype = t.dtype();
+        // t = time_factor * t   (done in F32)
+        let t_f32 = t.to_dtype(DType::F32)?;
+        let t_scaled = t_f32.mul_scalar(1000.0)?;
         let half = dim / 2;
         let max_period = 10000.0f64;
+        // freqs = exp(-ln(max_period) * arange(half) / half)   (F32)
         let freq_data: Vec<f32> = (0..half)
             .map(|i| (-max_period.ln() * i as f64 / half as f64).exp() as f32)
             .collect();
-        let freqs = Tensor::from_vec(freq_data, Shape::from_dims(&[1, half]), device.clone())?
-            .to_dtype(DType::BF16)?;
-
+        let freqs = Tensor::from_vec(freq_data, Shape::from_dims(&[1, half]), device.clone())?;
+        // args = t[:, None].float() * freqs[None]              (F32)
         let t_col = t_scaled.unsqueeze(1)?; // [B, 1]
-        let args = t_col.matmul(&freqs)?; // [B, half]
+        let args = t_col.matmul(&freqs)?; // [B, half] F32
+        // embedding = cat([cos(args), sin(args)], dim=-1)
         let cos = args.cos()?;
         let sin = args.sin()?;
-        Tensor::cat(&[&cos, &sin], 1) // [B, dim]
+        let emb = Tensor::cat(&[&cos, &sin], 1)?; // [B, dim] F32
+        // cast back to input dtype
+        emb.to_dtype(in_dtype)
     }
 
-    /// MLP: silu(in_layer(x)) → out_layer
+    /// MLPEmbedder: out_layer(silu(in_layer(x)))
+    ///
+    /// ## BFL reference — src/flux/modules/layers.py:52-60
+    /// ```python
+    /// class MLPEmbedder(nn.Module):
+    ///     def __init__(self, in_dim: int, hidden_dim: int):
+    ///         super().__init__()
+    ///         self.in_layer = nn.Linear(in_dim, hidden_dim, bias=True)
+    ///         self.silu = nn.SiLU()
+    ///         self.out_layer = nn.Linear(hidden_dim, hidden_dim, bias=True)
+    ///
+    ///     def forward(self, x: Tensor) -> Tensor:
+    ///         return self.out_layer(self.silu(self.in_layer(x)))
+    /// ```
+    ///
+    /// H4: require a 2-D [B, D] input — all callers (time, guidance, vector)
+    /// pass 2-D tensors in BFL.
     fn timestep_mlp(x: &Tensor, in_w: &Tensor, in_b: &Tensor, out_w: &Tensor, out_b: &Tensor) -> Result<Tensor> {
         let shape = x.shape().dims().to_vec();
-        let x_2d = if shape.len() == 2 { x.clone() } else { x.reshape(&[shape[0], shape[1]])? };
+        assert_eq!(
+            shape.len(),
+            2,
+            "MLPEmbedder expects a 2-D [B, D] input, got shape {:?}",
+            shape
+        );
+        let x_2d = x.clone();
 
         let in_wt = flame_core::bf16_elementwise::transpose2d_bf16(in_w)?;
         let h = x_2d.matmul(&in_wt)?;
@@ -262,114 +304,92 @@ impl Flux1DiT {
     }
 
     // -----------------------------------------------------------------------
-    // RoPE (complex multiply, 3-axis)
+    // RoPE — verbatim port of BFL src/flux/math.py and EmbedND from layers.py
     // -----------------------------------------------------------------------
 
-    /// Build 3-axis RoPE for FLUX 1.
+    /// Build RoPE cos/sin tables (FLUX 1 / Klein interleaved format).
     ///
-    /// img_ids: [N_img, 3] — (t, h, w) positions for image patches
-    /// txt_ids: [N_txt, 3] — all zeros for text
-    /// Returns: [1, 1, N_txt+N_img, head_dim/2] complex freqs
+    /// FLUX 1 BFL `rope()` builds a per-pair 2x2 rotation matrix that is
+    /// algebraically `[[cos, -sin], [sin, cos]]`. `flame_core::bf16_ops::rope_fused_bf16`
+    /// expects exactly this rotation expressed as separate `cos` / `sin` tables
+    /// (interleaved-pair convention, comment in the kernel says
+    /// "Used by Klein/Flux, LTX, HunyuanVideo"), so we precompute the same omega·pos
+    /// table BFL does and emit `(cos, sin)` directly. This drops the per-block
+    /// 5s F32-narrow path.
+    ///
+    /// img_ids: [N_img, 3]   txt_ids: [N_txt, 3]
+    /// Returns `(pe_cos, pe_sin)` each `[1, 1, N, sum(axes)/2]` BF16.
     pub fn build_rope_2d(
         img_ids: &Tensor,
         txt_ids: &Tensor,
         config: &Flux1Config,
         device: &Arc<CudaDevice>,
-    ) -> Result<Tensor> {
-        // Concatenate: [txt_ids; img_ids] along dim 0
+    ) -> Result<(Tensor, Tensor)> {
         let all_ids = Tensor::cat(&[txt_ids, img_ids], 0)?; // [N, 3]
         let all_ids_f32 = all_ids.to_dtype(DType::F32)?;
+        let n_total = all_ids_f32.shape().dims()[0];
 
-        let n_total = all_ids.shape().dims()[0];
-        let mut all_cos = Vec::new();
-        let mut all_sin = Vec::new();
+        let mut cos_parts: Vec<Tensor> = Vec::with_capacity(config.axes_dims_rope.len());
+        let mut sin_parts: Vec<Tensor> = Vec::with_capacity(config.axes_dims_rope.len());
 
-        for (axis, &dim) in config.axes_dims_rope.iter().enumerate() {
-            let half = dim / 2;
-            // Extract positions for this axis: all_ids[:, axis]
-            let pos = all_ids_f32.narrow(1, axis, 1)?.squeeze(Some(1))?; // [N]
+        for (axis, &axis_dim) in config.axes_dims_rope.iter().enumerate() {
+            assert!(axis_dim % 2 == 0, "rope dim must be even");
+            let half = axis_dim / 2;
 
-            // Frequencies
-            let freq_data: Vec<f32> = (0..half)
-                .map(|i| 1.0 / (config.rope_theta as f32).powf(2.0 * i as f32 / dim as f32))
+            // omega = 1 / (theta ** (arange(0, dim, 2) / dim))
+            let omega_data: Vec<f32> = (0..half)
+                .map(|i| {
+                    let scale = (2 * i) as f64 / axis_dim as f64;
+                    (1.0 / config.rope_theta.powf(scale)) as f32
+                })
                 .collect();
-            let freqs = Tensor::from_vec(freq_data, Shape::from_dims(&[1, half]), device.clone())?;
+            let omega = Tensor::from_vec(
+                omega_data,
+                Shape::from_dims(&[1, half]),
+                device.clone(),
+            )?; // [1, half] F32
 
-            // Outer product: [N, 1] * [1, half] = [N, half]
+            // pos = ids[:, axis]   shape [N]
+            let pos = all_ids_f32.narrow(1, axis, 1)?.squeeze(Some(1))?;
+            // outer product: [N, 1] @ [1, half] = [N, half]
             let pos_col = pos.unsqueeze(1)?;
-            let angles = pos_col.matmul(&freqs)?; // [N, half]
+            let angles = pos_col.matmul(&omega)?;
 
-            all_cos.push(angles.cos()?);
-            all_sin.push(angles.sin()?);
+            cos_parts.push(angles.cos()?);
+            sin_parts.push(angles.sin()?);
         }
 
-        // Concatenate across axes: [N, sum(half_dims)]
-        let cos_refs: Vec<&Tensor> = all_cos.iter().collect();
-        let sin_refs: Vec<&Tensor> = all_sin.iter().collect();
-        let cos_cat = Tensor::cat(&cos_refs, 1)?; // [N, 64] (16/2 + 56/2 + 56/2)
-        let sin_cat = Tensor::cat(&sin_refs, 1)?;
+        // BFL concatenates the per-axis rotation matrices on the half axis.
+        // For (cos, sin) tables that's the same: cat on the last (half) axis.
+        let cos_refs: Vec<&Tensor> = cos_parts.iter().collect();
+        let sin_refs: Vec<&Tensor> = sin_parts.iter().collect();
+        let cos_full = Tensor::cat(&cos_refs, 1)?; // [N, sum(half)]
+        let sin_full = Tensor::cat(&sin_refs, 1)?;
 
-        // Stack as [N, 64, 2] for complex representation, then reshape
-        // But flame_core doesn't have complex ops. We'll return cos and sin separately.
-        // Actually, the Python code uses torch.polar(ones, angles) → complex multiply.
-        // For our SDPA path, we apply RoPE differently — we'll store cos/sin
-        // as [1, 1, N, half] and use a rotation approach.
-        let cos_out = cos_cat.unsqueeze(0)?.unsqueeze(0)?.to_dtype(DType::BF16)?;
-        let sin_out = sin_cat.unsqueeze(0)?.unsqueeze(0)?.to_dtype(DType::BF16)?;
-
-        // Return concatenated [cos; sin] as [1, 1, N, 2*half] or two separate tensors.
-        // We'll pack them into one tensor: [1, 1, N, half, 2] for the complex representation.
-        // For now, return cos for the caller to handle both.
-        // Actually, let's just stack them: [2, 1, 1, N, 64]
-        Tensor::stack(&[cos_out, sin_out], 0) // [2, 1, 1, N, 64]
+        // [1, 1, N, sum(half)] BF16 — shape consumed by rope_fused_bf16.
+        let pe_cos = cos_full
+            .unsqueeze(0)?
+            .unsqueeze(0)?
+            .to_dtype(DType::BF16)?;
+        let pe_sin = sin_full
+            .unsqueeze(0)?
+            .unsqueeze(0)?
+            .to_dtype(DType::BF16)?;
+        Ok((pe_cos, pe_sin))
     }
 
-    /// Apply complex RoPE to q and k.
+    /// Apply RoPE to q and k via the fused kernel.
     ///
-    /// pe: [2, 1, 1, N, half] where pe[0]=cos, pe[1]=sin.
-    /// q, k: [B, H, N, D] where D=128.
-    ///
-    /// Complex multiply: (q_re + i*q_im) * (cos + i*sin)
-    ///   = (q_re*cos - q_im*sin) + i*(q_re*sin + q_im*cos)
-    fn apply_rope_complex(q: &Tensor, k: &Tensor, pe: &Tensor) -> Result<(Tensor, Tensor)> {
-        let pe_cos = pe.narrow(0, 0, 1)?.squeeze(Some(0))?; // [1, 1, N, 64]
-        let pe_sin = pe.narrow(0, 1, 1)?.squeeze(Some(0))?; // [1, 1, N, 64]
-
-        let q_rot = Self::rotate_complex(q, &pe_cos, &pe_sin)?;
-        let k_rot = Self::rotate_complex(k, &pe_cos, &pe_sin)?;
-        Ok((q_rot, k_rot))
-    }
-
-    /// Rotate a tensor using complex multiplication.
-    /// x: [B, H, N, D] where D is split into (D/2, 2) as (real, imag).
-    fn rotate_complex(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
-        let dims = x.shape().dims().to_vec();
-        let d = dims[3]; // 128
-        let half = d / 2; // 64
-
-        // Split x into even and odd elements (real and imaginary parts)
-        // x_re = x[..., 0::2], x_im = x[..., 1::2]
-        let x_re = x.narrow(3, 0, half)?; // Take first half
-        let x_im = x.narrow(3, half, half)?; // Take second half
-
-        // Wait — FLUX uses view_as_complex which interleaves: [re0, im0, re1, im1, ...]
-        // So we need stride-2 access. Let's reshape instead:
-        // x: [B, H, N, D] → [B, H, N, D/2, 2]
-        let (b, h, n, _d) = (dims[0], dims[1], dims[2], dims[3]);
-        let x_pairs = x.reshape(&[b, h, n, half, 2])?;
-        let x_re = x_pairs.narrow(4, 0, 1)?.squeeze(Some(4))?; // [B, H, N, half]
-        let x_im = x_pairs.narrow(4, 1, 1)?.squeeze(Some(4))?; // [B, H, N, half]
-
-        // Complex multiply: out_re = x_re*cos - x_im*sin
-        //                   out_im = x_re*sin + x_im*cos
-        let out_re = x_re.mul(cos)?.sub(&x_im.mul(sin)?)?;
-        let out_im = x_re.mul(sin)?.add(&x_im.mul(cos)?)?;
-
-        // Interleave back: [B, H, N, half, 2]
-        let out_re_exp = out_re.unsqueeze(4)?;
-        let out_im_exp = out_im.unsqueeze(4)?;
-        let interleaved = Tensor::cat(&[&out_re_exp, &out_im_exp], 4)?; // [B, H, N, half, 2]
-        interleaved.reshape(&[b, h, n, d])
+    /// `pe_cos`, `pe_sin`: `[1, 1, N, D/2]` BF16. `q`, `k`: `[B, H, N, D]` BF16.
+    fn apply_rope_complex(
+        q: &Tensor,
+        k: &Tensor,
+        pe_cos: &Tensor,
+        pe_sin: &Tensor,
+    ) -> Result<(Tensor, Tensor)> {
+        let q_out = flame_core::bf16_ops::rope_fused_bf16(q, pe_cos, pe_sin)?;
+        let k_out = flame_core::bf16_ops::rope_fused_bf16(k, pe_cos, pe_sin)?;
+        Ok((q_out, k_out))
     }
 
     // -----------------------------------------------------------------------
@@ -399,6 +419,16 @@ impl Flux1DiT {
         let cfg = self.config.clone();
         let dim = cfg.inner_dim;
 
+        // H3: enforce BFL model.py:100-103
+        //   if self.params.guidance_embed:
+        //       if guidance is None:
+        //           raise ValueError("Didn't get guidance strength for guidance distilled model.")
+        if cfg.has_guidance && guidance.is_none() {
+            return Err(flame_core::Error::InvalidInput(
+                "Didn't get guidance strength for guidance distilled model.".into(),
+            ));
+        }
+
         let img_len = img.shape().dims()[1];
         let txt_len = txt.shape().dims()[1];
 
@@ -408,11 +438,15 @@ impl Flux1DiT {
             self.shared.get("img_in.weight").ok_or_else(|| flame_core::Error::InvalidInput("Missing img_in.weight".into()))?,
             self.shared.get("img_in.bias").ok_or_else(|| flame_core::Error::InvalidInput("Missing img_in.bias".into()))?,
         )?;
-        let txt = Self::linear_bias(
-            txt,
-            self.shared.get("txt_in.weight").ok_or_else(|| flame_core::Error::InvalidInput("Missing txt_in.weight".into()))?,
-            self.shared.get("txt_in.bias").ok_or_else(|| flame_core::Error::InvalidInput("Missing txt_in.bias".into()))?,
-        )?;
+        // H2: txt_in uses nn.Linear default bias=True, but allow LoRA-wrapped
+        // checkpoints that may not ship a bias by falling back to linear_nobias.
+        let txt_in_w = self.shared.get("txt_in.weight")
+            .ok_or_else(|| flame_core::Error::InvalidInput("Missing txt_in.weight".into()))?;
+        let txt = if let Some(txt_in_b) = self.shared.get("txt_in.bias") {
+            Self::linear_bias(txt, txt_in_w, txt_in_b)?
+        } else {
+            Self::linear_nobias(txt, txt_in_w)?
+        };
 
         // --- Timestep + guidance + vector embeddings ---
         let t_emb = Self::timestep_embedding(timesteps, cfg.timestep_dim, &self.device)?;
@@ -448,32 +482,59 @@ impl Flux1DiT {
             vec = vec.add(&v_vec)?;
         }
 
-        // --- Build RoPE ---
-        let pe = Self::build_rope_2d(img_ids, txt_ids, &cfg, &self.device)?;
+        // --- Build RoPE (fused-kernel cos/sin tables) ---
+        let (pe_cos, pe_sin) = Self::build_rope_2d(img_ids, txt_ids, &cfg, &self.device)?;
 
         // --- Double blocks ---
         let mut img = img;
         let mut txt = txt;
         let total_blocks = cfg.num_double_blocks + cfg.num_single_blocks;
 
+        let profile = std::env::var("FLUX1_PROFILE").ok().as_deref() == Some("1");
+        let mut total_await_ms: u128 = 0;
+        let mut total_compute_ms: u128 = 0;
+        let mut total_prefetch_ms: u128 = 0;
+        let t_pf0 = std::time::Instant::now();
         self.swap.prefetch(0)
             .map_err(|e| flame_core::Error::InvalidInput(format!("prefetch: {e}")))?;
+        if profile {
+            total_prefetch_ms += t_pf0.elapsed().as_millis();
+        }
 
         for i in 0..cfg.num_double_blocks {
+            let t_aw = std::time::Instant::now();
             let raw = self.swap.await_block(i)
                 .map_err(|e| flame_core::Error::InvalidInput(format!("await: {e}")))?;
+            let aw_ms = t_aw.elapsed().as_millis();
+            total_await_ms += aw_ms;
+
+            let t_pf = std::time::Instant::now();
             if i + 1 < total_blocks {
                 self.swap.prefetch(i + 1)
                     .map_err(|e| flame_core::Error::InvalidInput(format!("prefetch: {e}")))?;
             }
+            let pf_ms = t_pf.elapsed().as_millis();
+            total_prefetch_ms += pf_ms;
 
+            let t_fwd = std::time::Instant::now();
             let (new_img, new_txt) = self.double_block_forward(
-                &img, &txt, &vec, &pe, &raw, i,
+                &img, &txt, &vec, &pe_cos, &pe_sin, &raw, i,
             )?;
+            // Sync ONLY when profiling so the per-block timer is accurate.
+            // Outside profiling we want consecutive blocks to dispatch and
+            // overlap with FlameSwap H2D streaming, not serialize on a sync.
+            if profile {
+                let _ = self.device.synchronize();
+            }
+            let fwd_ms = t_fwd.elapsed().as_millis();
+            total_compute_ms += fwd_ms;
             img = new_img;
             txt = new_txt;
 
-            if i % 5 == 0 || i == cfg.num_double_blocks - 1 {
+            if profile {
+                eprintln!("[PROF] double {:>2}/{}: await={:>4}ms prefetch={:>3}ms compute={:>5}ms",
+                    i + 1, cfg.num_double_blocks, aw_ms, pf_ms, fwd_ms);
+            } else if i % 5 == 0 || i == cfg.num_double_blocks - 1 {
                 log::info!("[Flux1] Double block {}/{}", i + 1, cfg.num_double_blocks);
             }
         }
@@ -484,18 +545,40 @@ impl Flux1DiT {
         // --- Single blocks ---
         for i in 0..cfg.num_single_blocks {
             let block_idx = cfg.num_double_blocks + i;
+
+            let t_aw = std::time::Instant::now();
             let raw = self.swap.await_block(block_idx)
                 .map_err(|e| flame_core::Error::InvalidInput(format!("await: {e}")))?;
+            let aw_ms = t_aw.elapsed().as_millis();
+            total_await_ms += aw_ms;
+
+            let t_pf = std::time::Instant::now();
             if block_idx + 1 < total_blocks {
                 self.swap.prefetch(block_idx + 1)
                     .map_err(|e| flame_core::Error::InvalidInput(format!("prefetch: {e}")))?;
             }
+            let pf_ms = t_pf.elapsed().as_millis();
+            total_prefetch_ms += pf_ms;
 
-            x = self.single_block_forward(&x, &vec, &pe, txt_len, &raw, i)?;
+            let t_fwd = std::time::Instant::now();
+            x = self.single_block_forward(&x, &vec, &pe_cos, &pe_sin, txt_len, &raw, i)?;
+            if profile {
+                let _ = self.device.synchronize();
+            }
+            let fwd_ms = t_fwd.elapsed().as_millis();
+            total_compute_ms += fwd_ms;
 
-            if i % 10 == 0 || i == cfg.num_single_blocks - 1 {
+            if profile {
+                eprintln!("[PROF] single {:>2}/{}: await={:>4}ms prefetch={:>3}ms compute={:>5}ms",
+                    i + 1, cfg.num_single_blocks, aw_ms, pf_ms, fwd_ms);
+            } else if i % 10 == 0 || i == cfg.num_single_blocks - 1 {
                 log::info!("[Flux1] Single block {}/{}", i + 1, cfg.num_single_blocks);
             }
+        }
+
+        if profile {
+            eprintln!("[PROF] TOTAL await={}ms compute={}ms prefetch={}ms",
+                total_await_ms, total_compute_ms, total_prefetch_ms);
         }
 
         // --- Extract image portion and apply final layer ---
@@ -512,7 +595,8 @@ impl Flux1DiT {
         img: &Tensor,
         txt: &Tensor,
         vec: &Tensor,
-        pe: &Tensor,
+        pe_cos: &Tensor,
+        pe_sin: &Tensor,
         weights: &HashMap<String, Tensor>,
         block_idx: usize,
     ) -> Result<(Tensor, Tensor)> {
@@ -520,6 +604,16 @@ impl Flux1DiT {
         let h = cfg.num_heads;
         let d = cfg.head_dim;
         let prefix = format!("double_blocks.{block_idx}");
+        // Section profiling: only fires when FLUX1_BLOCK_PROF=1 and only on block 0.
+        let prof = block_idx == 0 && std::env::var("FLUX1_BLOCK_PROF").ok().as_deref() == Some("1");
+        let dev = self.device.clone();
+        let mark = |label: &str, t: std::time::Instant| {
+            if prof {
+                let _ = dev.synchronize();
+                eprintln!("[BPROF dbl] {:<22} {:>6}ms", label, t.elapsed().as_millis());
+            }
+        };
+        let t_block = std::time::Instant::now();
 
         let w = |suffix: &str| -> Result<&Tensor> {
             let key = format!("{prefix}.{suffix}");
@@ -533,90 +627,112 @@ impl Flux1DiT {
         let (b, n_img) = (dims_img[0], dims_img[1]);
         let n_txt = dims_txt[1];
 
-        // Per-block modulation: 6 mods each for img and txt
+        // ── 1. modulation projection (silu + 2 linears + 12 narrows) ──
+        let t = std::time::Instant::now();
         let img_mod_w = w("img_mod.lin.weight")?;
         let img_mod_b = w("img_mod.lin.bias")?;
         let txt_mod_w = w("txt_mod.lin.weight")?;
         let txt_mod_b = w("txt_mod.lin.bias")?;
-
         let vec_act = vec.silu()?;
         let img_mods = Self::linear_bias(&vec_act.unsqueeze(1)?, img_mod_w, img_mod_b)?
-            .squeeze(Some(1))?; // [B, 6*dim]
+            .squeeze(Some(1))?;
         let txt_mods = Self::linear_bias(&vec_act.unsqueeze(1)?, txt_mod_w, txt_mod_b)?
             .squeeze(Some(1))?;
-
-        // Split into 6 mod vectors
         let chunk_size = cfg.inner_dim;
         let img_shift1 = img_mods.narrow(1, 0, chunk_size)?;
         let img_scale1 = img_mods.narrow(1, chunk_size, chunk_size)?;
-        let img_gate1 = img_mods.narrow(1, 2 * chunk_size, chunk_size)?;
+        let img_gate1  = img_mods.narrow(1, 2 * chunk_size, chunk_size)?;
         let img_shift2 = img_mods.narrow(1, 3 * chunk_size, chunk_size)?;
         let img_scale2 = img_mods.narrow(1, 4 * chunk_size, chunk_size)?;
-        let img_gate2 = img_mods.narrow(1, 5 * chunk_size, chunk_size)?;
-
+        let img_gate2  = img_mods.narrow(1, 5 * chunk_size, chunk_size)?;
         let txt_shift1 = txt_mods.narrow(1, 0, chunk_size)?;
         let txt_scale1 = txt_mods.narrow(1, chunk_size, chunk_size)?;
-        let txt_gate1 = txt_mods.narrow(1, 2 * chunk_size, chunk_size)?;
+        let txt_gate1  = txt_mods.narrow(1, 2 * chunk_size, chunk_size)?;
         let txt_shift2 = txt_mods.narrow(1, 3 * chunk_size, chunk_size)?;
         let txt_scale2 = txt_mods.narrow(1, 4 * chunk_size, chunk_size)?;
-        let txt_gate2 = txt_mods.narrow(1, 5 * chunk_size, chunk_size)?;
+        let txt_gate2  = txt_mods.narrow(1, 5 * chunk_size, chunk_size)?;
+        mark("1.mod_proj", t);
 
-        // Modulate + QKV
+        // ── 2a. modulate_pre × 2 ──
+        let t = std::time::Instant::now();
         let img_normed = Self::modulate_pre(img, &img_shift1, &img_scale1)?;
         let txt_normed = Self::modulate_pre(txt, &txt_shift1, &txt_scale1)?;
+        mark("2a.modulate_pre", t);
 
+        // ── 2b. qkv linears × 2 ──
+        let t = std::time::Instant::now();
         let img_qkv = Self::linear_bias(&img_normed, w("img_attn.qkv.weight")?, w("img_attn.qkv.bias")?)?;
         let txt_qkv = Self::linear_bias(&txt_normed, w("txt_attn.qkv.weight")?, w("txt_attn.qkv.bias")?)?;
+        mark("2b.qkv_linears", t);
 
-        // Reshape QKV: [B, N, 3*dim] → 3x [B, H, N, D]
+        // ── 2c. split_qkv × 2 ──
+        let t = std::time::Instant::now();
         let (img_q, img_k, img_v) = Self::split_qkv(&img_qkv, b, n_img, h, d)?;
         let (txt_q, txt_k, txt_v) = Self::split_qkv(&txt_qkv, b, n_txt, h, d)?;
+        mark("2c.split_qkv", t);
 
-        // QK norm
+        // ── 3. q/k RMSNorm × 4 ──
+        let t = std::time::Instant::now();
         let img_q = Self::rms_norm(&img_q, w("img_attn.norm.query_norm.scale")?, 1e-6)?;
         let img_k = Self::rms_norm(&img_k, w("img_attn.norm.key_norm.scale")?, 1e-6)?;
         let txt_q = Self::rms_norm(&txt_q, w("txt_attn.norm.query_norm.scale")?, 1e-6)?;
         let txt_k = Self::rms_norm(&txt_k, w("txt_attn.norm.key_norm.scale")?, 1e-6)?;
+        mark("3.qk_rmsnorm", t);
 
-        // Joint attention: concat then apply RoPE
-        let q = Tensor::cat(&[&txt_q, &img_q], 2)?; // [B, H, N_txt+N_img, D]
+        // ── 4. cat × 3 + RoPE ──
+        let t = std::time::Instant::now();
+        let q = Tensor::cat(&[&txt_q, &img_q], 2)?;
         let k = Tensor::cat(&[&txt_k, &img_k], 2)?;
         let v = Tensor::cat(&[&txt_v, &img_v], 2)?;
+        mark("4a.cat_qkv", t);
 
-        let (q, k) = Self::apply_rope_complex(&q, &k, pe)?;
+        let t = std::time::Instant::now();
+        let (q, k) = Self::apply_rope_complex(&q, &k, pe_cos, pe_sin)?;
+        mark("4b.rope", t);
 
-        // SDPA
+        // ── 5. SDPA ──
+        let t = std::time::Instant::now();
         let attn_out = flame_core::attention::sdpa(&q, &k, &v, None)?;
+        mark("5.sdpa", t);
 
-        // Split back
+        // ── 6. split back + permute + reshape + o-proj × 2 ──
+        let t = std::time::Instant::now();
         let txt_attn = attn_out.narrow(2, 0, n_txt)?;
         let img_attn = attn_out.narrow(2, n_txt, n_img)?;
-
         let img_attn = img_attn.permute(&[0, 2, 1, 3])?.reshape(&[b, n_img, h * d])?;
         let txt_attn = txt_attn.permute(&[0, 2, 1, 3])?.reshape(&[b, n_txt, h * d])?;
-
         let img_attn = Self::linear_bias(&img_attn, w("img_attn.proj.weight")?, w("img_attn.proj.bias")?)?;
         let txt_attn = Self::linear_bias(&txt_attn, w("txt_attn.proj.weight")?, w("txt_attn.proj.bias")?)?;
+        mark("6.attn_out+oproj", t);
 
-        // Gated residual
+        // ── 7. gated residual 1 ──
+        let t = std::time::Instant::now();
         let img = img.add(&img_gate1.unsqueeze(1)?.mul(&img_attn)?)?;
         let txt = txt.add(&txt_gate1.unsqueeze(1)?.mul(&txt_attn)?)?;
+        mark("7.gated_resid1", t);
 
-        // MLP with modulation
+        // ── 8. modulate2 + MLP (linear→gelu→linear) × 2 ──
+        let t = std::time::Instant::now();
         let img_mlp_in = Self::modulate_pre(&img, &img_shift2, &img_scale2)?;
         let txt_mlp_in = Self::modulate_pre(&txt, &txt_shift2, &txt_scale2)?;
-
-        // GELU MLP: Linear → GELU → Linear
         let img_mlp = Self::linear_bias(&img_mlp_in, w("img_mlp.0.weight")?, w("img_mlp.0.bias")?)?;
         let img_mlp = img_mlp.gelu()?;
         let img_mlp = Self::linear_bias(&img_mlp, w("img_mlp.2.weight")?, w("img_mlp.2.bias")?)?;
-
         let txt_mlp = Self::linear_bias(&txt_mlp_in, w("txt_mlp.0.weight")?, w("txt_mlp.0.bias")?)?;
         let txt_mlp = txt_mlp.gelu()?;
         let txt_mlp = Self::linear_bias(&txt_mlp, w("txt_mlp.2.weight")?, w("txt_mlp.2.bias")?)?;
+        mark("8.modulate2+mlp", t);
 
+        // ── 9. gated residual 2 ──
+        let t = std::time::Instant::now();
         let img = img.add(&img_gate2.unsqueeze(1)?.mul(&img_mlp)?)?;
         let txt = txt.add(&txt_gate2.unsqueeze(1)?.mul(&txt_mlp)?)?;
+        mark("9.gated_resid2", t);
+
+        if prof {
+            let _ = dev.synchronize();
+            eprintln!("[BPROF dbl] TOTAL                 {:>6}ms", t_block.elapsed().as_millis());
+        }
 
         Ok((img, txt))
     }
@@ -625,8 +741,9 @@ impl Flux1DiT {
         &self,
         x: &Tensor,
         vec: &Tensor,
-        pe: &Tensor,
-        txt_len: usize,
+        pe_cos: &Tensor,
+        pe_sin: &Tensor,
+        _txt_len: usize,
         weights: &HashMap<String, Tensor>,
         block_idx: usize,
     ) -> Result<Tensor> {
@@ -636,6 +753,17 @@ impl Flux1DiT {
         let dim = cfg.inner_dim;
         let mlp_hidden = (dim as f32 * cfg.mlp_ratio) as usize;
         let prefix = format!("single_blocks.{block_idx}");
+        // Section profiling: only fires when FLUX1_BLOCK_PROF=1 and only on block 0.
+        let prof = block_idx == 0
+            && std::env::var("FLUX1_BLOCK_PROF").ok().as_deref() == Some("1");
+        let dev = self.device.clone();
+        let mark = |label: &str, t: std::time::Instant| {
+            if prof {
+                let _ = dev.synchronize();
+                eprintln!("[BPROF sgl] {:<22} {:>6}ms", label, t.elapsed().as_millis());
+            }
+        };
+        let t_block = std::time::Instant::now();
 
         let w = |suffix: &str| -> Result<&Tensor> {
             let key = format!("{prefix}.{suffix}");
@@ -647,38 +775,72 @@ impl Flux1DiT {
         let dims = x.shape().dims().to_vec();
         let (b, n) = (dims[0], dims[1]);
 
-        // Modulation (3 mods)
+        // ── 1. modulation ──
+        let t = std::time::Instant::now();
         let vec_act = vec.silu()?;
         let mods = Self::linear_bias(&vec_act.unsqueeze(1)?, w("modulation.lin.weight")?, w("modulation.lin.bias")?)?
             .squeeze(Some(1))?;
         let shift = mods.narrow(1, 0, dim)?;
         let scale = mods.narrow(1, dim, dim)?;
         let gate = mods.narrow(1, 2 * dim, dim)?;
+        mark("1.mod_proj", t);
 
+        // ── 2. modulate_pre ──
+        let t = std::time::Instant::now();
         let x_normed = Self::modulate_pre(x, &shift, &scale)?;
+        mark("2.modulate_pre", t);
 
-        // Fused linear1: QKV + MLP_up
+        // ── 3. fused linear1 (QKV + MLP_up) ──
+        let t = std::time::Instant::now();
         let qkv_mlp = Self::linear_bias(&x_normed, w("linear1.weight")?, w("linear1.bias")?)?;
         let qkv = qkv_mlp.narrow(2, 0, 3 * dim)?;
         let mlp_in = qkv_mlp.narrow(2, 3 * dim, mlp_hidden)?;
+        mark("3.linear1", t);
 
+        // ── 4. split_qkv + qk_rmsnorm ──
+        let t = std::time::Instant::now();
         let (q, k, v) = Self::split_qkv(&qkv, b, n, h, d)?;
         let q = Self::rms_norm(&q, w("norm.query_norm.scale")?, 1e-6)?;
         let k = Self::rms_norm(&k, w("norm.key_norm.scale")?, 1e-6)?;
+        mark("4.split+qk_norm", t);
 
-        let (q, k) = Self::apply_rope_complex(&q, &k, pe)?;
+        // ── 5. RoPE ──
+        let t = std::time::Instant::now();
+        let (q, k) = Self::apply_rope_complex(&q, &k, pe_cos, pe_sin)?;
+        mark("5.rope", t);
 
+        // ── 6. SDPA ──
+        let t = std::time::Instant::now();
         let attn_out = flame_core::attention::sdpa(&q, &k, &v, None)?;
+        mark("6.sdpa", t);
+
+        // ── 7. permute + reshape ──
+        let t = std::time::Instant::now();
         let attn_out = attn_out.permute(&[0, 2, 1, 3])?.reshape(&[b, n, h * d])?;
+        mark("7.attn_out_permute", t);
 
-        // GELU on MLP path
+        // ── 8. GELU on MLP path ──
+        let t = std::time::Instant::now();
         let mlp_out = mlp_in.gelu()?;
+        mark("8.gelu", t);
 
-        // Fused linear2: concat attn_proj + mlp_down
-        let fused_in = Tensor::cat(&[&attn_out, &mlp_out], 2)?; // [B, N, dim+mlp_hidden]
+        // ── 9. fused linear2 (attn_proj + mlp_down via cat) ──
+        let t = std::time::Instant::now();
+        let fused_in = Tensor::cat(&[&attn_out, &mlp_out], 2)?;
         let out = Self::linear_bias(&fused_in, w("linear2.weight")?, w("linear2.bias")?)?;
+        mark("9.linear2", t);
 
-        x.add(&gate.unsqueeze(1)?.mul(&out)?)
+        // ── 10. gated residual ──
+        let t = std::time::Instant::now();
+        let result = x.add(&gate.unsqueeze(1)?.mul(&out)?)?;
+        mark("10.gated_resid", t);
+
+        if prof {
+            let _ = dev.synchronize();
+            eprintln!("[BPROF sgl] TOTAL                 {:>6}ms", t_block.elapsed().as_millis());
+        }
+
+        Ok(result)
     }
 
     fn final_layer_forward(&self, x: &Tensor, vec: &Tensor) -> Result<Tensor> {
@@ -708,11 +870,24 @@ impl Flux1DiT {
     // -----------------------------------------------------------------------
 
     fn split_qkv(qkv: &Tensor, b: usize, n: usize, h: usize, d: usize) -> Result<(Tensor, Tensor, Tensor)> {
-        let reshaped = qkv.reshape(&[b, n, 3, h, d])?;
-        let permuted = reshaped.permute(&[2, 0, 3, 1, 4])?; // [3, B, H, N, D]
-        let q = permuted.narrow(0, 0, 1)?.squeeze(Some(0))?;
-        let k = permuted.narrow(0, 1, 1)?.squeeze(Some(0))?;
-        let v = permuted.narrow(0, 2, 1)?.squeeze(Some(0))?;
+        // The previous implementation reshaped to 5D `[B,N,3,H,D]` then permuted
+        // `[2,0,3,1,4]`. flame-core has no GPU kernel for 5D permutes — it falls
+        // through to the general "CPU copy fallback" path in tensor.rs which
+        // costs ~2.3s on a 28MB BF16 QKV tensor (per profile, 2026-04-06).
+        //
+        // Replace with: 3D narrow on the contiguous output dim → 4D reshape →
+        // the specialized `permute_0213` hot path (`GpuOps::permute_0213`,
+        // already optimized for "Flux attention" reshapes — see tensor.rs:2587).
+        // Drops split_qkv from 2333ms to <5ms per block.
+        let dim = h * d;
+        let split_one = |start: usize| -> Result<Tensor> {
+            let s = qkv.narrow(2, start, dim)?;          // [B, N, dim]
+            let r = s.reshape(&[b, n, h, d])?;           // [B, N, H, D]  (view)
+            r.permute(&[0, 2, 1, 3])                     // [B, H, N, D]  (hot path)
+        };
+        let q = split_one(0)?;
+        let k = split_one(dim)?;
+        let v = split_one(2 * dim)?;
         Ok((q, k, v))
     }
 

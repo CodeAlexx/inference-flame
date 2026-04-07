@@ -32,6 +32,8 @@ pub struct ClipConfig {
     pub max_position_embeddings: usize,
     pub layer_norm_eps: f32,
     pub projection_dim: usize,
+    /// CLIP-L default EOS token id (CLIPTokenizer also pads with this value).
+    pub eos_token_id: i32,
 }
 
 impl Default for ClipConfig {
@@ -46,6 +48,7 @@ impl Default for ClipConfig {
             max_position_embeddings: 77,
             layer_norm_eps: 1e-5,
             projection_dim: 768,
+            eos_token_id: 49407, // HF CLIPTextConfig default
         }
     }
 }
@@ -205,17 +208,29 @@ impl ClipEncoder {
 
     /// Encode text: returns (last_hidden_state, pooled_output).
     ///
-    /// pooled_output = final_layer_norm(hidden_states[EOS_token_position])
+    /// Matches BFL `HFEmbedder` behavior — reads `pooler_output` which is the final
+    /// layer norm applied to the hidden state at the FIRST EOS token position.
+    /// Pads/truncates `token_ids` to `max_position_embeddings` (77) to match
+    /// `padding="max_length", max_length=77, truncation=True`.
     pub fn encode(&self, token_ids: &[i32]) -> Result<(Tensor, Tensor)> {
         let cfg = &self.config;
-        let seq_len = token_ids.len().min(cfg.max_position_embeddings);
+        let max_len = cfg.max_position_embeddings; // 77
+
+        // CLIP.H1 fix: always run at seq_len=77. CLIPTokenizer pads with eos_token_id.
+        let mut padded: Vec<i32> = token_ids.to_vec();
+        if padded.len() > max_len {
+            padded.truncate(max_len);
+        } else {
+            padded.resize(max_len, cfg.eos_token_id);
+        }
+        let seq_len = max_len;
 
         // 1. Token + position embeddings
         let token_w = self.w("text_model.embeddings.token_embedding.weight")?;
         let pos_w = self.w("text_model.embeddings.position_embedding.weight")?;
 
         let ids = Tensor::from_vec(
-            token_ids[..seq_len].iter().map(|&id| id as f32).collect(),
+            padded.iter().map(|&id| id as f32).collect(),
             Shape::from_dims(&[seq_len]),
             self.device.clone(),
         )?.to_dtype(DType::I32)?;
@@ -245,13 +260,23 @@ impl ClipEncoder {
         let final_ln_b = self.w("text_model.final_layer_norm.bias")?;
         let hidden = Self::layer_norm(&hidden, final_ln_w, final_ln_b, cfg.layer_norm_eps)?;
 
-        // 5. Pooled output: hidden state at EOS position
-        // EOS is the last non-padding token (or position of max token ID)
-        let eos_pos = token_ids[..seq_len]
+        // 5. Pooled output: hidden state at the FIRST EOS token position.
+        //
+        // ## HF reference (modeling_clip.py CLIPTextTransformer.forward):
+        // ```python
+        // pooled_output = last_hidden_state[
+        //     torch.arange(last_hidden_state.shape[0], device=...),
+        //     (input_ids.to(dtype=torch.int) == self.eos_token_id).int().argmax(dim=-1),
+        // ]
+        // ```
+        // `argmax` on {0,1} returns the FIRST index of the max. CLIPTokenizer pads
+        // with eos_token_id=49407, so this finds the real EOS, not a pad slot.
+        //
+        // CLIP.C1 fix: previously used `max_by_key` which returns the LAST tied
+        // element, landing on the final pad position instead of the real EOS.
+        let eos_pos = padded
             .iter()
-            .enumerate()
-            .max_by_key(|(_, &id)| id)
-            .map(|(i, _)| i)
+            .position(|&id| id == cfg.eos_token_id)
             .unwrap_or(seq_len - 1);
 
         let pooled = hidden.narrow(1, eos_pos, 1)?.squeeze(Some(1))?; // [1, 768]

@@ -36,13 +36,39 @@ use std::sync::Arc;
 // ---------------------------------------------------------------------------
 // Layout helpers -- GroupNorm wants NHWC, Conv2d wants NCHW
 // ---------------------------------------------------------------------------
+//
+// The naive 4D permutes `[0,2,3,1]` and `[0,3,1,2]` fall through to
+// flame-core's "general permutation fallback" in tensor.rs, which runs a
+// GPU→CPU copy + 4D scalar Rust loop + CPU→GPU copy for every call and
+// downcasts BF16 to F32 in the process. For `[1,128,1024,1024]` that's
+// ~8 s per call; the VAE decoder triggered dozens of them, adding up to
+// the 188 s decode. flame-core's other 4D "hot path" `permute_0132` is
+// *also* a CPU loop.
+//
+// The only genuine GPU permute primitive available is `permute_021`
+// (via `GpuOps::permute_021`), which swaps the last two axes of a 3D
+// BF16-preserving tensor. We reach NCHW↔NHWC with a single GPU permute
+// by reshaping to 3D first:
+//
+//   NCHW [N,C,H,W] → reshape [N,C,H*W] → permute[0,2,1] → [N,H*W,C]
+//                  → reshape [N,H,W,C] = NHWC
+//   NHWC [N,H,W,C] → reshape [N,H*W,C] → permute[0,2,1] → [N,C,H*W]
+//                  → reshape [N,C,H,W] = NCHW
+//
+// All reshapes are views (input tensors are already contiguous in the
+// expected layout). The single `permute_021` call is real GPU work and
+// preserves BF16 storage.
 
-/// NCHW -> NHWC
+/// NCHW -> NHWC. Uses the 4D permute directly now that flame-core's
+/// general fallback routes through `GpuOps::permute_generic` (a real
+/// GPU scatter kernel) instead of the old CPU scalar loop. The previous
+/// 3D-reshape workaround is kept below as a reference for how we
+/// diagnosed the original bug; see PERF_VAE_PERMUTE.md.
 fn to_nhwc(x: &Tensor) -> Result<Tensor> {
     x.permute(&[0, 2, 3, 1])
 }
 
-/// NHWC -> NCHW
+/// NHWC -> NCHW. Same rationale as `to_nhwc`.
 fn to_nchw(x: &Tensor) -> Result<Tensor> {
     x.permute(&[0, 3, 1, 2])
 }
@@ -218,12 +244,41 @@ impl AttnBlock {
         let k = linear_3d(&h_flat, &self.k_w, &self.k_b)?;
         let v = linear_3d(&h_flat, &self.v_w, &self.v_b)?;
 
-        // SDPA expects [B, H, N, D] -- use 1 head with D=C
+        // SDPA expects [B, H, N, D] with head_dim in {64, 96, 128} to hit
+        // flash attention. The LDM VAE uses single-head attention with
+        // head_dim = C = 512, which drops to `forward_bf16_fallback` and
+        // materializes the full `[B, 1, N, N]` scores matrix — 1 GB for
+        // `N = 16384` at 1024² latent. Multi-head reshape would change
+        // the math (softmax is nonlinear over channels); the correct fix
+        // is to tile the Q dimension and run the fallback per q-chunk.
+        //
+        // Per-tile peak: `[B, 1, TILE, N]` F32 scores ≈ `TILE * N * 4` bytes.
+        //   N=16384, TILE=1024 → 64 MB per tile (was 1 GB full).
+        // The `cuda_ops_bf16::sdpa_stream_bf16` fallback eats the streamed
+        // path for true flash on head_dim=512; we tile at the Rust level
+        // instead so we stay in the standard materialized path (which is
+        // fast once the scores tensor is small enough to fit sensibly).
         let q = q.unsqueeze(1)?; // [B, 1, N, C]
         let k = k.unsqueeze(1)?;
         let v = v.unsqueeze(1)?;
 
-        let out = sdpa_forward(&q, &k, &v, None)?; // [B, 1, N, C]
+        const ATTN_TILE: usize = 1024;
+        let out = if n <= ATTN_TILE {
+            // Small enough to run in one shot.
+            sdpa_forward(&q, &k, &v, None)?
+        } else {
+            let mut tiles: Vec<Tensor> = Vec::with_capacity(n.div_ceil(ATTN_TILE));
+            let mut start = 0;
+            while start < n {
+                let len = (n - start).min(ATTN_TILE);
+                let q_tile = q.narrow(2, start, len)?;
+                let out_tile = sdpa_forward(&q_tile, &k, &v, None)?;
+                tiles.push(out_tile);
+                start += len;
+            }
+            let tile_refs: Vec<&Tensor> = tiles.iter().collect();
+            Tensor::cat(&tile_refs, 2)?
+        };
         let out = out.squeeze(Some(1))?; // [B, N, C]
 
         // Output projection
@@ -491,14 +546,23 @@ impl LdmVAEDecoder {
                 || key == "first_stage_model.post_quant_conv.weight"
                 || key == "first_stage_model.post_quant_conv.bias"
         })?;
-        // Strip "first_stage_model." prefix
+        // Strip "first_stage_model." prefix, and cast every tensor to BF16.
+        // Some VAE checkpoints (FLUX 1 ae.safetensors) are F32 on disk and the
+        // loader preserves that; `group_norm_bf16` and other BF16 kernels
+        // require BF16 storage, so cast here. Same class of cast as the
+        // CLIP-L / T5-XXL FP16 → BF16 fix in their respective loaders.
         let fsm = "first_stage_model.";
         let mut w = HashMap::with_capacity(raw.len());
         for (key, val) in raw {
             let k = key.strip_prefix(fsm).unwrap_or(&key).to_string();
-            w.insert(k, val);
+            let val_bf16 = if val.dtype() == DType::BF16 {
+                val
+            } else {
+                val.to_dtype(DType::BF16)?
+            };
+            w.insert(k, val_bf16);
         }
-        println!("[LdmVAE] Loaded {} decoder weight tensors", w.len());
+        println!("[LdmVAE] Loaded {} decoder weight tensors (cast to BF16)", w.len());
         // Remap diffusers-format keys to LDM-format if needed
         let w = remap_diffusers_to_ldm(w);
         Self::from_weights(w, in_channels, scaling_factor, shift_factor, device)
@@ -573,10 +637,23 @@ impl LdmVAEDecoder {
     ///
     /// Input: `[B, C, H, W]` latent tensor (BF16).
     /// Output: `[B, 3, H*8, W*8]` RGB tensor.
+    ///
+    /// ## BFL reference — src/flux/modules/autoencoder.py:308-315
+    /// ```python
+    /// def encode(self, x: Tensor) -> Tensor:
+    ///     z = self.reg(self.encoder(x))
+    ///     z = self.scale_factor * (z - self.shift_factor)
+    ///     return z
+    ///
+    /// def decode(self, z: Tensor) -> Tensor:
+    ///     z = z / self.scale_factor + self.shift_factor
+    ///     return self.decoder(z)
+    /// ```
+    /// Inverse of `encode`: divide by scale first, then add shift.
     pub fn decode(&self, z: &Tensor) -> Result<Tensor> {
-        // Undo VAE encode-time normalization
-        let z = z.add_scalar(-self.shift_factor)?
-            .mul_scalar(1.0 / self.scaling_factor)?;
+        // Undo VAE encode-time normalization: z = z / scale_factor + shift_factor
+        let z = z.mul_scalar(1.0 / self.scaling_factor)?
+            .add_scalar(self.shift_factor)?;
 
         // decoder.conv_in
         let mut h = self.conv_in.forward(&z)?;
