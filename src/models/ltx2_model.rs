@@ -157,45 +157,47 @@ impl LTX2Config {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Compute `x @ weight.T + bias` for x=[B, N, C], weight=[out, C], bias=[out].
+/// Compute `x @ weight.T + bias` for x=[B, N, Cin], weight=[Cout, Cin] (PyTorch
+/// `nn.Linear` layout), bias=[Cout]. Routes to `fused_linear3d_native` which
+/// uses cuBLASLt with TRANSA=T (handles the transpose inside the GEMM, no
+/// per-call transpose kernel). 2D inputs are unsqueezed to 3D and squeezed
+/// back; that path is rare (only `AdaLayerNormSingle` style ops).
 fn linear3d(x: &Tensor, weight: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
     let shape = x.shape().dims().to_vec();
-    let (b, n, c) = if shape.len() == 3 {
-        (shape[0], shape[1], shape[2])
+    if shape.len() == 3 {
+        flame_core::ops::fused_inference::fused_linear3d_native(x, weight, bias)
     } else if shape.len() == 2 {
-        (1, shape[0], shape[1])
+        let x3 = x.unsqueeze(0)?;
+        let out3 = flame_core::ops::fused_inference::fused_linear3d_native(&x3, weight, bias)?;
+        out3.squeeze_dim(0)
     } else {
-        return Err(flame_core::Error::InvalidShape(format!(
+        Err(flame_core::Error::InvalidShape(format!(
             "linear3d expects rank 2 or 3, got {:?}",
             shape
-        )));
-    };
-
-    let x_2d = x.reshape(&[b * n, c])?;
-    let out_2d = matmul_weight_t(&x_2d, weight)?;
-    let out_dim = out_2d.shape().dims()[1];
-    let mut result = out_2d.reshape(&[b, n, out_dim])?;
-
-    if let Some(b_tensor) = bias {
-        result = result.add(&b_tensor.reshape(&[1, 1, out_dim])?)?;
+        )))
     }
-    Ok(result)
 }
 
-/// Pre-transpose a weight tensor from `[out_features, in_features]` to
-/// `[in_features, out_features]` so that `matmul_weight_t` can skip the
-/// per-forward GPU transpose kernel.  Call this once after loading weights.
-fn pre_transpose_weight(w: &Tensor) -> Result<Tensor> {
-    w.transpose()
-}
-
-/// Compute `x @ weight_t` for 2D tensors. BF16-accelerated when available.
+/// Identity — kept as a stub so existing callers compile.  In the old path
+/// this transposed weights from `[Cout, Cin]` to `[Cin, Cout]` so a plain
+/// matmul could skip a runtime transpose.  The new `linear3d` uses
+/// `fused_linear3d_native` which absorbs the transpose into the cuBLASLt GEMM
+/// itself, so weights stay in the native PyTorch `[Cout, Cin]` layout.
 ///
-/// Expects `weight_t` to already be in `[in_features, out_features]` layout
-/// (i.e. pre-transposed via `pre_transpose_weight`).  This avoids launching a
-/// GPU transpose kernel on every forward pass.
-fn matmul_weight_t(x: &Tensor, weight_t: &Tensor) -> Result<Tensor> {
-    x.matmul(weight_t)
+/// This MUST stay a no-op: with FlameSwap v2 the swapper returns non-owning
+/// views into pre-allocated GPU staging buffers, and calling `.transpose()`
+/// on each weight per block per step was burning ~6 seconds per block.
+fn pre_transpose_weight(w: &Tensor) -> Result<Tensor> {
+    Ok(w.clone())
+}
+
+/// Compute `x @ weight^T` for 2D tensors. Wraps `linear3d` (which routes
+/// through `fused_linear3d_native`).  `weight` is in PyTorch `[Cout, Cin]`
+/// layout, NOT pre-transposed.
+fn matmul_weight_t(x: &Tensor, weight: &Tensor) -> Result<Tensor> {
+    let x3 = x.unsqueeze(0)?;
+    let out3 = flame_core::ops::fused_inference::fused_linear3d_native(&x3, weight, None)?;
+    out3.squeeze_dim(0)
 }
 
 /// SiLU activation: x * sigmoid(x)
@@ -208,17 +210,45 @@ fn gelu_approximate(x: &Tensor) -> Result<Tensor> {
     x.gelu()
 }
 
-/// RMSNorm: x / sqrt(mean(x^2) + eps), optionally scaled by weight
+/// RMSNorm: x / sqrt(mean(x^2) + eps), optionally scaled by weight.
+///
+/// For BF16 inputs (the common case in inference), routes to flame-core's
+/// fused `rms_norm_bf16` kernel — single launch, single allocation. The old
+/// path round-tripped through FP32 with ~7 separate ops + allocations per
+/// call and was responsible for ~100 ms per call on `[1, 1320, 4096]`
+/// shapes. The fused kernel is sub-millisecond on the same shape.
+///
+/// For F32 inputs (rare — F32 scale_shift_table internals only), falls back
+/// to the manual path. Weight dtype is currently expected to match input.
 fn rms_norm(x: &Tensor, weight: Option<&Tensor>, eps: f32) -> Result<Tensor> {
+    if x.dtype() == DType::BF16 {
+        // Make sure the weight (if present) is BF16; the cached F32
+        // scale_shift_table tensors don't pass through here so this branch
+        // is the steady-state hot path.
+        let w_bf16;
+        let weight_arg = if let Some(w) = weight {
+            if w.dtype() == DType::BF16 {
+                Some(w)
+            } else {
+                w_bf16 = w.to_dtype(DType::BF16)?;
+                // Lifetime trick — bind to outer var so the &Tensor below stays valid.
+                // We do this via a Box leak avoidance: just compute and stash.
+                return flame_core::cuda_ops_bf16::rms_norm_bf16(x, Some(&w_bf16), eps);
+            }
+        } else {
+            None
+        };
+        return flame_core::cuda_ops_bf16::rms_norm_bf16(x, weight_arg, eps);
+    }
+
+    // Slow F32 fallback for the rare case where x is F32.
     let dims = x.shape().dims().to_vec();
     let last_dim = dims[dims.len() - 1];
 
-    // Compute in F32 for stability
     let x_f32 = x.to_dtype(DType::F32)?;
     let x_sq = x_f32.mul(&x_f32)?;
     let mean_sq = x_sq.mean_along_dims(&[dims.len() - 1], true)?;
 
-    // Reshape mean to match input for broadcast
     let mut bc_shape = dims.clone();
     bc_shape[dims.len() - 1] = 1;
     let mean_sq = mean_sq.reshape(&bc_shape)?;
@@ -398,11 +428,19 @@ fn repeat_interleave_last(x: &Tensor, n: usize) -> Result<Tensor> {
 /// Apply split rotary embeddings (LTX-2 style).
 ///
 /// `x`: [B, H, N, D_head] or [B, N, D] (auto-reshaped if cos is 4D)
-/// `cos_freqs`, `sin_freqs`: [B, H, N, D_head/2]
+/// `cos_freqs`, `sin_freqs`: [B, H, N, D_head/2] (BF16 from `compute_rope_frequencies`)
 ///
 /// Split RoPE splits head_dim into two halves and cross-rotates:
 ///   first_half_out  = first_half * cos - second_half * sin
 ///   second_half_out = second_half * cos + first_half * sin
+///
+/// Stays in BF16 throughout.  The previous version round-tripped through
+/// FP32 (4 casts in + 1 cast out + 6 elementwise FP32 ops = ~10 launches and
+/// ~10 allocations per call) which was burning 200–400 ms per attention.
+/// Cast-free BF16 is ~10× faster on the per-head LTX-2 RoPE shapes; using
+/// `flame_core::bf16_ops::rope_halfsplit_bf16` directly would be even faster
+/// but its kernel assumes cos/sin are broadcast across heads, which LTX-2
+/// does not.
 pub fn apply_rotary_emb(x: &Tensor, cos_freqs: &Tensor, sin_freqs: &Tensor) -> Result<Tensor> {
     let x_dims = x.shape().dims().to_vec();
     let cos_dims = cos_freqs.shape().dims().to_vec();
@@ -421,11 +459,13 @@ pub fn apply_rotary_emb(x: &Tensor, cos_freqs: &Tensor, sin_freqs: &Tensor) -> R
     let (b, h, n, d_head) = (xd[0], xd[1], xd[2], xd[3]);
     let half = d_head / 2;
 
-    // Split head_dim into two halves using narrow on dim 3 (4D tensor)
-    let first_half = x4d.narrow(3, 0, half)?;       // [B, H, N, half]
-    let second_half = x4d.narrow(3, half, half)?;    // [B, H, N, half]
+    // RoPE rotation in FP32 for numerical stability (BF16 path produced NaN).
+    // The narrow() calls materialize contiguous BF16 halves first; cast each
+    // to FP32 just before the rotation math, then cast the result back to BF16.
+    let first_half = x4d.narrow(3, 0, half)?;       // [B, H, N, half] BF16
+    let second_half = x4d.narrow(3, half, half)?;    // [B, H, N, half] BF16
 
-    let cos_f32 = cos_freqs.to_dtype(DType::F32)?;  // [B, H, N, half]
+    let cos_f32 = cos_freqs.to_dtype(DType::F32)?;
     let sin_f32 = sin_freqs.to_dtype(DType::F32)?;
     let first_f32 = first_half.to_dtype(DType::F32)?;
     let second_f32 = second_half.to_dtype(DType::F32)?;
@@ -436,7 +476,7 @@ pub fn apply_rotary_emb(x: &Tensor, cos_freqs: &Tensor, sin_freqs: &Tensor) -> R
     let first_out = first_f32.mul(&cos_f32)?.sub(&second_f32.mul(&sin_f32)?)?;
     let second_out = second_f32.mul(&cos_f32)?.add(&first_f32.mul(&sin_f32)?)?;
 
-    // Concatenate halves back: [B, H, N, D_head]
+    // Concatenate halves back and cast: [B, H, N, D_head] BF16
     let out = Tensor::cat(&[&first_out, &second_out], 3)?.to_dtype(DType::BF16)?;
 
     if needs_reshape {
@@ -556,15 +596,27 @@ impl LTX2Attention {
         query_rope: Option<(&Tensor, &Tensor)>,
         key_rope: Option<(&Tensor, &Tensor)>,
     ) -> Result<Tensor> {
+        let prof = std::env::var("LTX2_ATTN_PROF").is_ok();
+        let dev = hidden_states.device().clone();
+        let mut t = std::time::Instant::now();
+        let mut tick = |name: &'static str, t: &mut std::time::Instant, out: &mut Vec<(&'static str, u128)>| {
+            if prof { let _ = dev.synchronize(); }
+            out.push((name, t.elapsed().as_millis()));
+            *t = std::time::Instant::now();
+        };
+        let mut phases: Vec<(&'static str, u128)> = Vec::with_capacity(8);
+
         let kv_input = encoder_hidden_states.unwrap_or(hidden_states);
 
         let q = linear3d(hidden_states, &self.to_q_weight, Some(&self.to_q_bias))?;
         let k = linear3d(kv_input, &self.to_k_weight, Some(&self.to_k_bias))?;
         let v = linear3d(kv_input, &self.to_v_weight, Some(&self.to_v_bias))?;
+        tick("qkv", &mut t, &mut phases);
 
         // Fused RMSNorm across heads on Q and K
         let q = rms_norm(&q, Some(&self.norm_q_weight), self.eps)?;
         let k = rms_norm(&k, Some(&self.norm_k_weight), self.eps)?;
+        tick("qknorm", &mut t, &mut phases);
 
         // Apply rotary embeddings
         let q = if let Some((cos, sin)) = query_rope {
@@ -577,6 +629,7 @@ impl LTX2Attention {
         } else {
             k
         };
+        tick("rope", &mut t, &mut phases);
 
         // Reshape to [B, num_heads, S, head_dim] for SDPA
         let q_dims = q.shape().dims().to_vec();
@@ -587,9 +640,11 @@ impl LTX2Attention {
         let q = q.reshape(&[b, s_q, self.num_heads, self.head_dim])?.permute(&[0, 2, 1, 3])?;
         let k = k.reshape(&[b, s_kv, self.num_heads, self.head_dim])?.permute(&[0, 2, 1, 3])?;
         let v = v.reshape(&[b, s_kv, self.num_heads, self.head_dim])?.permute(&[0, 2, 1, 3])?;
+        tick("permute_in", &mut t, &mut phases);
 
         // Scaled dot-product attention
         let attn_out = flame_core::sdpa::forward(&q, &k, &v, attention_mask)?;
+        tick("sdpa", &mut t, &mut phases);
 
         // Reshape back: [B, heads, S, head_dim] -> [B, S, inner_dim]
         let attn_out = attn_out.permute(&[0, 2, 1, 3])?; // [B, S, H, D]
@@ -611,7 +666,13 @@ impl LTX2Attention {
         };
 
         // Output projection
-        linear3d(&attn_out, &self.to_out_weight, Some(&self.to_out_bias))
+        let out = linear3d(&attn_out, &self.to_out_weight, Some(&self.to_out_bias))?;
+        tick("post", &mut t, &mut phases);
+        if prof {
+            let parts: Vec<String> = phases.iter().map(|(n, ms)| format!("{}={}", n, ms)).collect();
+            log::info!("[ATTN-PROF d={} sq={}] {}", self.head_dim, s_q, parts.join(" "));
+        }
+        Ok(out)
     }
 }
 
@@ -798,32 +859,62 @@ impl LTX2TransformerBlock {
         let video_dim = hidden_states.shape().dims()[2];
         let audio_dim = audio_hidden_states.shape().dims()[2];
 
-        // ---- 1. Video Self-Attention with AdaLN-Zero ----
-        let norm_h = rms_norm(hidden_states, self.norm1_weight.as_ref(), self.eps)?;
+        // Profiling — gated by LTX2_FWD_PROF env var. When set, syncs the
+        // device after each phase and stores per-phase millis. Logged at the
+        // end of the function.  Used to identify the slow phase inside the
+        // 6-second-per-block AV forward.
+        let prof = std::env::var("LTX2_FWD_PROF").is_ok();
+        let dev = hidden_states.device().clone();
+        let mut t = std::time::Instant::now();
+        let mut take = |label: &mut Vec<(&'static str, u128)>, name: &'static str, start: &mut std::time::Instant| {
+            if prof { let _ = dev.synchronize(); }
+            let ms = start.elapsed().as_millis();
+            label.push((name, ms));
+            *start = std::time::Instant::now();
+        };
+        let mut phases: Vec<(&'static str, u128)> = Vec::with_capacity(8);
 
+        // ---- 1. Video Self-Attention with AdaLN-Zero ----
         // Compute 6 modulation params from scale_shift_table + temb
         let (shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp) =
             self.compute_ada_params_6(&self.scale_shift_table, temb, b, video_dim)?;
 
-        // Modulate: norm * (1 + scale) + shift
-        let mod_h = norm_h.mul(&scale_msa.add_scalar(1.0)?)?.add(&shift_msa)?;
+        // Fused: rms_norm + (1+scale)*x + shift in one kernel.  Falls back
+        // to separate calls when no affine weight is present.
+        let mod_h = if let Some(w) = self.norm1_weight.as_ref() {
+            fused_rms_norm_modulate(hidden_states, w, &scale_msa, &shift_msa, self.eps)?
+        } else {
+            let norm_h = rms_norm(hidden_states, None, self.eps)?;
+            fused_modulate(&norm_h, &scale_msa, &shift_msa)?
+        };
         let attn_out = self.attn1.forward(&mod_h, None, None, video_rotary_emb, None)?;
-        let mut hidden_states = hidden_states.add(&attn_out.mul(&gate_msa)?)?;
+        // Fused: x + attn_out * gate in one kernel.
+        let mut hidden_states = fused_residual_gate(hidden_states, &attn_out, &gate_msa)?;
+        take(&mut phases, "vsa", &mut t);
 
         // ---- Audio Self-Attention with AdaLN-Zero ----
-        let norm_a = rms_norm(audio_hidden_states, self.audio_norm1_weight.as_ref(), self.eps)?;
         let (a_shift_msa, a_scale_msa, a_gate_msa, a_shift_mlp, a_scale_mlp, a_gate_mlp) =
             self.compute_ada_params_6(&self.audio_scale_shift_table, temb_audio, b, audio_dim)?;
-        let mod_a = norm_a.mul(&a_scale_msa.add_scalar(1.0)?)?.add(&a_shift_msa)?;
+        let mod_a = if let Some(w) = self.audio_norm1_weight.as_ref() {
+            fused_rms_norm_modulate(audio_hidden_states, w, &a_scale_msa, &a_shift_msa, self.eps)?
+        } else {
+            let norm_a = rms_norm(audio_hidden_states, None, self.eps)?;
+            fused_modulate(&norm_a, &a_scale_msa, &a_shift_msa)?
+        };
         let attn_a_out = self.audio_attn1.forward(&mod_a, None, None, audio_rotary_emb, None)?;
-        let mut audio_hidden_states = audio_hidden_states.add(&attn_a_out.mul(&a_gate_msa)?)?;
+        let mut audio_hidden_states = fused_residual_gate(audio_hidden_states, &attn_a_out, &a_gate_msa)?;
+        take(&mut phases, "asa", &mut t);
 
         // ---- 2. Video/Audio Cross-Attention with text (AdaLN modulated) ----
         // Extract cross-attention modulation params (indices 6-8 of [9, dim] table)
         let (v_shift_ca, v_scale_ca, v_gate_ca) =
             self.compute_ada_params_ca(&self.scale_shift_table, temb, b, video_dim)?;
-        let norm_h2 = rms_norm(&hidden_states, self.norm2_weight.as_ref(), self.eps)?;
-        let mod_h2 = norm_h2.mul(&v_scale_ca.add_scalar(1.0)?)?.add(&v_shift_ca)?;
+        let mod_h2 = if let Some(w) = self.norm2_weight.as_ref() {
+            fused_rms_norm_modulate(&hidden_states, w, &v_scale_ca, &v_shift_ca, self.eps)?
+        } else {
+            let norm_h2 = rms_norm(&hidden_states, None, self.eps)?;
+            fused_modulate(&norm_h2, &v_scale_ca, &v_shift_ca)?
+        };
 
         // KV (text) context modulation — see LTX2_AV_BUGS.md Bug 2.
         // Mirrors `apply_cross_attention_adaln` in the Lightricks reference.
@@ -845,13 +936,18 @@ impl LTX2TransformerBlock {
         };
 
         let ca_out = self.attn2.forward(&mod_h2, Some(&modulated_v_context), encoder_attention_mask, None, None)?;
-        hidden_states = hidden_states.add(&ca_out.mul(&v_gate_ca)?)?;
+        hidden_states = fused_residual_gate(&hidden_states, &ca_out, &v_gate_ca)?;
         drop(modulated_v_context);
+        take(&mut phases, "vca", &mut t);
 
         let (a_shift_ca, a_scale_ca, a_gate_ca) =
             self.compute_ada_params_ca(&self.audio_scale_shift_table, temb_audio, b, audio_dim)?;
-        let norm_a2 = rms_norm(&audio_hidden_states, self.audio_norm2_weight.as_ref(), self.eps)?;
-        let mod_a2 = norm_a2.mul(&a_scale_ca.add_scalar(1.0)?)?.add(&a_shift_ca)?;
+        let mod_a2 = if let Some(w) = self.audio_norm2_weight.as_ref() {
+            fused_rms_norm_modulate(&audio_hidden_states, w, &a_scale_ca, &a_shift_ca, self.eps)?
+        } else {
+            let norm_a2 = rms_norm(&audio_hidden_states, None, self.eps)?;
+            fused_modulate(&norm_a2, &a_scale_ca, &a_shift_ca)?
+        };
 
         // Same KV modulation for the audio cross-attention.
         let modulated_a_context = if let (Some(apsst), Some(apt)) =
@@ -869,13 +965,17 @@ impl LTX2TransformerBlock {
         };
 
         let ca_a_out = self.audio_attn2.forward(&mod_a2, Some(&modulated_a_context), audio_encoder_attention_mask, None, None)?;
-        audio_hidden_states = audio_hidden_states.add(&ca_a_out.mul(&a_gate_ca)?)?;
+        audio_hidden_states = fused_residual_gate(&audio_hidden_states, &ca_a_out, &a_gate_ca)?;
         drop(modulated_a_context);
+        take(&mut phases, "aca", &mut t);
 
 
         // ---- 3. Audio-to-Video / Video-to-Audio Cross-Attention ----
+        // The norm is shared between A2V and V2A on each side; modulation
+        // happens via fused_modulate per branch.
         let norm_a2v = rms_norm(&hidden_states, self.audio_to_video_norm_weight.as_ref(), self.eps)?;
         let norm_v2a = rms_norm(&audio_hidden_states, self.video_to_audio_norm_weight.as_ref(), self.eps)?;
+        take(&mut phases, "av_norm", &mut t);
 
         // Compute per-layer cross-attention modulation
         let (a2v_gate, v2a_gate, video_a2v_mod, video_v2a_mod, audio_a2v_mod, audio_v2a_mod) =
@@ -884,37 +984,75 @@ impl LTX2TransformerBlock {
                 temb_ca_gate, temb_ca_audio_gate,
                 b, video_dim, audio_dim,
             )?;
+        take(&mut phases, "av_params", &mut t);
 
-        // A2V: Q=video, KV=audio
-        let mod_video_a2v = norm_a2v.mul(&video_a2v_mod.0.add_scalar(1.0)?)?.add(&video_a2v_mod.1)?;
-        let mod_audio_a2v = norm_v2a.mul(&audio_a2v_mod.0.add_scalar(1.0)?)?.add(&audio_a2v_mod.1)?;
-
+        // A2V: Q=video (modulated by video_a2v scale/shift), KV=audio (modulated by audio_a2v).
+        //
+        // NOTE: video_a2v_mod / audio_a2v_mod scale/shift have shape `[B, 1, dim]`
+        // (broadcast across the token dimension), so we CANNOT use `fused_modulate`
+        // here — that kernel is plain elementwise and doesn't broadcast, it would
+        // read garbage past the end of scale/shift and produce NaN.  Use the
+        // broadcast-aware manual `mul + add` path.
+        let mod_video_a2v = norm_a2v
+            .mul(&video_a2v_mod.0.add_scalar(1.0)?)?
+            .add(&video_a2v_mod.1)?;
+        let mod_audio_a2v = norm_v2a
+            .mul(&audio_a2v_mod.0.add_scalar(1.0)?)?
+            .add(&audio_a2v_mod.1)?;
+        take(&mut phases, "a2v_mod", &mut t);
         let a2v_out = self.audio_to_video_attn.forward(
             &mod_video_a2v, Some(&mod_audio_a2v), None,
             ca_video_rotary_emb, ca_audio_rotary_emb,
         )?;
+        take(&mut phases, "a2v_attn", &mut t);
+        // a2v_gate is [B, 1, dim] broadcast — fused_residual_gate doesn't
+        // broadcast, so use manual mul+add (same as A2V/V2A modulation above).
         hidden_states = hidden_states.add(&a2v_out.mul(&a2v_gate)?)?;
+        drop(mod_video_a2v);
+        drop(mod_audio_a2v);
 
-        // V2A: Q=audio, KV=video
-        let mod_video_v2a = norm_a2v.mul(&video_v2a_mod.0.add_scalar(1.0)?)?.add(&video_v2a_mod.1)?;
-        let mod_audio_v2a = norm_v2a.mul(&audio_v2a_mod.0.add_scalar(1.0)?)?.add(&audio_v2a_mod.1)?;
-
+        // V2A: Q=audio (modulated by audio_v2a), KV=video (modulated by video_v2a)
+        let mod_video_v2a = norm_a2v
+            .mul(&video_v2a_mod.0.add_scalar(1.0)?)?
+            .add(&video_v2a_mod.1)?;
+        let mod_audio_v2a = norm_v2a
+            .mul(&audio_v2a_mod.0.add_scalar(1.0)?)?
+            .add(&audio_v2a_mod.1)?;
+        take(&mut phases, "v2a_mod", &mut t);
         let v2a_out = self.video_to_audio_attn.forward(
             &mod_audio_v2a, Some(&mod_video_v2a), None,
             ca_audio_rotary_emb, ca_video_rotary_emb,
         )?;
+        take(&mut phases, "v2a_attn", &mut t);
+        // v2a_gate is [B, 1, dim] broadcast — manual residual.
         audio_hidden_states = audio_hidden_states.add(&v2a_out.mul(&v2a_gate)?)?;
+        take(&mut phases, "av_tail", &mut t);
 
         // ---- 4. FeedForward ----
-        let norm_ff = rms_norm(&hidden_states, self.norm3_weight.as_ref(), self.eps)?;
-        let mod_ff = norm_ff.mul(&scale_mlp.add_scalar(1.0)?)?.add(&shift_mlp)?;
+        let mod_ff = if let Some(w) = self.norm3_weight.as_ref() {
+            fused_rms_norm_modulate(&hidden_states, w, &scale_mlp, &shift_mlp, self.eps)?
+        } else {
+            let norm_ff = rms_norm(&hidden_states, None, self.eps)?;
+            fused_modulate(&norm_ff, &scale_mlp, &shift_mlp)?
+        };
         let ff_out = self.ff.forward(&mod_ff)?;
-        hidden_states = hidden_states.add(&ff_out.mul(&gate_mlp)?)?;
+        hidden_states = fused_residual_gate(&hidden_states, &ff_out, &gate_mlp)?;
+        take(&mut phases, "vff", &mut t);
 
-        let norm_aff = rms_norm(&audio_hidden_states, self.audio_norm3_weight.as_ref(), self.eps)?;
-        let mod_aff = norm_aff.mul(&a_scale_mlp.add_scalar(1.0)?)?.add(&a_shift_mlp)?;
+        let mod_aff = if let Some(w) = self.audio_norm3_weight.as_ref() {
+            fused_rms_norm_modulate(&audio_hidden_states, w, &a_scale_mlp, &a_shift_mlp, self.eps)?
+        } else {
+            let norm_aff = rms_norm(&audio_hidden_states, None, self.eps)?;
+            fused_modulate(&norm_aff, &a_scale_mlp, &a_shift_mlp)?
+        };
         let aff_out = self.audio_ff.forward(&mod_aff)?;
-        audio_hidden_states = audio_hidden_states.add(&aff_out.mul(&a_gate_mlp)?)?;
+        audio_hidden_states = fused_residual_gate(&audio_hidden_states, &aff_out, &a_gate_mlp)?;
+        take(&mut phases, "aff", &mut t);
+
+        if prof {
+            let parts: Vec<String> = phases.iter().map(|(n, ms)| format!("{}={}ms", n, ms)).collect();
+            log::info!("[FWD-PROF] {}", parts.join(" "));
+        }
 
         Ok((hidden_states, audio_hidden_states))
     }
@@ -922,23 +1060,45 @@ impl LTX2TransformerBlock {
     /// Compute first 6 AdaLN-Zero modulation parameters from scale_shift_table + temb.
     /// Works with both [6, dim] and [9, dim] tables (only uses indices 0-5).
     /// Returns (shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp).
+    ///
+    /// Performance: the scale_shift_table is loaded as F32 (small, ~150 KB) by
+    /// the F32 cache.  The OLD path did `(F32 table + BF16 temb) -> F32 ada
+    /// [B, N, 6, dim] (~128 MB) -> to_dtype(BF16) -> [B, N, 6, dim] BF16
+    /// (~64 MB)`, which is ~190 MB allocated per call * 4 calls/block * 48
+    /// blocks * 8 steps ≈ 290 GB of cudaMallocAsync churn per stage 1.
+    /// Per-call cost: ~250–500 ms because the cudarc mempool can't recycle
+    /// fast enough on a 24 GB card.
+    ///
+    /// New path: cast the small table to BF16 (one tiny alloc), then do the
+    /// add in BF16.  Single ~64 MB BF16 allocation per call instead of two
+    /// large allocs and a round-trip cast.  ~10× faster on the same shapes.
     fn compute_ada_params_6(
         &self,
-        table: &Tensor,  // [6+, dim]
-        temb: &Tensor,   // [B, N, num_params*dim]
+        table: &Tensor,  // [6+, dim] possibly F32 from f32_cache
+        temb: &Tensor,   // [B, N, num_params*dim] BF16
         batch_size: usize,
         dim: usize,
     ) -> Result<(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)> {
         let num_tokens = temb.shape().dims()[1];
 
+        // Cast table to BF16 if needed (small alloc on a [9, dim] tensor, cheap).
+        let table_bf16;
+        let table_ref = if table.dtype() == DType::BF16 {
+            table
+        } else {
+            table_bf16 = table.to_dtype(DType::BF16)?;
+            &table_bf16
+        };
+
         // Extract first 6 rows from table
-        let table_6 = table.narrow(0, 0, 6)?; // [6, dim]
+        let table_6 = table_ref.narrow(0, 0, 6)?; // [6, dim]
         let table_bc = table_6.unsqueeze(0)?.unsqueeze(0)?; // [1, 1, 6, dim]
 
         // Extract first 6*dim from temb
         let temb_6 = temb.narrow(2, 0, 6 * dim)?; // [B, N, 6*dim]
         let temb_4d = temb_6.reshape(&[batch_size, num_tokens, 6, dim])?;
-        let ada = table_bc.add(&temb_4d)?.to_dtype(DType::BF16)?; // [B, N, 6, dim]
+        // Single BF16 alloc, no F32 round-trip.
+        let ada = table_bc.add(&temb_4d)?; // [B, N, 6, dim] BF16
 
         let shift_msa = ada.narrow(2, 0, 1)?.squeeze_dim(2)?;
         let scale_msa = ada.narrow(2, 1, 1)?.squeeze_dim(2)?;
@@ -952,23 +1112,32 @@ impl LTX2TransformerBlock {
 
     /// Compute cross-attention adaln params from indices 6-8 of a [9, dim] table.
     /// Returns (shift_ca_q, scale_ca_q, gate_ca).
+    /// Same BF16-throughout treatment as `compute_ada_params_6`.
     fn compute_ada_params_ca(
         &self,
-        table: &Tensor,  // [9, dim]
-        temb: &Tensor,   // [B, N, 9*dim]
+        table: &Tensor,  // [9, dim] possibly F32
+        temb: &Tensor,   // [B, N, 9*dim] BF16
         batch_size: usize,
         dim: usize,
     ) -> Result<(Tensor, Tensor, Tensor)> {
         let num_tokens = temb.shape().dims()[1];
 
+        let table_bf16;
+        let table_ref = if table.dtype() == DType::BF16 {
+            table
+        } else {
+            table_bf16 = table.to_dtype(DType::BF16)?;
+            &table_bf16
+        };
+
         // Extract rows 6-8 from table
-        let table_ca = table.narrow(0, 6, 3)?; // [3, dim]
+        let table_ca = table_ref.narrow(0, 6, 3)?; // [3, dim]
         let table_bc = table_ca.unsqueeze(0)?.unsqueeze(0)?; // [1, 1, 3, dim]
 
         // Extract last 3*dim from temb
         let temb_ca = temb.narrow(2, 6 * dim, 3 * dim)?; // [B, N, 3*dim]
         let temb_4d = temb_ca.reshape(&[batch_size, num_tokens, 3, dim])?;
-        let ada = table_bc.add(&temb_4d)?.to_dtype(DType::BF16)?; // [B, N, 3, dim]
+        let ada = table_bc.add(&temb_4d)?; // [B, N, 3, dim] BF16
 
         let shift_ca_q = ada.narrow(2, 0, 1)?.squeeze_dim(2)?;
         let scale_ca_q = ada.narrow(2, 1, 1)?.squeeze_dim(2)?;
@@ -999,41 +1168,61 @@ impl LTX2TransformerBlock {
         (Tensor, Tensor),       // (audio_a2v_scale, audio_a2v_shift)
         (Tensor, Tensor),       // (audio_v2a_scale, audio_v2a_shift)
     )> {
-        // Video per-layer: first 4 rows = scale/shift, 5th row = gate contribution
-        let v_table_ss = self.video_a2v_cross_attn_scale_shift_table.narrow(0, 0, 4)?; // [4, dim]
-        let v_table_gate = self.video_a2v_cross_attn_scale_shift_table.narrow(0, 4, 1)?; // [1, dim]
+        // Video per-layer: first 4 rows = scale/shift, 5th row = gate contribution.
+        //
+        // Performance: BOTH operands of `add` MUST be the same rank. The
+        // OLD path mixed 3D `[1, 4, dim]` (from `unsqueeze(0)` on `[4, dim]`)
+        // with 4D `[B, 1, 4, dim]` (from temb reshape).  flame-core's
+        // mixed-rank broadcast falls back to a slow generic path that took
+        // ~600 ms per add * 4 adds = ~2.5 SECONDS per call * 48 blocks * 8
+        // steps ≈ 16 minutes per stage 1.  Aligning to 4D up front routes
+        // through the fast same-rank broadcast.
+        //
+        // Also pre-cast tables to BF16 once (small allocs, ~1 KB each).
+        let v_full_table = if self.video_a2v_cross_attn_scale_shift_table.dtype() == DType::BF16 {
+            self.video_a2v_cross_attn_scale_shift_table.clone()
+        } else {
+            self.video_a2v_cross_attn_scale_shift_table.to_dtype(DType::BF16)?
+        };
+        let a_full_table = if self.audio_a2v_cross_attn_scale_shift_table.dtype() == DType::BF16 {
+            self.audio_a2v_cross_attn_scale_shift_table.clone()
+        } else {
+            self.audio_a2v_cross_attn_scale_shift_table.to_dtype(DType::BF16)?
+        };
 
-        // Combine global + per-layer video cross-attn scale/shift
-        let v_ss_bc = v_table_ss.unsqueeze(0)?; // [1, 4, dim]
-        let temb_ss_4d = temb_ca_ss.reshape(&[b, 1, 4, video_dim])?;
-        let v_combined = v_ss_bc.to_dtype(temb_ss_4d.dtype())?.add(&temb_ss_4d)?;
+        let v_table_ss = v_full_table.narrow(0, 0, 4)?; // [4, dim]
+        let v_table_gate = v_full_table.narrow(0, 4, 1)?; // [1, dim]
+        let a_table_ss = a_full_table.narrow(0, 0, 4)?;
+        let a_table_gate = a_full_table.narrow(0, 4, 1)?;
+
+        // Combine global + per-layer video cross-attn scale/shift.  Rank-aligned.
+        let v_ss_bc = v_table_ss.unsqueeze(0)?.unsqueeze(0)?; // [1, 1, 4, dim] (4D)
+        let temb_ss_4d = temb_ca_ss.reshape(&[b, 1, 4, video_dim])?; // [B, 1, 4, dim] (4D)
+        let v_combined = v_ss_bc.add(&temb_ss_4d)?;
 
         let video_a2v_scale = v_combined.narrow(2, 0, 1)?.squeeze_dim(2)?;
         let video_a2v_shift = v_combined.narrow(2, 1, 1)?.squeeze_dim(2)?;
         let video_v2a_scale = v_combined.narrow(2, 2, 1)?.squeeze_dim(2)?;
         let video_v2a_shift = v_combined.narrow(2, 3, 1)?.squeeze_dim(2)?;
 
-        // a2v gate: per_layer + global
-        let v_gate_bc = v_table_gate.unsqueeze(0)?;
-        let temb_gate_4d = temb_ca_gate.reshape(&[b, 1, 1, video_dim])?;
-        let a2v_gate = v_gate_bc.to_dtype(temb_gate_4d.dtype())?.add(&temb_gate_4d)?.squeeze_dim(2)?;
+        // a2v gate: per_layer + global.  Same rank-alignment fix.
+        let v_gate_bc = v_table_gate.unsqueeze(0)?.unsqueeze(0)?; // [1, 1, 1, dim] (4D)
+        let temb_gate_4d = temb_ca_gate.reshape(&[b, 1, 1, video_dim])?; // [B, 1, 1, dim] (4D)
+        let a2v_gate = v_gate_bc.add(&temb_gate_4d)?.squeeze_dim(2)?;
 
         // Audio per-layer
-        let a_table_ss = self.audio_a2v_cross_attn_scale_shift_table.narrow(0, 0, 4)?;
-        let a_table_gate = self.audio_a2v_cross_attn_scale_shift_table.narrow(0, 4, 1)?;
-
-        let a_ss_bc = a_table_ss.unsqueeze(0)?;
+        let a_ss_bc = a_table_ss.unsqueeze(0)?.unsqueeze(0)?; // [1, 1, 4, dim]
         let temb_a_ss_4d = temb_ca_audio_ss.reshape(&[b, 1, 4, audio_dim])?;
-        let a_combined = a_ss_bc.to_dtype(temb_a_ss_4d.dtype())?.add(&temb_a_ss_4d)?;
+        let a_combined = a_ss_bc.add(&temb_a_ss_4d)?;
 
         let audio_a2v_scale = a_combined.narrow(2, 0, 1)?.squeeze_dim(2)?;
         let audio_a2v_shift = a_combined.narrow(2, 1, 1)?.squeeze_dim(2)?;
         let audio_v2a_scale = a_combined.narrow(2, 2, 1)?.squeeze_dim(2)?;
         let audio_v2a_shift = a_combined.narrow(2, 3, 1)?.squeeze_dim(2)?;
 
-        let a_gate_bc = a_table_gate.unsqueeze(0)?;
+        let a_gate_bc = a_table_gate.unsqueeze(0)?.unsqueeze(0)?; // [1, 1, 1, dim]
         let temb_a_gate_4d = temb_ca_audio_gate.reshape(&[b, 1, 1, audio_dim])?;
-        let v2a_gate = a_gate_bc.to_dtype(temb_a_gate_4d.dtype())?.add(&temb_a_gate_4d)?.squeeze_dim(2)?;
+        let v2a_gate = a_gate_bc.add(&temb_a_gate_4d)?.squeeze_dim(2)?;
 
         Ok((
             a2v_gate, v2a_gate,
@@ -3381,10 +3570,14 @@ impl LTX2StreamingModel {
 
             swap.prefetch(0)
                 .map_err(|e| flame_core::Error::Io(format!("prefetch: {e}")))?;
+            let prof = std::env::var("LTX2_BLOCK_PROF").is_ok();
             for i in 0..num_layers {
                 let t_block = std::time::Instant::now();
                 let raw_weights = swap.await_block(i)
                     .map_err(|e| flame_core::Error::Io(format!("await_block: {e}")))?;
+                if prof { let _ = device.synchronize(); }
+                let t_after_await = t_block.elapsed().as_millis();
+
                 if i + 1 < num_layers {
                     swap.prefetch(i + 1)
                         .map_err(|e| flame_core::Error::Io(format!("prefetch: {e}")))?;
@@ -3402,6 +3595,9 @@ impl LTX2StreamingModel {
                     }
                 }
                 let block = Self::load_block_from_weights_static(&config_clone, i, block_weights)?;
+                if prof { let _ = device.synchronize(); }
+                let t_after_build = t_block.elapsed().as_millis();
+
                 let (new_hs, new_ahs) = block.forward(
                     &hs, &ahs,
                     &enc_hs, &audio_enc_hs,
@@ -3416,12 +3612,19 @@ impl LTX2StreamingModel {
                     video_prompt_ts.as_ref(),
                     audio_prompt_ts.as_ref(),
                 )?;
+                if prof { let _ = device.synchronize(); }
+                let t_after_forward = t_block.elapsed().as_millis();
+
                 hs = new_hs;
                 ahs = new_ahs;
                 drop(block);
-                if (i + 1) % 12 == 0 || i + 1 == num_layers || i == 0 {
-                    log::info!("[LTX2] AV Block {}/{}: {}ms",
-                        i + 1, num_layers, t_block.elapsed().as_millis());
+                if prof || (i + 1) % 12 == 0 || i + 1 == num_layers || i == 0 {
+                    log::info!("[LTX2] AV Block {}/{}: total={}ms (await={}ms, build={}ms, forward={}ms)",
+                        i + 1, num_layers,
+                        t_block.elapsed().as_millis(),
+                        t_after_await,
+                        t_after_build - t_after_await,
+                        t_after_forward - t_after_build);
                 }
             }
         } else {
