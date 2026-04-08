@@ -594,6 +594,8 @@ impl LTX2Attention {
         let k = if let Some((cos, sin)) = key_rope.or(query_rope) {
             apply_rotary_emb(&k_normed, cos, sin)?
         } else { k_normed.clone() };
+        let q_post_rope_clone = q.clone();
+        let k_post_rope_clone = k.clone();
 
         let q_dims = q.shape().dims().to_vec();
         let (b, s_q) = (q_dims[0], q_dims[1]);
@@ -605,18 +607,22 @@ impl LTX2Attention {
         let v_4d = v_raw.reshape(&[b, s_kv, self.num_heads, self.head_dim])?.permute(&[0, 2, 1, 3])?;
 
         let attn_out_raw = flame_core::sdpa::forward(&q_4d, &k_4d, &v_4d, attention_mask)?;
+        let sdpa_out_clone = attn_out_raw.clone();
         let attn_out = attn_out_raw.permute(&[0, 2, 1, 3])?;
+        let post_permute_clone = attn_out.clone();
         let inner_dim = self.num_heads * self.head_dim;
 
-        let (gated, gate_logits_dump): (Tensor, Option<Tensor>) =
+        let (gated, gate_logits_dump, post_mul_dump): (Tensor, Option<Tensor>, Option<Tensor>) =
             if let (Some(gate_w), Some(gate_b)) = (&self.to_gate_logits_weight, &self.to_gate_logits_bias) {
                 let gate_logits = linear3d(hidden_states, gate_w, Some(gate_b))?;
                 let gates = gate_logits.sigmoid()?.mul_scalar(2.0)?;
                 let gates_4d = gates.unsqueeze(3)?;
-                let gated = attn_out.mul(&gates_4d)?.reshape(&[b, s_q, inner_dim])?;
-                (gated, Some(gate_logits))
+                let post_mul = attn_out.mul(&gates_4d)?;
+                let post_mul_clone = post_mul.clone();
+                let gated = post_mul.reshape(&[b, s_q, inner_dim])?;
+                (gated, Some(gate_logits), Some(post_mul_clone))
             } else {
-                (attn_out.reshape(&[b, s_q, inner_dim])?, None)
+                (attn_out.reshape(&[b, s_q, inner_dim])?, None, None)
             };
 
         let out = linear3d(&gated, &self.to_out_weight, Some(&self.to_out_bias))?;
@@ -627,6 +633,13 @@ impl LTX2Attention {
             dump.insert(format!("{dump_prefix}_to_v_out"), v_raw);
             dump.insert(format!("{dump_prefix}_q_norm_out"), q_normed);
             dump.insert(format!("{dump_prefix}_k_norm_out"), k_normed);
+            dump.insert(format!("{dump_prefix}_q_post_rope"), q_post_rope_clone);
+            dump.insert(format!("{dump_prefix}_k_post_rope"), k_post_rope_clone);
+            dump.insert(format!("{dump_prefix}_sdpa_raw"), sdpa_out_clone);
+            dump.insert(format!("{dump_prefix}_post_permute"), post_permute_clone);
+            if let Some(pm) = post_mul_dump {
+                dump.insert(format!("{dump_prefix}_post_mul"), pm);
+            }
             dump.insert(format!("{dump_prefix}_to_out_in"), gated);
             dump.insert(format!("{dump_prefix}_to_out_out"), out.clone());
             if let Some(gl) = gate_logits_dump {
@@ -977,7 +990,16 @@ impl LTX2TransformerBlock {
             let norm_a = rms_norm(audio_hidden_states, None, self.eps)?;
             fused_modulate(&norm_a, &a_scale_msa, &a_shift_msa)?
         };
-        let attn_a_out = self.audio_attn1.forward(&mod_a, None, None, audio_rotary_emb, None)?;
+        let attn_a_out = if dump_intermediates {
+            self.audio_attn1.forward_dump(
+                &mod_a, None, None,
+                audio_rotary_emb, None,
+                Some(&mut intermediate_dump),
+                "dump_asa",
+            )?
+        } else {
+            self.audio_attn1.forward(&mod_a, None, None, audio_rotary_emb, None)?
+        };
         if dump_intermediates {
             intermediate_dump.insert("dump_asa_attn_out".into(), attn_a_out.clone());
             intermediate_dump.insert("dump_mod_a_input".into(), mod_a.clone());
@@ -2083,32 +2105,58 @@ fn build_audio_coords(
     audio_frames: usize,
     _audio_freq: usize,
     audio_scale_factor: usize,
-    vae_temporal_scale: usize,
+    _vae_temporal_scale: usize,
     causal_offset: usize,
-    frame_rate: f32,
+    _frame_rate: f32,
     device: std::sync::Arc<flame_core::CudaDevice>,
 ) -> Result<Tensor> {
-    // Audio has 1 token per temporal frame (mel bins are flattened into channels).
+    // Audio temporal coords match Python's
+    // `AudioPatchifier._get_audio_latent_time_in_sec` from
+    // ltx_core/components/patchifiers.py:
+    //
+    //   audio_mel_frame = latent_index * audio_latent_downsample_factor
+    //   if is_causal:
+    //       audio_mel_frame = max(0, audio_mel_frame + 1 - audio_latent_downsample_factor)
+    //   time_in_sec = audio_mel_frame * hop_length / sample_rate
+    //
+    // Constants:
+    //   audio_latent_downsample_factor = audio_scale_factor (= 4)
+    //   hop_length = 160
+    //   sample_rate = 16000
+    //   → mel_to_sec_divisor = sample_rate / hop_length = 100
+    //
+    // The previous Rust formula was wrong: it used
+    //   scale = audio_scale_factor * vae_temporal_scale (= 32)
+    //   subtract = vae_temporal_scale (= 8)
+    //   divisor = frame_rate (= 25)
+    // which produced positions ~32× larger than Python's, giving the wrong
+    // audio RoPE cos/sin and the audio "2.4× too hot" symptom.
+    //
+    // Verified against Python's audio_indices_grid: token 0 = [0.0, 0.01],
+    // token 1 = [0.01, 0.05], token 256 = [10.21, 10.25].
+    const AUDIO_HOP_LENGTH: f32 = 160.0;
+    const AUDIO_SAMPLE_RATE: f32 = 16000.0;
+    let mel_to_sec_divisor = AUDIO_SAMPLE_RATE / AUDIO_HOP_LENGTH; // = 100.0
+
     let num_tokens = audio_frames;
     let mut coords_data = vec![0.0f32; batch_size * 1 * num_tokens * 2];
+
+    let scale = audio_scale_factor as f32;
 
     for b in 0..batch_size {
         for t in 0..audio_frames {
             let base = b * 1 * num_tokens * 2;
 
-            // Audio temporal coords: scaled by audio_scale_factor * vae_temporal_scale
-            let scale = (audio_scale_factor * vae_temporal_scale) as f32;
-            let t_start = t as f32 * scale;
-            let t_end = (t + 1) as f32 * scale;
+            let mel_start = t as f32 * scale;
+            let mel_end = (t + 1) as f32 * scale;
 
-            // Causal fix
-            let vae_t = vae_temporal_scale as f32;
-            let t_start_causal = (t_start + causal_offset as f32 - vae_t).max(0.0);
-            let t_end_causal = (t_end + causal_offset as f32 - vae_t).max(0.0);
+            // Causal: subtract audio_scale_factor (= audio_latent_downsample_factor)
+            let mel_start_causal = (mel_start + causal_offset as f32 - scale).max(0.0);
+            let mel_end_causal = (mel_end + causal_offset as f32 - scale).max(0.0);
 
-            // Frame-rate scaling
-            let t_start_scaled = t_start_causal / frame_rate;
-            let t_end_scaled = t_end_causal / frame_rate;
+            // Convert mel-frame index to seconds
+            let t_start_scaled = mel_start_causal / mel_to_sec_divisor;
+            let t_end_scaled = mel_end_causal / mel_to_sec_divisor;
 
             coords_data[base + t * 2] = t_start_scaled;
             coords_data[base + t * 2 + 1] = t_end_scaled;

@@ -162,6 +162,17 @@ fn main() -> anyhow::Result<()> {
     drop(audio_noise);
     stats("audio_x (after noise injection)", &audio_x)?;
 
+    // FLAME_DUMP_AUDIO_STEPS=1 — collect audio_x after every Euler step into
+    // output/rust_audio_step_trace.safetensors. Used by the audio-bug bisect
+    // protocol: compare per-step against Python's trace to find the first
+    // divergent step (matched-noise scenario via LTX2_NOISE_FILE).
+    let dump_audio_steps = std::env::var("FLAME_DUMP_AUDIO_STEPS").is_ok();
+    let mut audio_step_trace: HashMap<String, Tensor> = HashMap::new();
+    if dump_audio_steps {
+        audio_step_trace.insert("audio_x_init".to_string(), audio_x.clone());
+        println!("  [audio step trace] init captured (audio_x post-noise)");
+    }
+
     // --- 3-step denoise loop ---
     for step in 0..s2_steps {
         let sigma = s2_sigmas[step];
@@ -196,9 +207,23 @@ fn main() -> anyhow::Result<()> {
             .add(&audio_vel.to_dtype(DType::F32)?.mul_scalar(dt)?)?
             .to_dtype(audio_dtype)?;
 
+        if dump_audio_steps {
+            audio_step_trace.insert(format!("audio_x_after_step_{step:02}"), audio_x.clone());
+        }
+
         print!("  step {}/{} sigma={:.4} dt={:.1}s ",
             step + 1, s2_steps, sigma, t_step.elapsed().as_secs_f32());
         stats("after step", &video_x)?;
+    }
+
+    if dump_audio_steps {
+        let trace_path = format!("{OUTPUT_DIR}/rust_audio_step_trace.safetensors");
+        flame_core::serialization::save_tensors(
+            &audio_step_trace,
+            std::path::Path::new(&trace_path),
+            flame_core::serialization::SerializationFormat::SafeTensors,
+        )?;
+        println!("  [audio step trace] saved {} keys to {trace_path}", audio_step_trace.len());
     }
 
     println!("\n--- Final ---");
