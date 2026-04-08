@@ -189,8 +189,22 @@ struct SpatialResampler {
 
 impl SpatialResampler {
     fn load(weights: &Weights, prefix: &str) -> Result<Self> {
-        let conv_weight = get_weight_bf16(weights, &format!("{prefix}.conv.weight"))?;
-        let conv_bias = get_weight_bf16(weights, &format!("{prefix}.conv.bias"))?;
+        // The official Lightricks upsampler
+        // (`ltx-2.3-spatial-upscaler-x2-1.0.safetensors`) uses
+        // `upsampler.0.{weight,bias}` from a `torch.nn.Sequential(Conv2d, PixelShuffle)`.
+        // The diffusers copy uses `upsampler.conv.{weight,bias}` but its
+        // trained values diverge from the Lightricks file and are wrong for
+        // LTX-2.3. Try the Sequential naming first.
+        let (conv_weight, conv_bias) = match (
+            weights.get(&format!("{prefix}.0.weight")),
+            weights.get(&format!("{prefix}.0.bias")),
+        ) {
+            (Some(w), Some(b)) => (w.to_dtype(DType::BF16)?, b.to_dtype(DType::BF16)?),
+            _ => (
+                get_weight_bf16(weights, &format!("{prefix}.conv.weight"))?,
+                get_weight_bf16(weights, &format!("{prefix}.conv.bias"))?,
+            ),
+        };
         Ok(Self {
             conv_weight,
             conv_bias,
@@ -201,12 +215,21 @@ impl SpatialResampler {
     ///
     /// Input:  [B, 1024, F, H, W]
     /// Output: [B, 1024, F, H*2, W*2]
+    ///
+    /// Mirrors the einops in Python's `LatentUpsampler.forward` for the
+    /// `rational_resampler=False` 3D case:
+    ///     "b c f h w -> (b f) c h w"  →  Conv2d + PixelShuffle  →
+    ///     "(b f) c h w -> b c f h w"
+    /// This requires permute+reshape both ways — a bare `reshape` on a
+    /// [B, C, F, H, W] tensor to [B*F, C, H, W] is **wrong** because B and
+    /// F are not adjacent in memory (C sits between them), so the resulting
+    /// buffer would interleave frames with channels.
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let dims = x.shape().dims().to_vec();
         let (b, c, f, h, w) = (dims[0], dims[1], dims[2], dims[3], dims[4]);
 
-        // [B, C, F, H, W] → [B*F, C, H, W]
-        let x_2d = x.reshape(&[b * f, c, h, w])?;
+        // [B, C, F, H, W] → [B, F, C, H, W] → [B*F, C, H, W]
+        let x_2d = x.permute(&[0, 2, 1, 3, 4])?.reshape(&[b * f, c, h, w])?;
 
         // Conv2d(1024 → 4096, k=3, p=1)
         let x_conv = cudnn_conv2d_bf16(
@@ -223,8 +246,10 @@ impl SpatialResampler {
 
         // BlurDown with stride=1 is identity — skip
 
-        // [B*F, C, H*2, W*2] → [B, C, F, H*2, W*2]
-        x_up.reshape(&[b, c, f, h * PIXEL_SHUFFLE_FACTOR, w * PIXEL_SHUFFLE_FACTOR])
+        // [B*F, C, H*2, W*2] → [B, F, C, H*2, W*2] → [B, C, F, H*2, W*2]
+        let h2 = h * PIXEL_SHUFFLE_FACTOR;
+        let w2 = w * PIXEL_SHUFFLE_FACTOR;
+        x_up.reshape(&[b, f, c, h2, w2])?.permute(&[0, 2, 1, 3, 4])
     }
 }
 
@@ -300,8 +325,13 @@ impl LTX2LatentUpsampler {
     /// Input:  `[B, 128, F, H, W]`
     /// Output: `[B, 128, F, H*2, W*2]`
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let dump = std::env::var("LTX2_UPSAMPLER_DUMP").is_ok();
+        let mut dumps: std::collections::HashMap<String, Tensor> = std::collections::HashMap::new();
+        if dump { dumps.insert("input".to_string(), x.clone()); }
+
         // initial_conv → initial_norm → SiLU
         let mut h = self.initial_conv.forward(x)?;
+        if dump { dumps.insert("after_initial_conv".to_string(), h.clone()); }
         h = group_norm_5d(
             &h,
             NUM_GROUPS,
@@ -309,23 +339,42 @@ impl LTX2LatentUpsampler {
             &self.initial_norm_bias,
             1e-5,
         )?;
+        if dump { dumps.insert("after_initial_norm".to_string(), h.clone()); }
         h = h.silu()?;
+        if dump { dumps.insert("after_initial_silu".to_string(), h.clone()); }
 
         // 4× ResBlock (pre-upsample)
-        for block in &self.res_blocks {
+        for (i, block) in self.res_blocks.iter().enumerate() {
             h = block.forward(&h)?;
+            if dump { dumps.insert(format!("after_res_block_{i}"), h.clone()); }
         }
 
         // Spatial 2x upsample
         h = self.resampler.forward(&h)?;
+        if dump { dumps.insert("after_resampler".to_string(), h.clone()); }
 
         // 4× ResBlock (post-upsample)
-        for block in &self.post_res_blocks {
+        for (i, block) in self.post_res_blocks.iter().enumerate() {
             h = block.forward(&h)?;
+            if dump { dumps.insert(format!("after_post_res_block_{i}"), h.clone()); }
         }
 
         // final_conv: 1024 → 128
-        self.final_conv.forward(&h)
+        let out = self.final_conv.forward(&h)?;
+        if dump { dumps.insert("final".to_string(), out.clone()); }
+
+        if dump {
+            let path = std::env::var("LTX2_UPSAMPLER_DUMP_PATH")
+                .unwrap_or_else(|_| "/home/alex/EriDiffusion/inference-flame/output/rust_upsampler_intermediates.safetensors".to_string());
+            flame_core::serialization::save_tensors(
+                &dumps,
+                std::path::Path::new(&path),
+                flame_core::serialization::SerializationFormat::SafeTensors,
+            )?;
+            log::info!("[UpsamplerDump] wrote {} tensors to {}", dumps.len(), path);
+        }
+
+        Ok(out)
     }
 }
 

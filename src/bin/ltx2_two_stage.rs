@@ -33,10 +33,22 @@ const MODEL_PATH: &str =
     "/home/alex/.serenity/models/checkpoints/ltx-2.3-22b-distilled.safetensors";
 const GEMMA_ROOT: &str = "/home/alex/.serenity/models/text_encoders/gemma-3-12b-it-standalone";
 const LTX_CHECKPOINT: &str = "/home/alex/.serenity/models/checkpoints/ltx-2.3-22b-dev.safetensors";
+// IMPORTANT: use the Lightricks official upsampler, not the diffusers copy.
+// The diffusers file (`ltx2-diffusers/latent_upsampler/`) uses a *different*
+// set of weights (max |diff| ~0.8 on `upsampler.conv.weight`) — likely from
+// an older LTX-2 release — and produces completely wrong upscaled latents.
+// The official Python DistilledPipeline uses this file by default.
 const UPSAMPLER_PATH: &str =
-    "/home/alex/.serenity/models/checkpoints/ltx2-diffusers/latent_upsampler/diffusion_pytorch_model.safetensors";
+    "/home/alex/.serenity/models/checkpoints/ltx-2.3-spatial-upscaler-x2-1.0.safetensors";
+// Python's `upsample_video()` calls
+// `encoder.per_channel_statistics.un_normalize(latent)` where
+// `encoder` is built from the DISTILLED checkpoint and reads
+// `vae.per_channel_statistics.{mean,std}-of-means`. The diffusers VAE
+// `latents_mean`/`latents_std` are *different* numbers (max diff ~0.79) and
+// produce a different un-normalized latent — which caused stage 2 to collapse.
+// Load the distilled stats directly instead.
 const VAE_PATH: &str =
-    "/home/alex/.serenity/models/checkpoints/ltx2-diffusers/vae/diffusion_pytorch_model.safetensors";
+    "/home/alex/.serenity/models/checkpoints/ltx-2.3-22b-distilled.safetensors";
 
 const OUTPUT_DIR: &str = "/home/alex/EriDiffusion/inference-flame/output";
 
@@ -321,12 +333,13 @@ fn main() -> anyhow::Result<()> {
 
     let vae_weights = flame_core::serialization::load_file_filtered(
         std::path::Path::new(VAE_PATH), &device,
-        |key| key == "latents_mean" || key == "latents_std",
+        |key| key == "vae.per_channel_statistics.mean-of-means"
+            || key == "vae.per_channel_statistics.std-of-means",
     )?;
-    let latents_mean = vae_weights.get("latents_mean")
-        .ok_or_else(|| anyhow::anyhow!("Missing latents_mean"))?;
-    let latents_std = vae_weights.get("latents_std")
-        .ok_or_else(|| anyhow::anyhow!("Missing latents_std"))?;
+    let latents_mean = vae_weights.get("vae.per_channel_statistics.mean-of-means")
+        .ok_or_else(|| anyhow::anyhow!("Missing vae.per_channel_statistics.mean-of-means in distilled checkpoint"))?;
+    let latents_std = vae_weights.get("vae.per_channel_statistics.std-of-means")
+        .ok_or_else(|| anyhow::anyhow!("Missing vae.per_channel_statistics.std-of-means in distilled checkpoint"))?;
 
     // Un-normalize: x * std + mean
     let mean_5d = latents_mean.reshape(&[1, LATENT_CHANNELS, 1, 1, 1])?;
@@ -341,6 +354,19 @@ fn main() -> anyhow::Result<()> {
     drop(upsampler);
     drop(video_unnorm);
     println!("  Upscaled: {:?} in {:.1}s", video_upscaled.shape().dims(), t0.elapsed().as_secs_f32());
+
+    // Debug: dump upscaled latent (post-upsampler, pre re-normalize) so it can
+    // be diffed against Python's `output/python_upscaled_from_rust.safetensors`.
+    if std::env::var("LTX2_DUMP_UPSCALED").is_ok() {
+        let mut up = HashMap::new();
+        up.insert("latents".to_string(), video_upscaled.clone());
+        flame_core::serialization::save_tensors(
+            &up,
+            std::path::Path::new("/home/alex/EriDiffusion/inference-flame/output/rust_upscaled_from_rust.safetensors"),
+            flame_core::serialization::SerializationFormat::SafeTensors,
+        )?;
+        println!("  [LTX2_DUMP_UPSCALED] saved upscaled latent");
+    }
 
     // Re-normalize: (x - mean) / std
     let s2_mean = latents_mean.reshape(&[1, LATENT_CHANNELS, 1, 1, 1])?;
