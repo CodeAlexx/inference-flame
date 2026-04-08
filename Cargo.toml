@@ -34,6 +34,22 @@ name = "chroma_infer"
 path = "src/bin/chroma_infer.rs"
 
 [[bin]]
+name = "chroma_encode"
+path = "src/bin/chroma_encode.rs"
+
+[[bin]]
+name = "chroma_gen"
+path = "src/bin/chroma_gen.rs"
+
+[[bin]]
+name = "qwenimage_gen"
+path = "src/bin/qwenimage_gen.rs"
+
+[[bin]]
+name = "qwenimage_edit_gen"
+path = "src/bin/qwenimage_edit_gen.rs"
+
+[[bin]]
 name = "zimage_infer"
 path = "src/bin/zimage_infer.rs"
 

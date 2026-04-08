@@ -67,6 +67,14 @@ const T5_SEQ_LEN: usize = 512;
 // ---------------------------------------------------------------------------
 
 fn main() -> anyhow::Result<()> {
+    eprintln!("WARNING: chroma_infer loads T5 + DiT in the same process and");
+    eprintln!("         will OOM on a 24 GB GPU (T5 ~10 GB + DiT ~17 GB > 24 GB).");
+    eprintln!("         Use chroma_encode + chroma_gen (two-stage) instead.");
+    eprintln!();
+    if std::env::var("CHROMA_INFER_FORCE").as_deref() != Ok("1") {
+        eprintln!("Set CHROMA_INFER_FORCE=1 to override this check.");
+        std::process::exit(2);
+    }
     env_logger::init();
     let t_total = Instant::now();
     let device = global_cuda_device();
@@ -184,38 +192,42 @@ fn main() -> anyhow::Result<()> {
         let t_next = timesteps[step + 1];
         let dt = t_next - t_curr;
 
-        let t_vec = Tensor::from_vec(
-            vec![t_curr],
-            Shape::from_dims(&[1]),
-            device.clone(),
-        )?
-        .to_dtype(DType::BF16)?;
+        // Scoped block: every per-step temporary drops at the closing `}`
+        // BEFORE the next iteration's allocations happen. Prevents VRAM
+        // accumulation across denoise steps.
+        let next_x = {
+            let t_vec = Tensor::from_vec(
+                vec![t_curr],
+                Shape::from_dims(&[1]),
+                device.clone(),
+            )?
+            .to_dtype(DType::BF16)?;
 
-        // cond forward
-        let cond_pred = dit.forward(
-            &x,
-            &t5_cond_hidden,
-            &t_vec,
-            &img_ids,
-            &txt_ids,
-        )?;
-        // uncond forward
-        let uncond_pred = dit.forward(
-            &x,
-            &t5_uncond_hidden,
-            &t_vec,
-            &img_ids,
-            &txt_ids,
-        )?;
+            let cond_pred = dit.forward(
+                &x,
+                &t5_cond_hidden,
+                &t_vec,
+                &img_ids,
+                &txt_ids,
+            )?;
+            let uncond_pred = dit.forward(
+                &x,
+                &t5_uncond_hidden,
+                &t_vec,
+                &img_ids,
+                &txt_ids,
+            )?;
 
-        // CFG: noise = uncond + scale * (cond - uncond)
-        let diff = cond_pred.sub(&uncond_pred)?;
-        let scaled = diff.mul_scalar(GUIDANCE_SCALE)?;
-        let pred = uncond_pred.add(&scaled)?;
+            // CFG: noise = uncond + scale * (cond - uncond)
+            let diff = cond_pred.sub(&uncond_pred)?;
+            let scaled = diff.mul_scalar(GUIDANCE_SCALE)?;
+            let pred = uncond_pred.add(&scaled)?;
 
-        // Euler step: x = x + dt * pred
-        let step_tensor = pred.mul_scalar(dt)?;
-        x = x.add(&step_tensor)?;
+            // Euler step: x_next = x + dt * pred
+            let step_tensor = pred.mul_scalar(dt)?;
+            x.add(&step_tensor)?
+        };
+        x = next_x;
 
         if (step + 1) % 5 == 0 || step == 0 || step + 1 == NUM_STEPS {
             log::info!("[Chroma] step {}/{} t={:.4}", step + 1, NUM_STEPS, t_curr);
