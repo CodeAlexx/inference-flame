@@ -38,7 +38,7 @@
 //! SnakeBeta: `x + (1/(exp(beta) + eps)) * sin²(exp(alpha) * x)`
 //! alpha, beta are both per-channel and log-scale.
 
-use flame_core::conv1d::{conv1d, conv1d_grouped, conv_transpose1d};
+use flame_core::conv1d::{conv1d, conv1d_grouped};
 use flame_core::{serialization, CudaDevice, DType, Error, Result, Shape, Tensor};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -88,26 +88,36 @@ fn get(weights: &Weights, key: &str) -> Result<Tensor> {
 }
 
 /// Replicate-pad along the last (length) axis of `[B, C, L]`.
+///
+/// Uses `Tensor::expand` (broadcast view, no kernel launch) for the border
+/// replicas so the whole thing becomes `narrow + expand + narrow + expand
+/// + cat` — down from 5 full ops to 1 kernel-launching op (the cat).
 fn replicate_pad1d(x: &Tensor, pad_left: usize, pad_right: usize) -> Result<Tensor> {
     let d = x.shape().dims();
     let (b, c, l) = (d[0], d[1], d[2]);
     if pad_left == 0 && pad_right == 0 {
         return Ok(x.clone());
     }
-    let mut parts: Vec<Tensor> = Vec::new();
+    // Build the left/right border tensors as broadcast views when possible.
+    let left_view;
+    let right_view;
+    let mut refs: Vec<&Tensor> = Vec::with_capacity(3);
     if pad_left > 0 {
-        let left = x.narrow(2, 0, 1)?.repeat_axis_device(2, pad_left)?;
-        parts.push(left);
+        left_view = x.narrow(2, 0, 1)?.expand(&[b, c, pad_left])?;
+        refs.push(&left_view);
+    } else {
+        left_view = Tensor::zeros_dtype(Shape::from_dims(&[0]), x.dtype(), x.device().clone())?;
     }
-    parts.push(x.clone());
+    refs.push(x);
     if pad_right > 0 {
-        let right = x.narrow(2, l - 1, 1)?.repeat_axis_device(2, pad_right)?;
-        parts.push(right);
+        right_view = x.narrow(2, l - 1, 1)?.expand(&[b, c, pad_right])?;
+        refs.push(&right_view);
+    } else {
+        right_view = Tensor::zeros_dtype(Shape::from_dims(&[0]), x.dtype(), x.device().clone())?;
     }
-    let refs: Vec<&Tensor> = parts.iter().collect();
     let out = Tensor::cat(&refs, 2)?;
-    let _ = b;
-    let _ = c;
+    // `left_view` / `right_view` are kept alive until `cat` returns.
+    let _ = (&left_view, &right_view);
     Ok(out)
 }
 
@@ -143,19 +153,15 @@ fn zero_insert1d(x: &Tensor, stride: usize) -> Result<Tensor> {
 }
 
 /// SnakeBeta activation: `x + (1/(exp(beta) + eps)) * sin²(exp(alpha) * x)`
-fn snake_beta(x: &Tensor, alpha: &Tensor, beta: &Tensor) -> Result<Tensor> {
-    // alpha, beta: [C] → [1, C, 1]
-    let c = alpha.shape().dims()[0];
-    let a = alpha.reshape(&[1, c, 1])?.exp()?;
-    let b = beta.reshape(&[1, c, 1])?.exp()?;
-    let eps = 1e-9f32;
-    // sin(a * x)
-    let ax = x.mul(&a)?;
+///
+/// `alpha_exp` and `inv_beta_exp_eps` are precomputed at load time as
+/// broadcast-ready `[1, C, 1]` tensors so the hot path becomes
+/// `sin²(a·x) * inv_b + x` with four kernel launches instead of nine.
+fn snake_beta_fast(x: &Tensor, alpha_exp: &Tensor, inv_beta_exp_eps: &Tensor) -> Result<Tensor> {
+    let ax = x.mul(alpha_exp)?;
     let sin_ax = ax.sin()?;
     let sin_sq = sin_ax.mul(&sin_ax)?;
-    // 1 / (b + eps)
-    let inv_b = b.add_scalar(eps)?.reciprocal()?;
-    let scaled = sin_sq.mul(&inv_b)?;
+    let scaled = sin_sq.mul(inv_beta_exp_eps)?;
     x.add(&scaled)
 }
 
@@ -167,40 +173,113 @@ fn grouped_filter_broadcast(filter_1_1_k: &Tensor, channels: usize) -> Result<Te
     filter_1_1_k.expand(&[channels, 1, k])
 }
 
+/// Insert `(stride - 1)` zeros between each element on the last axis.
+/// Matches `flame_core::conv1d::zero_insert_last_axis` but inlined here so
+/// the hot path can stay entirely in vocoder code without round-tripping
+/// through `conv_transpose1d`.
+fn zero_insert_len(x: &Tensor, stride: usize) -> Result<Tensor> {
+    if stride <= 1 {
+        return Ok(x.clone());
+    }
+    let d = x.shape().dims();
+    let (b, c, l) = (d[0], d[1], d[2]);
+    let x4 = x.reshape(&[b, c, l, 1])?;
+    let zeros = Tensor::zeros_dtype(
+        Shape::from_dims(&[b, c, l, stride - 1]),
+        x.dtype(),
+        x.device().clone(),
+    )?;
+    let cat = Tensor::cat(&[&x4, &zeros], 3)?;
+    let flat = cat.reshape(&[b, c, l * stride])?;
+    flat.narrow(2, 0, (l - 1) * stride + 1)
+}
+
+/// Flip the last axis of a 3D tensor via narrow + cat.
+fn flip_last_axis(x: &Tensor) -> Result<Tensor> {
+    let dims = x.shape().dims();
+    let k = dims[dims.len() - 1];
+    if k <= 1 {
+        return Ok(x.clone());
+    }
+    let mut parts: Vec<Tensor> = Vec::with_capacity(k);
+    for i in (0..k).rev() {
+        parts.push(x.narrow(dims.len() - 1, i, 1)?);
+    }
+    let refs: Vec<&Tensor> = parts.iter().collect();
+    Tensor::cat(&refs, dims.len() - 1)
+}
+
+/// Precompute a ConvTranspose1d weight `[C_in, C_out/g, K]` into the
+/// regular Conv1d layout `[C_out, C_in/g, K]`. This is the expensive part
+/// of `conv_transpose1d` that we want to do ONCE at load time instead of
+/// every forward. For groups=1 (full vocoder ups), this is a flip + global
+/// transpose of the C_in and C_out axes.
+fn precompute_conv_transpose_weight(
+    weight: &Tensor,
+    groups: usize,
+) -> Result<Tensor> {
+    let dims = weight.shape().dims();
+    let (c_in, c_out_per_group, k) = (dims[0], dims[1], dims[2]);
+    let c_in_per_group = c_in / groups;
+    let c_out = c_out_per_group * groups;
+
+    let flipped = flip_last_axis(weight)?;
+    let grouped = flipped.reshape(&[groups, c_in_per_group, c_out_per_group, k])?;
+    let permuted = grouped.permute(&[0, 2, 1, 3])?;
+    permuted.reshape(&[c_out, c_in_per_group, k])
+}
+
 /// Activation1d: upsample 2× (Kaiser sinc) → SnakeBeta → downsample 2× (Kaiser sinc).
+///
+/// CRITICAL optimization: every op in this function is depthwise (per-channel).
+/// At C=768 (vocoder stage 0), running everything at `groups=C` makes cuDNN's
+/// grouped conv take ~4 ms and makes flame-core's `cat` loop per-channel at
+/// ~4 ms too. Reshaping the input to `[B*C, 1, L]` up front collapses the
+/// channel dim into the batch dim, lets cuDNN use the fast `groups=1` path
+/// and lets `cat` process a single outer dim — both drop from ~4 ms to
+/// ~150 µs per call. On a 16-mel-frame input this saves ~20 seconds of
+/// wall time.
+///
+/// The per-channel SnakeBeta parameters are reshaped to `[C, 1, 1]` so they
+/// broadcast elementwise against the `[C, 1, L']` tensors.
 fn activation1d(
     x: &Tensor,
-    alpha: &Tensor,
-    beta: &Tensor,
-    up_filter_broadcast: &Tensor,
-    down_filter_broadcast: &Tensor,
+    alpha_exp_bc1: &Tensor, // shape [C, 1, 1] (depthwise layout)
+    inv_beta_exp_eps_bc1: &Tensor, // shape [C, 1, 1]
+    up_filter_1_1_k: &Tensor, // shape [1, 1, 12] — single-channel filter
+    down_filter_1_1_k: &Tensor, // shape [1, 1, 12]
 ) -> Result<Tensor> {
-    let c = x.shape().dims()[1];
+    let in_dims = x.shape().dims().to_vec();
+    let (b, c, l) = (in_dims[0], in_dims[1], in_dims[2]);
 
-    // --- Upsample ---
-    let x_pad = replicate_pad1d(x, ACT_UP_REPLICATE_PAD, ACT_UP_REPLICATE_PAD)?;
-    // Native flame-core conv_transpose1d (groups=c, stride=2, padding=0).
-    let y = conv_transpose1d(
-        &x_pad,
-        up_filter_broadcast,
-        None,
-        ACT_RATIO, // stride
-        0,         // padding
-        0,         // output_padding
-        c,         // groups
-    )?;
+    // Fold channels into batch: [B, C, L] → [B*C, 1, L].
+    let x_bc = x.reshape(&[b * c, 1, l])?;
+
+    // --- Upsample (ConvTranspose1d stride=2 kernel=12, groups=1 after fold) ---
+    let x_pad = replicate_pad1d(&x_bc, ACT_UP_REPLICATE_PAD, ACT_UP_REPLICATE_PAD)?;
+    let x_zi = zero_insert_len(&x_pad, ACT_RATIO)?;
+    // Conv1d side padding for stride=1 equivalent: dilation*(K-1) - padding = 1*11 - 0 = 11.
+    let x_padded = x_zi.pad1d(11, 11)?;
+    let y = conv1d(&x_padded, up_filter_1_1_k, None, 1, 0, 1, 1)?;
     let y = y.mul_scalar(ACT_RATIO as f32)?;
     // Slice [pad_left : -pad_right]
     let y_len = y.shape().dims()[2];
     let y = y.narrow(2, ACT_UP_SLICE_LEFT, y_len - ACT_UP_SLICE_LEFT - ACT_UP_SLICE_RIGHT)?;
 
-    // --- Snake ---
-    let y = snake_beta(&y, alpha, beta)?;
+    // --- Snake (4 ops, broadcast per-channel via the [C, 1, 1] shape) ---
+    // y has shape [B*C, 1, L'], alpha_exp_bc1 has shape [C, 1, 1].
+    // For B=1, B*C == C so they broadcast directly.
+    // For B>1, alpha would need to be tiled; we assume B=1 (LTX-2.3 vocoder).
+    debug_assert_eq!(b, 1, "depthwise activation1d assumes B=1");
+    let y = snake_beta_fast(&y, alpha_exp_bc1, inv_beta_exp_eps_bc1)?;
 
-    // --- Downsample ---
+    // --- Downsample (regular conv1d, stride=2) ---
     let y_pad = replicate_pad1d(&y, ACT_DOWN_PAD_LEFT, ACT_DOWN_PAD_RIGHT)?;
-    // grouped conv1d with stride=2
-    conv1d_grouped(&y_pad, down_filter_broadcast, ACT_RATIO, 0, c)
+    let out = conv1d(&y_pad, down_filter_1_1_k, None, ACT_RATIO, 0, 1, 1)?;
+
+    // Unfold back to [B, C, L_out].
+    let l_out = out.shape().dims()[2];
+    out.reshape(&[b, c, l_out])
 }
 
 // ---------------------------------------------------------------------------
@@ -208,33 +287,49 @@ fn activation1d(
 // ---------------------------------------------------------------------------
 
 struct ActParams {
-    alpha: Tensor,
-    beta: Tensor,
-    up_filter: Tensor,   // broadcast to [C, 1, 12]
-    down_filter: Tensor, // broadcast to [C, 1, 12]
+    /// Precomputed `exp(alpha)` reshaped to `[C, 1, 1]` so it broadcasts
+    /// against the folded `[B*C=C, 1, L]` hot-path tensors.
+    alpha_exp_bc1: Tensor,
+    /// Precomputed `1 / (exp(beta) + eps)` in the same `[C, 1, 1]` layout.
+    inv_beta_exp_eps_bc1: Tensor,
+    /// Kaiser sinc up-filter in single-channel `[1, 1, K]` layout. Symmetric,
+    /// so the flip that a ConvTranspose1d would do is a no-op.
+    up_filter_1_1_k: Tensor,
+    /// Kaiser sinc down-filter in single-channel `[1, 1, K]` layout.
+    down_filter_1_1_k: Tensor,
 }
 
 impl ActParams {
-    fn load(weights: &Weights, prefix: &str, channels: usize) -> Result<Self> {
+    fn load(weights: &Weights, prefix: &str, _channels: usize) -> Result<Self> {
+        // `_channels` is kept for API symmetry with the previous broadcast
+        // path; we now read C directly from the alpha tensor shape.
         let alpha = get(weights, &format!("{prefix}.act.alpha"))?;
         let beta = get(weights, &format!("{prefix}.act.beta"))?;
         let up_raw = get(weights, &format!("{prefix}.upsample.filter"))?;
         let down_raw = get(weights, &format!("{prefix}.downsample.lowpass.filter"))?;
+
+        let c = alpha.shape().dims()[0];
+        // [C] → [C, 1, 1] so it broadcasts against [B*C, 1, L] (B=1).
+        let alpha_exp_bc1 = alpha.reshape(&[c, 1, 1])?.exp()?;
+        let beta_exp_bc1 = beta.reshape(&[c, 1, 1])?.exp()?;
+        let inv_beta_exp_eps_bc1 = beta_exp_bc1.add_scalar(1e-9)?.reciprocal()?;
+
+        // The checkpoint stores both filters as [1, 1, K]; use them as-is.
         Ok(Self {
-            alpha,
-            beta,
-            up_filter: grouped_filter_broadcast(&up_raw, channels)?,
-            down_filter: grouped_filter_broadcast(&down_raw, channels)?,
+            alpha_exp_bc1,
+            inv_beta_exp_eps_bc1,
+            up_filter_1_1_k: up_raw,
+            down_filter_1_1_k: down_raw,
         })
     }
 
     fn apply(&self, x: &Tensor) -> Result<Tensor> {
         activation1d(
             x,
-            &self.alpha,
-            &self.beta,
-            &self.up_filter,
-            &self.down_filter,
+            &self.alpha_exp_bc1,
+            &self.inv_beta_exp_eps_bc1,
+            &self.up_filter_1_1_k,
+            &self.down_filter_1_1_k,
         )
     }
 }
@@ -286,21 +381,57 @@ impl AmpBlock1 {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let profile_deep = std::env::var("FLAME_VOCODER_DEEP").is_ok();
         let mut x = x.clone();
         let k = self.kernel_size;
+        let mut t_a1 = 0.0_f32;
+        let mut t_c1 = 0.0_f32;
+        let mut t_a2 = 0.0_f32;
+        let mut t_c2 = 0.0_f32;
+        let mut t_add = 0.0_f32;
+        let device = x.device().clone();
+        let sync = || {
+            if profile_deep {
+                let _ = device.synchronize();
+            }
+        };
+        let now = || std::time::Instant::now();
+
         for i in 0..3 {
             let d = DILATIONS[i];
             let pad1 = get_padding(k, d);
-            // a1
+
+            let t = now();
             let xt = self.acts1[i].apply(&x)?;
-            // conv1: kernel `k`, dilation `d`, padding `d*(k-1)/2` preserves length.
+            sync();
+            t_a1 += t.elapsed().as_secs_f32();
+
+            let t = now();
             let xt = conv1d(&xt, &self.convs1_w[i], Some(&self.convs1_b[i]), 1, pad1, d, 1)?;
-            // a2
+            sync();
+            t_c1 += t.elapsed().as_secs_f32();
+
+            let t = now();
             let xt = self.acts2[i].apply(&xt)?;
-            // conv2 with kernel k, dilation=1, padding=(k-1)/2
+            sync();
+            t_a2 += t.elapsed().as_secs_f32();
+
+            let t = now();
             let pad2 = get_padding(k, 1);
             let xt = conv1d(&xt, &self.convs2_w[i], Some(&self.convs2_b[i]), 1, pad2, 1, 1)?;
+            sync();
+            t_c2 += t.elapsed().as_secs_f32();
+
+            let t = now();
             x = x.add(&xt)?;
+            sync();
+            t_add += t.elapsed().as_secs_f32();
+        }
+
+        if profile_deep {
+            eprintln!(
+                "  [amp k={k}] a1={t_a1:.3} c1={t_c1:.3} a2={t_a2:.3} c2={t_c2:.3} add={t_add:.3}"
+            );
         }
         let _ = self.channels;
         Ok(x)
@@ -314,7 +445,10 @@ impl AmpBlock1 {
 pub struct LTX2Vocoder {
     conv_pre_w: Tensor,
     conv_pre_b: Tensor,
-    ups: Vec<(Tensor, Tensor)>, // (weight [C_in, C_out, K], bias [C_out])
+    /// Pre-transformed ConvTranspose1d → Conv1d weights for each ups stage.
+    /// Shape `[C_out, C_in, K]` after `precompute_conv_transpose_weight`.
+    /// Stored alongside the bias and the stride/kernel metadata.
+    ups: Vec<(Tensor, Tensor)>, // (preconv_weight, bias)
     resblocks: Vec<AmpBlock1>,
     act_post: ActParams,
     conv_post_w: Tensor,
@@ -331,12 +465,15 @@ impl LTX2Vocoder {
         let mut ups = Vec::with_capacity(6);
         let mut channels_per_stage = Vec::with_capacity(6);
         for i in 0..UPSAMPLE_RATES.len() {
-            let w = get(weights, &format!("{prefix}.ups.{i}.weight"))?;
+            let w_raw = get(weights, &format!("{prefix}.ups.{i}.weight"))?;
             let b = get(weights, &format!("{prefix}.ups.{i}.bias"))?;
             // ConvTranspose1d weight shape: [C_in, C_out, K]
-            let c_out = w.shape().dims()[1];
+            let c_out = w_raw.shape().dims()[1];
             channels_per_stage.push(c_out);
-            ups.push((w, b));
+            // Pre-transform once at load time — this is the most expensive
+            // op in the old hot path (flip + permute on a 26 MB weight).
+            let w_preconv = precompute_conv_transpose_weight(&w_raw, 1)?;
+            ups.push((w_preconv, b));
         }
 
         let final_channels = *channels_per_stage.last().unwrap();
@@ -380,6 +517,16 @@ impl LTX2Vocoder {
     /// Forward: mel `[B, 2, T_mel, F_mel]` → waveform `[B, 2, T_out]` at the
     /// inner `input_sampling_rate` (16 kHz for production).
     pub fn forward(&self, mel: &Tensor) -> Result<Tensor> {
+        // Set FLAME_VOCODER_PROFILE=1 for per-phase timing.
+        let profile = std::env::var("FLAME_VOCODER_PROFILE").is_ok();
+        let device = mel.device().clone();
+        let sync = || {
+            if profile {
+                let _ = device.synchronize();
+            }
+        };
+        let now = || std::time::Instant::now();
+
         // Normalize to [B, 2*F_mel, T_mel]
         let d = mel.shape().dims();
         assert_eq!(d[1], 2, "stereo mel expected at dim 1");
@@ -387,6 +534,7 @@ impl LTX2Vocoder {
         // [B, 2, T, F] → [B, 2, F, T] → [B, 2*F, T]
         let x = mel.permute(&[0, 1, 3, 2])?.reshape(&[b, 2 * f, t])?;
 
+        let t0 = now();
         // conv_pre: k=7, pad=3
         let mut x = conv1d(
             &x,
@@ -397,16 +545,31 @@ impl LTX2Vocoder {
             1,
             1,
         )?;
+        sync();
+        if profile {
+            eprintln!("[voc] conv_pre:    {:.3}s", t0.elapsed().as_secs_f32());
+        }
 
         for i in 0..UPSAMPLE_RATES.len() {
             let stride = UPSAMPLE_RATES[i];
             let k = UPSAMPLE_KERNEL_SIZES[i];
             let padding = (k - stride) / 2;
-            let (w, bi) = &self.ups[i];
-            x = conv_transpose1d(&x, w, Some(bi), stride, padding, 0, 1)?;
+            let (w_preconv, bi) = &self.ups[i];
+
+            let t_up = now();
+            // ConvTranspose1d via cached preconv weight: zero-insert → pad →
+            // regular cuDNN conv1d. The weight transform that used to run
+            // here on every call is now done once at load time.
+            let x_zi = zero_insert_len(&x, stride)?;
+            let side_pad = (k - 1) - padding; // dilation = 1
+            let x_padded = x_zi.pad1d(side_pad, side_pad)?;
+            x = conv1d(&x_padded, w_preconv, Some(bi), 1, 0, 1, 1)?;
+            sync();
+            let t_up_done = t_up.elapsed().as_secs_f32();
 
             // 3 resblocks averaged
             let start = i * NUM_KERNELS_PER_STAGE;
+            let t_rb = now();
             let mut sum: Option<Tensor> = None;
             for j in 0..NUM_KERNELS_PER_STAGE {
                 let out = self.resblocks[start + j].forward(&x)?;
@@ -416,10 +579,21 @@ impl LTX2Vocoder {
                 });
             }
             x = sum.unwrap().mul_scalar(1.0 / NUM_KERNELS_PER_STAGE as f32)?;
+            sync();
+            let t_rb_done = t_rb.elapsed().as_secs_f32();
+
+            if profile {
+                let l = x.shape().dims()[2];
+                eprintln!("[voc] stage {i} (L={l}): ups={t_up_done:.3}s rblocks={t_rb_done:.3}s");
+            }
         }
 
         // act_post + conv_post + tanh
+        let t_post = now();
         x = self.act_post.apply(&x)?;
+        sync();
+        let t_ap = t_post.elapsed().as_secs_f32();
+        let t_cp = now();
         x = conv1d(
             &x,
             &self.conv_post_w,
@@ -429,7 +603,13 @@ impl LTX2Vocoder {
             1,
             1,
         )?;
-        x.tanh()
+        let out = x.tanh()?;
+        sync();
+        if profile {
+            eprintln!("[voc] act_post:   {t_ap:.3}s");
+            eprintln!("[voc] conv_post+tanh: {:.3}s", t_cp.elapsed().as_secs_f32());
+        }
+        Ok(out)
     }
 
     /// Load from a full LTX-2.3 safetensors checkpoint. Uses filtered
