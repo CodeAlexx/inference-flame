@@ -8,6 +8,7 @@ pub mod qwen3_encoder;
 pub mod gemma3_encoder;
 pub mod feature_extractor;
 pub mod fp8_resident;
+pub mod fp8_quant;
 pub mod mistral_encoder;
 pub mod clip_encoder;
 pub mod t5_encoder;

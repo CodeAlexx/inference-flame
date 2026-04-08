@@ -266,10 +266,21 @@ fn main() -> anyhow::Result<()> {
             return Ok(());
         }
 
-        // Euler step: x_{t+1} = x_t + velocity * dt, where dt = sigma_next - sigma
+        // F32 Euler step — mirrors Python's `EulerDiffusionStep.step` which
+        // does `(sample.float() + velocity.float() * dt).to(sample.dtype)`.
+        // BF16 accumulation drift compounds across 8+3 steps and was the
+        // source of the audio "2.4× too hot" symptom.
         let dt = sigma_next - sigma;
-        video_x = video_x.add(&video_vel.mul_scalar(dt)?)?;
-        audio_x = audio_x.add(&audio_vel.mul_scalar(dt)?)?;
+        let video_dtype = video_x.dtype();
+        let audio_dtype = audio_x.dtype();
+        video_x = video_x
+            .to_dtype(DType::F32)?
+            .add(&video_vel.to_dtype(DType::F32)?.mul_scalar(dt)?)?
+            .to_dtype(video_dtype)?;
+        audio_x = audio_x
+            .to_dtype(DType::F32)?
+            .add(&audio_vel.to_dtype(DType::F32)?.mul_scalar(dt)?)?
+            .to_dtype(audio_dtype)?;
 
         // NaN check
         if let Ok(v) = video_x.to_vec() {
@@ -411,10 +422,18 @@ fn main() -> anyhow::Result<()> {
             None, None,  // attention masks: None = pre-projected embeddings
         )?;
 
-        // Euler step: sample += velocity * dt
+        // F32 Euler step (see stage 1 loop above for rationale).
         let dt = sigma_next - sigma;
-        video_x = video_x.add(&video_vel.mul_scalar(dt)?)?;
-        audio_x = audio_x.add(&audio_vel.mul_scalar(dt)?)?;
+        let video_dtype = video_x.dtype();
+        let audio_dtype = audio_x.dtype();
+        video_x = video_x
+            .to_dtype(DType::F32)?
+            .add(&video_vel.to_dtype(DType::F32)?.mul_scalar(dt)?)?
+            .to_dtype(video_dtype)?;
+        audio_x = audio_x
+            .to_dtype(DType::F32)?
+            .add(&audio_vel.to_dtype(DType::F32)?.mul_scalar(dt)?)?
+            .to_dtype(audio_dtype)?;
 
         // NaN check
         if let Ok(v) = video_x.to_vec() {

@@ -145,9 +145,22 @@ fn main() -> anyhow::Result<()> {
             None, None,
         )?;
 
+        // F32 Euler step — mirrors Python's `EulerDiffusionStep.step` which
+        // does `(sample.float() + velocity.float() * dt).to(sample.dtype)`.
+        // Doing the add in BF16 directly compounds rounding error across
+        // 8+3 steps (audio std grew from ~1 to ~2.3 — see alexltx.md). F32
+        // accumulation matches Python's behavior.
         let dt = sigma_next - sigma;
-        video_x = video_x.add(&video_vel.mul_scalar(dt)?)?;
-        audio_x = audio_x.add(&audio_vel.mul_scalar(dt)?)?;
+        let video_dtype = video_x.dtype();
+        let audio_dtype = audio_x.dtype();
+        video_x = video_x
+            .to_dtype(DType::F32)?
+            .add(&video_vel.to_dtype(DType::F32)?.mul_scalar(dt)?)?
+            .to_dtype(video_dtype)?;
+        audio_x = audio_x
+            .to_dtype(DType::F32)?
+            .add(&audio_vel.to_dtype(DType::F32)?.mul_scalar(dt)?)?
+            .to_dtype(audio_dtype)?;
 
         print!("  step {}/{} sigma={:.4} dt={:.1}s ",
             step + 1, s2_steps, sigma, t_step.elapsed().as_secs_f32());
