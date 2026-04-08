@@ -519,6 +519,354 @@ impl KleinVaeDecoder {
 }
 
 // ---------------------------------------------------------------------------
+// Encoder — mirror of the decoder for offline latent caching.
+// ---------------------------------------------------------------------------
+//
+// Architecture (Flux 2 / Klein VAE, ch=128, ch_mult=(1,2,4,4), 2 layers/block):
+//   conv_in:        Conv2d(3, 128, 3, pad=1)
+//   down_blocks.0:  2x ResBlock(128→128) + downsample (asymmetric pad)
+//   down_blocks.1:  2x ResBlock(128→256) + downsample
+//   down_blocks.2:  2x ResBlock(256→512) + downsample
+//   down_blocks.3:  2x ResBlock(512→512)  — NO downsample
+//   mid_block:      ResBlock(512) + Attn(512) + ResBlock(512)
+//   conv_norm_out:  GroupNorm(32, 512)
+//   conv_out:       Conv2d(512, 64, 3, pad=1)   (64 = 2 * latent_ch)
+//   quant_conv:     Conv2d(64, 64, 1)
+//
+// After encoder we take the deterministic mean (first 32 channels of the
+// 64-channel quantized output), patchify with 2x2 pixel-unshuffle to get
+// 128 channels, then apply the BatchNorm normalization
+// `(z - running_mean) / sqrt(running_var + eps)`. The result matches what
+// `KleinVaeDecoder::decode` consumes.
+
+const ENCODER_BLOCK_CHANNELS: [usize; 4] = [128, 256, 512, 512];
+const ENCODER_LAYERS_PER_BLOCK: usize = 2;
+
+/// Pad an NCHW tensor with zeros: `(left, right, top, bottom)`.
+fn pad2d_zeros(
+    x: &Tensor,
+    left: usize,
+    right: usize,
+    top: usize,
+    bottom: usize,
+) -> Result<Tensor> {
+    if left == 0 && right == 0 && top == 0 && bottom == 0 {
+        return Ok(x.clone());
+    }
+    let dims = x.shape().dims();
+    if dims.len() != 4 {
+        return Err(Error::InvalidOperation(format!(
+            "pad2d_zeros: expected NCHW, got rank {}",
+            dims.len()
+        )));
+    }
+    let (b, c, h, w) = (dims[0], dims[1], dims[2], dims[3]);
+    let device = x.device().clone();
+    let dtype = x.dtype();
+
+    // Pad width first (left/right) along axis 3.
+    let mut current = x.clone();
+    if left > 0 {
+        let zeros = Tensor::zeros_dtype(
+            Shape::from_dims(&[b, c, h, left]),
+            dtype,
+            device.clone(),
+        )?;
+        current = Tensor::cat(&[&zeros, &current], 3)?;
+    }
+    if right > 0 {
+        let zeros = Tensor::zeros_dtype(
+            Shape::from_dims(&[b, c, h, right]),
+            dtype,
+            device.clone(),
+        )?;
+        current = Tensor::cat(&[&current, &zeros], 3)?;
+    }
+
+    // Then pad height (top/bottom) along axis 2.
+    let new_w = w + left + right;
+    if top > 0 {
+        let zeros = Tensor::zeros_dtype(
+            Shape::from_dims(&[b, c, top, new_w]),
+            dtype,
+            device.clone(),
+        )?;
+        current = Tensor::cat(&[&zeros, &current], 2)?;
+    }
+    if bottom > 0 {
+        let zeros = Tensor::zeros_dtype(
+            Shape::from_dims(&[b, c, bottom, new_w]),
+            dtype,
+            device,
+        )?;
+        current = Tensor::cat(&[&current, &zeros], 2)?;
+    }
+    Ok(current)
+}
+
+/// Forward pixel-unshuffle: `[B, 32, 2H, 2W]` → `[B, 128, H, W]`.
+///
+/// This is the inverse of [`unpatchify_latents`].
+pub fn patchify_latents(latents: &Tensor) -> Result<Tensor> {
+    let dims = latents.shape().dims();
+    let (b, c, h2, w2) = (dims[0], dims[1], dims[2], dims[3]);
+
+    if c == 128 {
+        return Ok(latents.clone());
+    }
+    if c != LATENT_CH {
+        return Err(Error::InvalidOperation(format!(
+            "patchify expects {LATENT_CH} channels, got {c}"
+        )));
+    }
+    if h2 % 2 != 0 || w2 % 2 != 0 {
+        return Err(Error::InvalidOperation(format!(
+            "patchify expects even spatial dims, got {h2}x{w2}"
+        )));
+    }
+    let (h, w) = (h2 / 2, w2 / 2);
+
+    // Inverse of unpatchify_latents permutation:
+    //   unpatchify: [B, 32, 2, 2, H, W] -> permute(0,1,4,2,5,3) -> [B, 32, H, 2, W, 2]
+    //   patchify:   [B, 32, H, 2, W, 2] -> permute(0,1,3,5,2,4) -> [B, 32, 2, 2, H, W]
+    let x = latents.reshape(&[b, LATENT_CH, h, 2, w, 2])?;
+    let x = x.permute(&[0, 1, 3, 5, 2, 4])?;
+    x.reshape(&[b, 128, h, w])
+}
+
+/// One encoder down block: `num_resnets` resnets in series, optional
+/// asymmetric-pad downsample conv at the end.
+struct DownBlock {
+    resnets: Vec<ResBlock>,
+    downsample_conv: Option<Conv2d>,
+}
+
+impl DownBlock {
+    fn load(
+        weights: &HashMap<String, Tensor>,
+        prefix: &str,
+        in_ch: usize,
+        out_ch: usize,
+        num_resnets: usize,
+        has_downsample: bool,
+        device: &CudaArc,
+    ) -> Result<Self> {
+        let mut resnets = Vec::with_capacity(num_resnets);
+        let mut ch = in_ch;
+        for m in 0..num_resnets {
+            resnets.push(ResBlock::load(
+                weights,
+                &format!("{prefix}.resnets.{m}"),
+                ch,
+                out_ch,
+                device,
+            )?);
+            ch = out_ch;
+        }
+        let downsample_conv = if has_downsample {
+            Some(load_conv(
+                weights,
+                &format!("{prefix}.downsamplers.0.conv"),
+                out_ch,
+                out_ch,
+                3,
+                2,
+                0, // padding handled manually (asymmetric (0,1,0,1))
+                device,
+            )?)
+        } else {
+            None
+        };
+        Ok(Self {
+            resnets,
+            downsample_conv,
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let mut h = x.clone();
+        for resnet in &self.resnets {
+            h = resnet.forward(&h)?;
+        }
+        if let Some(conv) = &self.downsample_conv {
+            // Asymmetric pad (right + bottom only) to match diffusers Encoder.
+            h = pad2d_zeros(&h, 0, 1, 0, 1)?;
+            h = conv.forward(&h)?;
+        }
+        Ok(h)
+    }
+}
+
+/// Klein / Flux 2 VAE encoder.
+///
+/// Input:  `[B, 3, H, W]` RGB in `[-1, 1]`.
+/// Output: `[B, 128, H/16, W/16]` packed latents (post-BN, post-patchify),
+/// matching the format that [`KleinVaeDecoder::decode`] consumes.
+pub struct KleinVaeEncoder {
+    conv_in: Conv2d,
+    down_blocks: Vec<DownBlock>,
+    mid_block: MidBlock,
+    conv_norm_out: GroupNorm,
+    conv_out: Conv2d,
+    quant_conv: Option<Conv2d>,
+    bn_inv_scale: Tensor, // 1 / sqrt(running_var + eps), [128] BF16
+    bn_neg_mean: Tensor,  // -running_mean, [128] BF16
+}
+
+impl KleinVaeEncoder {
+    /// Load encoder weights from a HashMap (diffusers-format keys).
+    ///
+    /// Required keys: `encoder.conv_in.*`, `encoder.down_blocks.*`,
+    /// `encoder.mid_block.*`, `encoder.conv_norm_out.*`, `encoder.conv_out.*`,
+    /// `quant_conv.*` (optional), `bn.running_mean`, `bn.running_var`.
+    pub fn load(weights: &HashMap<String, Tensor>, device: &Device) -> Result<Self> {
+        let cuda = device.cuda_device_arc();
+        let top_ch = ENCODER_BLOCK_CHANNELS[ENCODER_BLOCK_CHANNELS.len() - 1];
+
+        // conv_in: Conv2d(3, 128, 3, pad=1)
+        let conv_in = load_conv(
+            weights,
+            "encoder.conv_in",
+            3,
+            ENCODER_BLOCK_CHANNELS[0],
+            3,
+            1,
+            1,
+            &cuda,
+        )?;
+
+        // 4 down blocks; final block has no downsample.
+        let mut down_blocks = Vec::with_capacity(ENCODER_BLOCK_CHANNELS.len());
+        for i in 0..ENCODER_BLOCK_CHANNELS.len() {
+            let in_ch = if i == 0 {
+                ENCODER_BLOCK_CHANNELS[0]
+            } else {
+                ENCODER_BLOCK_CHANNELS[i - 1]
+            };
+            let out_ch = ENCODER_BLOCK_CHANNELS[i];
+            let has_down = i < ENCODER_BLOCK_CHANNELS.len() - 1;
+            down_blocks.push(DownBlock::load(
+                weights,
+                &format!("encoder.down_blocks.{i}"),
+                in_ch,
+                out_ch,
+                ENCODER_LAYERS_PER_BLOCK,
+                has_down,
+                &cuda,
+            )?);
+        }
+
+        // mid_block: shares MidBlock loader with the decoder side.
+        let mid_block = MidBlock::load(weights, "encoder.mid_block", top_ch, &cuda)?;
+
+        // conv_norm_out: GroupNorm(32, 512)
+        let conv_norm_out = load_gn(weights, "encoder.conv_norm_out", top_ch, &cuda)?;
+
+        // conv_out: Conv2d(512, 64, 3, pad=1) — outputs 2 * latent_ch
+        let conv_out = load_conv(
+            weights,
+            "encoder.conv_out",
+            top_ch,
+            2 * LATENT_CH,
+            3,
+            1,
+            1,
+            &cuda,
+        )?;
+
+        // quant_conv: Conv2d(64, 64, 1) — optional in diffusers; Klein has it.
+        let quant_conv = if weights.contains_key("quant_conv.weight") {
+            Some(load_conv(
+                weights,
+                "quant_conv",
+                2 * LATENT_CH,
+                2 * LATENT_CH,
+                1,
+                1,
+                0,
+                &cuda,
+            )?)
+        } else {
+            None
+        };
+
+        // BN normalization is applied AFTER patchify, so it sees 128 channels.
+        let bn_eps = 1e-4f32;
+        let var = weights
+            .get("bn.running_var")
+            .ok_or_else(|| Error::InvalidOperation("missing bn.running_var".into()))?
+            .to_dtype(DType::F32)?;
+        let mean = weights
+            .get("bn.running_mean")
+            .ok_or_else(|| Error::InvalidOperation("missing bn.running_mean".into()))?
+            .to_dtype(DType::F32)?;
+        // inv_scale = 1 / sqrt(var + eps); compute via host-side reciprocal.
+        let scale_f32 = var.add_scalar(bn_eps)?.sqrt()?;
+        let scale_vec: Vec<f32> = scale_f32.to_vec()?;
+        let inv_scale_vec: Vec<f32> = scale_vec.into_iter().map(|s| 1.0 / s).collect();
+        let inv_scale_f32 = Tensor::from_vec(
+            inv_scale_vec,
+            scale_f32.shape().clone(),
+            cuda.clone(),
+        )?;
+        let neg_mean_f32 = mean.mul_scalar(-1.0f32)?;
+        let bn_inv_scale = inv_scale_f32.to_dtype(DType::BF16)?;
+        let bn_neg_mean = neg_mean_f32.to_dtype(DType::BF16)?;
+
+        Ok(Self {
+            conv_in,
+            down_blocks,
+            mid_block,
+            conv_norm_out,
+            conv_out,
+            quant_conv,
+            bn_inv_scale,
+            bn_neg_mean,
+        })
+    }
+
+    /// Encode an image batch `[B, 3, H, W]` (BF16 in `[-1, 1]`) to packed
+    /// latents `[B, 128, H/16, W/16]`.
+    ///
+    /// Uses the deterministic mean of the diagonal-Gaussian posterior
+    /// (no sampling) — the right choice for caching training latents.
+    pub fn encode(&self, image: &Tensor) -> Result<Tensor> {
+        let mut h = self.conv_in.forward(image)?;
+        for block in &self.down_blocks {
+            h = block.forward(&h)?;
+        }
+        h = self.mid_block.forward(&h)?;
+        h = self.conv_norm_out.forward_nchw(&h)?;
+        h = h.silu()?;
+        h = self.conv_out.forward(&h)?;
+        if let Some(qc) = &self.quant_conv {
+            h = qc.forward(&h)?;
+        }
+
+        // h is [B, 64, h, w] = [mu (32) | logvar (32)]. Take deterministic mean.
+        let dims = h.shape().dims();
+        let (b, c, h_, w_) = (dims[0], dims[1], dims[2], dims[3]);
+        if c != 2 * LATENT_CH {
+            return Err(Error::InvalidOperation(format!(
+                "encoder conv_out produced {c} channels, expected {}",
+                2 * LATENT_CH
+            )));
+        }
+        let mu = h.narrow(1, 0, LATENT_CH)?;
+
+        // Patchify: [B, 32, h, w] -> [B, 128, h/2, w/2]
+        let z = patchify_latents(&mu)?;
+
+        // BatchNorm forward: (z + neg_mean) * inv_scale, broadcast over [B, 128, H, W].
+        let scale = self.bn_inv_scale.reshape(&[1, 128, 1, 1])?;
+        let bias = self.bn_neg_mean.reshape(&[1, 128, 1, 1])?;
+        let centered = z.add(&bias)?;
+        let _ = (b, h_, w_); // suppress unused
+        centered.mul(&scale)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
