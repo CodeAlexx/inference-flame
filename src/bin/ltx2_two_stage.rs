@@ -472,39 +472,45 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn simple_tokenize(text: &str, _max_len: usize) -> anyhow::Result<(Vec<i32>, Vec<i32>)> {
-    let bench_dir = "/home/alex/ltx2-refs/bench20";
-    let prompts_path = format!("{bench_dir}/prompts.json");
-    if std::path::Path::new(&prompts_path).exists() {
-        let prompts_json = std::fs::read_to_string(&prompts_path)?;
-        let prompts: Vec<String> = serde_json::from_str(&prompts_json)?;
-        for (i, p) in prompts.iter().enumerate() {
-            if p == text {
-                let token_path = format!("{bench_dir}/tokens_{i:02}.json");
-                let token_json = std::fs::read_to_string(&token_path)?;
-                let tokens: serde_json::Value = serde_json::from_str(&token_json)?;
-                let input_ids: Vec<i32> = tokens["input_ids"].as_array().unwrap()
-                    .iter().map(|v| v.as_i64().unwrap() as i32).collect();
-                let attention_mask: Vec<i32> = tokens["attention_mask"].as_array().unwrap()
-                    .iter().map(|v| v.as_i64().unwrap() as i32).collect();
-                println!("  Matched token file: Some(\"tokens_{i:02}.json\")");
-                return Ok((input_ids, attention_mask));
-            }
-        }
-    }
-    // Fallback: Use cinematic prompt tokens
-    let fallback = format!("{bench_dir}/tokens_cinematic.json");
-    if std::path::Path::new(&fallback).exists() {
-        let token_json = std::fs::read_to_string(&fallback)?;
-        let tokens: serde_json::Value = serde_json::from_str(&token_json)?;
-        let input_ids: Vec<i32> = tokens["input_ids"].as_array().unwrap()
-            .iter().map(|v| v.as_i64().unwrap() as i32).collect();
-        let attention_mask: Vec<i32> = tokens["attention_mask"].as_array().unwrap()
-            .iter().map(|v| v.as_i64().unwrap() as i32).collect();
-        println!("  Using fallback cinematic tokens");
-        return Ok((input_ids, attention_mask));
-    }
-    anyhow::bail!("No tokenized prompts found in {bench_dir}")
+/// Tokenize a prompt for Gemma-3 using the HuggingFace `tokenizers` crate.
+///
+/// Matches the Python reference pipeline's behavior:
+///   - BOS (id=2) prepended automatically via `add_special_tokens=true`
+///   - If encoded length > max_len, right-truncate (truncation_side='right')
+///   - If encoded length < max_len, left-pad with pad_id=0 (padding_side='left')
+///   - attention_mask: 0 for pad positions, 1 for real tokens
+///
+/// Verified against `/home/alex/ltx2-refs/bench20/tokens_*.json`:
+/// e.g. encode("a cat") → [2, 236746, 5866] (BOS, "a", "▁cat"), matches byte-for-byte.
+fn simple_tokenize(text: &str, max_len: usize) -> anyhow::Result<(Vec<i32>, Vec<i32>)> {
+    let tok_path = format!("{GEMMA_ROOT}/tokenizer.json");
+    let tokenizer = tokenizers::Tokenizer::from_file(&tok_path)
+        .map_err(|e| anyhow::anyhow!("Tokenizer load ({tok_path}): {e}"))?;
+    let encoding = tokenizer
+        .encode(text, true)
+        .map_err(|e| anyhow::anyhow!("Tokenizer encode: {e}"))?;
+    let raw_ids: &[u32] = encoding.get_ids();
+
+    let ids: Vec<u32> = if raw_ids.len() > max_len {
+        println!(
+            "  [tokenize] prompt encoded to {} tokens, truncating to {}",
+            raw_ids.len(),
+            max_len
+        );
+        raw_ids[..max_len].to_vec()
+    } else {
+        raw_ids.to_vec()
+    };
+
+    let real_len = ids.len();
+    let pad = max_len - real_len;
+    let mut input_ids: Vec<i32> = vec![0i32; pad];
+    input_ids.extend(ids.iter().map(|&id| id as i32));
+    let mut attention_mask: Vec<i32> = vec![0i32; pad];
+    attention_mask.extend(std::iter::repeat(1i32).take(real_len));
+    debug_assert_eq!(input_ids.len(), max_len);
+    debug_assert_eq!(attention_mask.len(), max_len);
+    Ok((input_ids, attention_mask))
 }
 
 fn make_noise(_numel: usize, seed: u64, dims: &[usize], device: &std::sync::Arc<cudarc::driver::CudaDevice>) -> anyhow::Result<Tensor> {

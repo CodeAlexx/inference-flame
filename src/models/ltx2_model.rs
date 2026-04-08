@@ -565,6 +565,77 @@ pub struct LTX2Attention {
 }
 
 impl LTX2Attention {
+    /// Forward with optional dump of intermediate states. When `dump_into` is
+    /// Some, the per-step tensors (q, k, v, q_norm, k_norm, gated, etc.) are
+    /// inserted into the HashMap with keys prefixed by `dump_prefix`. Used by
+    /// LTX2_DUMP_BLOCK0 to track precision drift in V2A.
+    pub fn forward_dump(
+        &self,
+        hidden_states: &Tensor,
+        encoder_hidden_states: Option<&Tensor>,
+        attention_mask: Option<&Tensor>,
+        query_rope: Option<(&Tensor, &Tensor)>,
+        key_rope: Option<(&Tensor, &Tensor)>,
+        dump_into: Option<&mut HashMap<String, Tensor>>,
+        dump_prefix: &str,
+    ) -> Result<Tensor> {
+        let kv_input = encoder_hidden_states.unwrap_or(hidden_states);
+
+        let q_raw = linear3d(hidden_states, &self.to_q_weight, Some(&self.to_q_bias))?;
+        let k_raw = linear3d(kv_input, &self.to_k_weight, Some(&self.to_k_bias))?;
+        let v_raw = linear3d(kv_input, &self.to_v_weight, Some(&self.to_v_bias))?;
+
+        let q_normed = rms_norm(&q_raw, Some(&self.norm_q_weight), self.eps)?;
+        let k_normed = rms_norm(&k_raw, Some(&self.norm_k_weight), self.eps)?;
+
+        let q = if let Some((cos, sin)) = query_rope {
+            apply_rotary_emb(&q_normed, cos, sin)?
+        } else { q_normed.clone() };
+        let k = if let Some((cos, sin)) = key_rope.or(query_rope) {
+            apply_rotary_emb(&k_normed, cos, sin)?
+        } else { k_normed.clone() };
+
+        let q_dims = q.shape().dims().to_vec();
+        let (b, s_q) = (q_dims[0], q_dims[1]);
+        let k_dims = k.shape().dims().to_vec();
+        let s_kv = k_dims[1];
+
+        let q_4d = q.reshape(&[b, s_q, self.num_heads, self.head_dim])?.permute(&[0, 2, 1, 3])?;
+        let k_4d = k.reshape(&[b, s_kv, self.num_heads, self.head_dim])?.permute(&[0, 2, 1, 3])?;
+        let v_4d = v_raw.reshape(&[b, s_kv, self.num_heads, self.head_dim])?.permute(&[0, 2, 1, 3])?;
+
+        let attn_out_raw = flame_core::sdpa::forward(&q_4d, &k_4d, &v_4d, attention_mask)?;
+        let attn_out = attn_out_raw.permute(&[0, 2, 1, 3])?;
+        let inner_dim = self.num_heads * self.head_dim;
+
+        let (gated, gate_logits_dump): (Tensor, Option<Tensor>) =
+            if let (Some(gate_w), Some(gate_b)) = (&self.to_gate_logits_weight, &self.to_gate_logits_bias) {
+                let gate_logits = linear3d(hidden_states, gate_w, Some(gate_b))?;
+                let gates = gate_logits.sigmoid()?.mul_scalar(2.0)?;
+                let gates_4d = gates.unsqueeze(3)?;
+                let gated = attn_out.mul(&gates_4d)?.reshape(&[b, s_q, inner_dim])?;
+                (gated, Some(gate_logits))
+            } else {
+                (attn_out.reshape(&[b, s_q, inner_dim])?, None)
+            };
+
+        let out = linear3d(&gated, &self.to_out_weight, Some(&self.to_out_bias))?;
+
+        if let Some(dump) = dump_into {
+            dump.insert(format!("{dump_prefix}_to_q_out"), q_raw);
+            dump.insert(format!("{dump_prefix}_to_k_out"), k_raw);
+            dump.insert(format!("{dump_prefix}_to_v_out"), v_raw);
+            dump.insert(format!("{dump_prefix}_q_norm_out"), q_normed);
+            dump.insert(format!("{dump_prefix}_k_norm_out"), k_normed);
+            dump.insert(format!("{dump_prefix}_to_out_in"), gated);
+            dump.insert(format!("{dump_prefix}_to_out_out"), out.clone());
+            if let Some(gl) = gate_logits_dump {
+                dump.insert(format!("{dump_prefix}_gate_logits"), gl);
+            }
+        }
+        Ok(out)
+    }
+
     /// Forward with optional separate query/key RoPE.
     fn forward(
         &self,
@@ -907,6 +978,10 @@ impl LTX2TransformerBlock {
             fused_modulate(&norm_a, &a_scale_msa, &a_shift_msa)?
         };
         let attn_a_out = self.audio_attn1.forward(&mod_a, None, None, audio_rotary_emb, None)?;
+        if dump_intermediates {
+            intermediate_dump.insert("dump_asa_attn_out".into(), attn_a_out.clone());
+            intermediate_dump.insert("dump_mod_a_input".into(), mod_a.clone());
+        }
         let mut audio_hidden_states = fused_residual_gate(audio_hidden_states, &attn_a_out, &a_gate_msa)?;
         if dump_intermediates {
             intermediate_dump.insert("dump_after_asa".into(), audio_hidden_states.clone());
@@ -976,6 +1051,9 @@ impl LTX2TransformerBlock {
         };
 
         let ca_a_out = self.audio_attn2.forward(&mod_a2, Some(&modulated_a_context), audio_encoder_attention_mask, None, None)?;
+        if dump_intermediates {
+            intermediate_dump.insert("dump_aca_attn_out".into(), ca_a_out.clone());
+        }
         audio_hidden_states = fused_residual_gate(&audio_hidden_states, &ca_a_out, &a_gate_ca)?;
         if dump_intermediates {
             intermediate_dump.insert("dump_after_aca".into(), audio_hidden_states.clone());
@@ -989,6 +1067,12 @@ impl LTX2TransformerBlock {
         // happens via fused_modulate per branch.
         let norm_a2v = rms_norm(&hidden_states, self.audio_to_video_norm_weight.as_ref(), self.eps)?;
         let norm_v2a = rms_norm(&audio_hidden_states, self.video_to_audio_norm_weight.as_ref(), self.eps)?;
+        if dump_intermediates {
+            intermediate_dump.insert("dump_norm_a2v".into(), norm_a2v.clone());
+            intermediate_dump.insert("dump_norm_v2a".into(), norm_v2a.clone());
+            intermediate_dump.insert("dump_hs_pre_av_norm".into(), hidden_states.clone());
+            intermediate_dump.insert("dump_ahs_pre_av_norm".into(), audio_hidden_states.clone());
+        }
         take(&mut phases, "av_norm", &mut t);
 
         // Compute per-layer cross-attention modulation
@@ -998,6 +1082,14 @@ impl LTX2TransformerBlock {
                 temb_ca_gate, temb_ca_audio_gate,
                 b, video_dim, audio_dim,
             )?;
+        if dump_intermediates {
+            intermediate_dump.insert("dump_video_v2a_scale".into(), video_v2a_mod.0.clone());
+            intermediate_dump.insert("dump_video_v2a_shift".into(), video_v2a_mod.1.clone());
+            intermediate_dump.insert("dump_audio_v2a_scale".into(), audio_v2a_mod.0.clone());
+            intermediate_dump.insert("dump_audio_v2a_shift".into(), audio_v2a_mod.1.clone());
+            intermediate_dump.insert("dump_video_a2v_scale".into(), video_a2v_mod.0.clone());
+            intermediate_dump.insert("dump_video_a2v_shift".into(), video_a2v_mod.1.clone());
+        }
         take(&mut phases, "av_params", &mut t);
 
         // A2V: Q=video (modulated by video_a2v scale/shift), KV=audio (modulated by audio_a2v).
@@ -1018,6 +1110,9 @@ impl LTX2TransformerBlock {
             &mod_video_a2v, Some(&mod_audio_a2v), None,
             ca_video_rotary_emb, ca_audio_rotary_emb,
         )?;
+        if dump_intermediates {
+            intermediate_dump.insert("dump_a2v_raw_out".into(), a2v_out.clone());
+        }
         take(&mut phases, "a2v_attn", &mut t);
         // a2v_gate is [B, 1, dim] broadcast — fused_residual_gate doesn't
         // broadcast, so use manual mul+add (same as A2V/V2A modulation above).
@@ -1036,10 +1131,24 @@ impl LTX2TransformerBlock {
             .mul(&audio_v2a_mod.0.add_scalar(1.0)?)?
             .add(&audio_v2a_mod.1)?;
         take(&mut phases, "v2a_mod", &mut t);
-        let v2a_out = self.video_to_audio_attn.forward(
-            &mod_audio_v2a, Some(&mod_video_v2a), None,
-            ca_audio_rotary_emb, ca_video_rotary_emb,
-        )?;
+        let v2a_out = if dump_intermediates {
+            self.video_to_audio_attn.forward_dump(
+                &mod_audio_v2a, Some(&mod_video_v2a), None,
+                ca_audio_rotary_emb, ca_video_rotary_emb,
+                Some(&mut intermediate_dump),
+                "dump_v2a",
+            )?
+        } else {
+            self.video_to_audio_attn.forward(
+                &mod_audio_v2a, Some(&mod_video_v2a), None,
+                ca_audio_rotary_emb, ca_video_rotary_emb,
+            )?
+        };
+        if dump_intermediates {
+            intermediate_dump.insert("dump_v2a_raw_out".into(), v2a_out.clone());
+            intermediate_dump.insert("dump_mod_audio_v2a".into(), mod_audio_v2a.clone());
+            intermediate_dump.insert("dump_mod_video_v2a".into(), mod_video_v2a.clone());
+        }
         take(&mut phases, "v2a_attn", &mut t);
         // v2a_gate is [B, 1, dim] broadcast — manual residual.
         audio_hidden_states = audio_hidden_states.add(&v2a_out.mul(&v2a_gate)?)?;
@@ -1069,6 +1178,9 @@ impl LTX2TransformerBlock {
             fused_modulate(&norm_aff, &a_scale_mlp, &a_shift_mlp)?
         };
         let aff_out = self.audio_ff.forward(&mod_aff)?;
+        if dump_intermediates {
+            intermediate_dump.insert("dump_aff_raw_out".into(), aff_out.clone());
+        }
         audio_hidden_states = fused_residual_gate(&audio_hidden_states, &aff_out, &a_gate_mlp)?;
         if dump_intermediates {
             intermediate_dump.insert("dump_after_aff".into(), audio_hidden_states.clone());
@@ -3526,6 +3638,15 @@ impl LTX2StreamingModel {
             None
         };
 
+        // Accumulate per-block audio hidden states on the FIRST AV forward
+        // call only. Used by LTX2_DUMP_AUDIO to compare against Python's
+        // per-block trace and localize the block where Rust drifts.
+        static FIRST_AV_FORWARD: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        let is_first_av_forward = FIRST_AV_FORWARD.set(()).is_ok();
+        let dump_per_block_audio =
+            is_first_av_forward && std::env::var("LTX2_DUMP_AUDIO").is_ok();
+        let mut per_block_ahs: Vec<Tensor> = Vec::new();
+
         // 5. Timestep embeddings
         let num_mod_params = self.time_embed.num_mod_params;
         let ts_expanded = timestep.unsqueeze(1)?.expand(&[batch_size, num_video_tokens])?;
@@ -3854,6 +3975,13 @@ impl LTX2StreamingModel {
                     }
                 }
 
+                // First-call-only: capture full audio hidden state per block
+                // for element-wise comparison against Python.
+                if dump_per_block_audio {
+                    let _ = device.synchronize();
+                    per_block_ahs.push(new_ahs.clone());
+                }
+
                 // Dump block 0 outputs (the last thing fired in the OnceLock above
                 // already saved inputs; we save outputs to a separate file).
                 if i == 0 && std::env::var("LTX2_DUMP_BLOCK0").is_ok() {
@@ -3926,6 +4054,11 @@ impl LTX2StreamingModel {
                 if let Some(t) = a_flat_input { dump.insert("a_flat_input".into(), t); }
                 if let Some(t) = ahs_after_projin { dump.insert("ahs_after_projin".into(), t); }
                 dump.insert("ahs_final".into(), ahs.clone());
+                // Per-block ahs (output of each block, 48 entries) for
+                // localizing where Rust drifts from Python in the block stack.
+                for (idx, t) in per_block_ahs.iter().enumerate() {
+                    dump.insert(format!("ahs_block_{idx:02}"), t.clone());
+                }
                 dump.insert("a_timestep".into(), a_timestep.clone());
                 dump.insert("a_embedded".into(), a_embedded.clone());
                 dump.insert("audio_sst".into(), audio_sst.clone());

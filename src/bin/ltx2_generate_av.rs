@@ -276,85 +276,45 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Simple tokenizer: <bos>(2) + byte-level tokens, left-padded to max_len.
-/// This is a placeholder — production should use the HuggingFace tokenizer.
+/// Tokenize a prompt for Gemma-3 using the HuggingFace `tokenizers` crate.
+///
+/// Matches the Python reference pipeline's behavior:
+///   - BOS (id=2) prepended automatically via `add_special_tokens=true`
+///   - If encoded length > max_len, right-truncate (truncation_side='right')
+///   - If encoded length < max_len, left-pad with pad_id=0 (padding_side='left')
+///   - attention_mask: 0 for pad positions, 1 for real tokens
+///
+/// Verified against `/home/alex/ltx2-refs/bench20/tokens_*.json`:
+/// e.g. encode("a cat") → [2, 236746, 5866] (BOS, "a", "▁cat"), matches byte-for-byte.
 fn simple_tokenize(text: &str, max_len: usize) -> anyhow::Result<(Vec<i32>, Vec<i32>)> {
-    // For now, load pre-tokenized data if available
-    let bench_dir = "/home/alex/ltx2-refs/bench20";
+    let tok_path = format!("{GEMMA_ROOT}/tokenizer.json");
+    let tokenizer = tokenizers::Tokenizer::from_file(&tok_path)
+        .map_err(|e| anyhow::anyhow!("Tokenizer load ({tok_path}): {e}"))?;
+    let encoding = tokenizer
+        .encode(text, true)
+        .map_err(|e| anyhow::anyhow!("Tokenizer encode: {e}"))?;
+    let raw_ids: &[u32] = encoding.get_ids();
 
-    // Try to find a matching prompt in bench20
-    let prompts_path = format!("{bench_dir}/prompts.json");
-    if std::path::Path::new(&prompts_path).exists() {
-        let prompts_json = std::fs::read_to_string(&prompts_path)?;
-        let prompts: Vec<String> = serde_json::from_str(&prompts_json)?;
+    let ids: Vec<u32> = if raw_ids.len() > max_len {
+        eprintln!(
+            "  [tokenize] prompt encoded to {} tokens, truncating to {}",
+            raw_ids.len(),
+            max_len
+        );
+        raw_ids[..max_len].to_vec()
+    } else {
+        raw_ids.to_vec()
+    };
 
-        for (i, p) in prompts.iter().enumerate() {
-            if p == text {
-                let token_path = format!("{bench_dir}/tokens_{i:02}.json");
-                let token_json = std::fs::read_to_string(&token_path)?;
-                let tokens: serde_json::Value = serde_json::from_str(&token_json)?;
-
-                let input_ids: Vec<i32> = tokens["input_ids"]
-                    .as_array().unwrap()
-                    .iter().map(|v| v.as_i64().unwrap() as i32)
-                    .collect();
-                let attention_mask: Vec<i32> = tokens["attention_mask"]
-                    .as_array().unwrap()
-                    .iter().map(|v| v.as_i64().unwrap() as i32)
-                    .collect();
-
-                return Ok((input_ids, attention_mask));
-            }
-        }
-    }
-
-    // Scan ALL token files in bench dir for matching prompt
-    if let Ok(entries) = std::fs::read_dir(bench_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().map(|e| e == "json").unwrap_or(false)
-                && path.file_name().map(|n| n.to_str().unwrap_or("").starts_with("tokens")).unwrap_or(false)
-            {
-                if let Ok(token_json) = std::fs::read_to_string(&path) {
-                    if let Ok(tokens) = serde_json::from_str::<serde_json::Value>(&token_json) {
-                        let stored = tokens["prompt"].as_str().unwrap_or("");
-                        // Fuzzy match: compare first 60 chars to handle quote differences
-                        if stored.len() > 60 && text.len() > 60 && stored[..60] == text[..60] {
-                            let input_ids: Vec<i32> = tokens["input_ids"]
-                                .as_array().unwrap()
-                                .iter().map(|v| v.as_i64().unwrap() as i32)
-                                .collect();
-                            let attention_mask: Vec<i32> = tokens["attention_mask"]
-                                .as_array().unwrap()
-                                .iter().map(|v| v.as_i64().unwrap() as i32)
-                                .collect();
-                            eprintln!("  Matched token file: {:?}", path.file_name());
-                            return Ok((input_ids, attention_mask));
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let ref_path = "/home/alex/ltx2-refs/gemma3/tokens.json";
-    if std::path::Path::new(ref_path).exists() {
-        let token_json = std::fs::read_to_string(ref_path)?;
-        let tokens: serde_json::Value = serde_json::from_str(&token_json)?;
-
-        let input_ids: Vec<i32> = tokens["input_ids"]
-            .as_array().unwrap()
-            .iter().map(|v| v.as_i64().unwrap() as i32)
-            .collect();
-        let attention_mask: Vec<i32> = tokens["attention_mask"]
-            .as_array().unwrap()
-            .iter().map(|v| v.as_i64().unwrap() as i32)
-            .collect();
-
-        return Ok((input_ids, attention_mask));
-    }
-
-    anyhow::bail!("No tokenized data found for prompt. Run bench_20_prompts.py first.");
+    let real_len = ids.len();
+    let pad = max_len - real_len;
+    let mut input_ids: Vec<i32> = vec![0i32; pad];
+    input_ids.extend(ids.iter().map(|&id| id as i32));
+    let mut attention_mask: Vec<i32> = vec![0i32; pad];
+    attention_mask.extend(std::iter::repeat(1i32).take(real_len));
+    debug_assert_eq!(input_ids.len(), max_len);
+    debug_assert_eq!(attention_mask.len(), max_len);
+    Ok((input_ids, attention_mask))
 }
 
 /// Generate Gaussian noise with Box-Muller transform.
