@@ -3513,6 +3513,19 @@ impl LTX2StreamingModel {
         let mut hs = linear3d(&v_flat, &self.proj_in_weight, Some(&self.proj_in_bias))?;
         let mut ahs = linear3d(&a_flat, audio_proj_in_w, Some(audio_proj_in_b))?;
 
+        // Pre-block audio dump for LTX2_DUMP_AUDIO (appended to the output
+        // dump once both phases run).
+        let ahs_after_projin = if std::env::var("LTX2_DUMP_AUDIO").is_ok() {
+            Some(ahs.clone())
+        } else {
+            None
+        };
+        let a_flat_input = if std::env::var("LTX2_DUMP_AUDIO").is_ok() {
+            Some(a_flat.clone())
+        } else {
+            None
+        };
+
         // 5. Timestep embeddings
         let num_mod_params = self.time_embed.num_mod_params;
         let ts_expanded = timestep.unsqueeze(1)?.expand(&[batch_size, num_video_tokens])?;
@@ -3820,6 +3833,27 @@ impl LTX2StreamingModel {
                 if prof { let _ = device.synchronize(); }
                 let t_after_forward = t_block.elapsed().as_millis();
 
+                // Per-block audio/video stats for LTX2_DUMP_AUDIO — reveals
+                // where the audio stream std explodes across the 48 blocks.
+                if std::env::var("LTX2_DUMP_AUDIO").is_ok() {
+                    let _ = device.synchronize();
+                    let stats = |t: &Tensor| -> Option<(f64, f64, f32, f32)> {
+                        t.to_dtype(DType::F32).and_then(|x| x.to_vec()).ok().map(|v| {
+                            let n = v.len() as f64;
+                            let mean = v.iter().map(|x| *x as f64).sum::<f64>() / n;
+                            let var = v.iter().map(|x| { let d = *x as f64 - mean; d*d }).sum::<f64>() / n;
+                            let std = var.sqrt();
+                            let mn = v.iter().cloned().fold(f32::INFINITY, f32::min);
+                            let mx = v.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                            (mean, std, mn, mx)
+                        })
+                    };
+                    if let (Some(a), Some(v)) = (stats(&new_ahs), stats(&new_hs)) {
+                        log::info!("[BLK {:>2}] VIDEO mean={:+.4} std={:.4} min={:+.4} max={:+.4}  ||  AUDIO mean={:+.4} std={:.4} min={:+.4} max={:+.4}",
+                            i, v.0, v.1, v.2, v.3, a.0, a.1, a.2, a.3);
+                    }
+                }
+
                 // Dump block 0 outputs (the last thing fired in the OnceLock above
                 // already saved inputs; we save outputs to a separate file).
                 if i == 0 && std::env::var("LTX2_DUMP_BLOCK0").is_ok() {
@@ -3875,11 +3909,40 @@ impl LTX2StreamingModel {
         let a_shift = a_final_ss.narrow(2, 0, 1)?.squeeze_dim(2)?;
         let a_scale = a_final_ss.narrow(2, 1, 1)?.squeeze_dim(2)?;
         let a_normed = layer_norm_no_affine(&ahs, self.config.norm_eps)?;
-        let a_output = a_normed.mul(&a_scale.add_scalar(1.0)?.to_dtype(DType::BF16)?)?.add(&a_shift)?;
-        let a_output = linear3d(&a_output, audio_proj_out_w, audio_proj_out_b)?;
+        let a_modulated = a_normed.mul(&a_scale.add_scalar(1.0)?.to_dtype(DType::BF16)?)?.add(&a_shift)?;
+        let a_linout = linear3d(&a_modulated, audio_proj_out_w, audio_proj_out_b)?;
         // Unpatchify audio: [B, T, C*F] → [B, C, T, F]
-        let a_output = a_output.reshape(&[batch_size, audio_frames, audio_channels, audio_freq])?; // [B, T, C, F]
+        let a_output = a_linout.reshape(&[batch_size, audio_frames, audio_channels, audio_freq])?; // [B, T, C, F]
         let a_output = a_output.permute(&[0, 2, 1, 3])?; // [B, C, T, F]
+
+        // LTX2_DUMP_AUDIO=1 — audio path sanity dump. Fires once per process
+        // and saves intermediates to rust_audio_dump.safetensors so they can
+        // be diffed against python_audio_dump.safetensors.
+        if std::env::var("LTX2_DUMP_AUDIO").is_ok() {
+            static AUDIO_DUMPED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            if AUDIO_DUMPED.set(()).is_ok() {
+                let _ = device.synchronize();
+                let mut dump: HashMap<String, Tensor> = HashMap::new();
+                if let Some(t) = a_flat_input { dump.insert("a_flat_input".into(), t); }
+                if let Some(t) = ahs_after_projin { dump.insert("ahs_after_projin".into(), t); }
+                dump.insert("ahs_final".into(), ahs.clone());
+                dump.insert("a_timestep".into(), a_timestep.clone());
+                dump.insert("a_embedded".into(), a_embedded.clone());
+                dump.insert("audio_sst".into(), audio_sst.clone());
+                dump.insert("a_shift".into(), a_shift.clone());
+                dump.insert("a_scale".into(), a_scale.clone());
+                dump.insert("a_normed".into(), a_normed.clone());
+                dump.insert("a_modulated".into(), a_modulated.clone());
+                dump.insert("a_linout".into(), a_linout.clone());
+                dump.insert("a_output_final".into(), a_output.clone());
+                flame_core::serialization::save_tensors(
+                    &dump,
+                    std::path::Path::new("/home/alex/EriDiffusion/inference-flame/output/rust_audio_dump.safetensors"),
+                    flame_core::serialization::SerializationFormat::SafeTensors,
+                )?;
+                log::info!("[LTX2 AUDIO DUMP] saved {} tensors", dump.len());
+            }
+        }
 
         Ok((v_output, a_output))
     }
