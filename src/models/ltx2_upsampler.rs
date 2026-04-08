@@ -238,6 +238,7 @@ impl SpatialResampler {
             Some(&self.conv_bias),
             (1, 1),  // stride
             (1, 1),  // padding
+            (1, 1),  // dilation
             1,       // groups
         )?;
 

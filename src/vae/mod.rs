@@ -7,4 +7,6 @@ pub use klein_vae::KleinVaeDecoder;
 pub mod wan21_vae;
 pub use wan21_vae::Wan21VaeDecoder;
 pub mod ltx2_audio_vae;
+pub use ltx2_audio_vae::LTX2AudioVaeDecoder;
 pub mod ltx2_vocoder;
+pub use ltx2_vocoder::LTX2Vocoder;

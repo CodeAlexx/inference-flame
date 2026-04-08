@@ -10,7 +10,7 @@ use flame_core::{global_cuda_device, DType, Shape, Tensor};
 use std::time::Instant;
 
 const VAE_PATH: &str =
-    "/home/alex/.serenity/models/vaes/LTX2/LTX2_video_vae_old_bf16.safetensors";
+    "/home/alex/.serenity/models/checkpoints/ltx-2.3-22b-distilled.safetensors";
 
 fn main() -> flame_core::Result<()> {
     eprintln!("=== LTX-2 Video VAE Decoder Test ===\n");
@@ -48,7 +48,7 @@ fn main() -> flame_core::Result<()> {
 
     // Decode
     let t1 = Instant::now();
-    let decoded = vae.decode(&latent, 0.05, 0.0)?;
+    let decoded = vae.decode(&latent)?;
     let decode_time = t1.elapsed();
 
     let out_dims = decoded.shape().dims().to_vec();

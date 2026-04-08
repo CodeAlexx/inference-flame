@@ -1,324 +1,426 @@
-//! LTX-2.3 Audio VAE Decoder — pure flame-core.
+//! LTX-2.3 Audio VAE decoder — pure flame-core, production checkpoint parity.
 //!
-//! Decodes audio latents [B, 8, T, mel_bins] → mel spectrogram [B, 2, T', mel_bins].
+//! Matches `AudioDecoder` from `ltx_core.model.audio_vae.audio_vae` for the
+//! LTX-2.3 22B {dev,distilled} checkpoints:
 //!
-//! Architecture: standard 2D LDM-style VAE decoder with:
-//!   - Causal conv2d (pad width axis only)
-//!   - GroupNorm normalization
-//!   - SiLU activation
-//!   - Mid block: 2 ResNet blocks + self-attention (Conv2d 1x1)
-//!   - 4 up stages with ResNet blocks + upsample convs
-//!   - Per-channel statistics denormalization
+//!   input latent: [B, 8, T_lat, F_lat]  (normalized)
+//!   1. patchify denormalize:  [B, 8, T, F] → [B, T, 128] via rearrange "b c t f -> b t (c f)"
+//!                             then un_normalize with per_channel_statistics (128-dim!)
+//!                             then rearrange back to [B, 8, T, F]
+//!   2. conv_in: CausalConv2d(8 → 512, k=3, causality_axis=HEIGHT)
+//!   3. mid:
+//!        block_1: ResnetBlock(512, 512)
+//!        attn_1: Identity   (production checkpoint has NO mid attention)
+//!        block_2: ResnetBlock(512, 512)
+//!   4. up blocks (forward order = reversed iteration over up[0..3]):
+//!        up[2]: 3 ResnetBlocks all 512 → 512, then upsample(512→512, nearest ×2 + conv + drop first frame)
+//!        up[1]: 3 ResnetBlocks (512→256, 256→256, 256→256), then upsample(256→256)
+//!        up[0]: 3 ResnetBlocks (256→128, 128→128, 128→128), NO upsample
+//!   5. norm_out: PixelNorm (no weights)
+//!   6. conv_out: CausalConv2d(128 → 2, k=3)   — stereo output
 //!
-//! Weight key prefix: `audio_vae.decoder.*`
+//! Causality is on HEIGHT (dim 2, time). Frequency (dim 3) is padded symmetrically.
+//! Causal padding is ZERO padding (unlike video VAE first-frame replicate).
 //!
-//! ⚠️ STAGING — move to production after cargo check passes.
+//! ResnetBlock:
+//!   h = norm1(x)                       # PixelNorm (no weights)
+//!   h = silu(h)
+//!   h = conv1(h, causal)
+//!   h = norm2(h)
+//!   h = silu(h)
+//!   h = conv2(h, causal)
+//!   if in != out: x = nin_shortcut(x)  # 1×1 conv
+//!   return x + h
 
-use flame_core::{DType, Result, Shape, Tensor};
+use flame_core::serialization;
+use flame_core::{CudaDevice, DType, Error, Result, Shape, Tensor};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 type Weights = HashMap<String, Tensor>;
 
-const LATENT_DOWNSAMPLE_FACTOR: usize = 4;
+const LATENT_CH: usize = 8;
+const PATCHED_CH: usize = 128; // 8 latent × 16 mel_bins
+const PIXEL_NORM_EPS: f32 = 1e-6;
 
 // ---------------------------------------------------------------------------
-// Per-channel statistics (denormalize latents before decode)
+// Weight loading
 // ---------------------------------------------------------------------------
 
-/// Denormalize audio latents using stored mean/std statistics.
-///
-/// ## PyTorch reference:
-/// ```python
-/// def un_normalize(self, x):
-///     return x * self.channel_std + self.channel_mean
-/// ```
-fn denormalize(
-    x: &Tensor,
-    mean: &Tensor,  // [channels]
-    std: &Tensor,   // [channels]
-) -> Result<Tensor> {
-    let dims = x.shape().dims().to_vec();
-    let c = dims[1];
-    // Reshape mean/std to [1, C, 1, 1] for broadcasting
-    let mean_4d = mean.reshape(&[1, c, 1, 1])?;
-    let std_4d = std.reshape(&[1, c, 1, 1])?;
-    x.mul(&std_4d.expand(&dims)?)?.add(&mean_4d.expand(&dims)?)
+fn get_bf16(weights: &Weights, key: &str) -> Result<Tensor> {
+    weights
+        .get(key)
+        .ok_or_else(|| Error::InvalidOperation(format!("AudioVAE: missing weight: {key}")))?
+        .to_dtype(DType::BF16)
+}
+
+fn has_key(weights: &Weights, key: &str) -> bool {
+    weights.contains_key(key)
 }
 
 // ---------------------------------------------------------------------------
-// Causal Conv2d helper
+// 2D zero padding (asymmetric per axis).
+// `left`, `right`, `top`, `bottom` in F.pad order (W left/right, H top/bottom).
+// Input is [B, C, H, W].
 // ---------------------------------------------------------------------------
 
-/// Causal 2D convolution: pad width (frequency) axis only.
-/// For k=3: pad_left=1, pad_right=1 on width axis; no height padding.
-///
-/// Uses flame-core's Conv2d infrastructure.
-fn causal_conv2d(
-    x: &Tensor,
-    weight: &Tensor,
-    bias: Option<&Tensor>,
-    stride: usize,
-) -> Result<Tensor> {
-    let k_h = weight.shape().dims()[2];
-    let k_w = weight.shape().dims()[3];
-    let pad_h = (k_h - 1) / 2; // symmetric padding on height (time)
-    let pad_w = (k_w - 1) / 2; // symmetric padding on width (freq)
+fn pad2d_zero(x: &Tensor, left: usize, right: usize, top: usize, bottom: usize) -> Result<Tensor> {
+    let d = x.shape().dims();
+    let (b, c, h, w) = (d[0], d[1], d[2], d[3]);
+    let new_h = h + top + bottom;
+    let new_w = w + left + right;
 
-    // Conv2d via cuDNN with symmetric padding
-    flame_core::cudnn::cudnn_conv2d_bf16(x, weight, bias, (stride, stride), (pad_h, pad_w), 1)
-}
+    // Fast path: no padding
+    if left == 0 && right == 0 && top == 0 && bottom == 0 {
+        return Ok(x.clone());
+    }
 
-// ---------------------------------------------------------------------------
-// GroupNorm
-// ---------------------------------------------------------------------------
-
-fn group_norm_32(x: &Tensor, weight: &Tensor, bias: &Tensor) -> Result<Tensor> {
-    flame_core::group_norm::group_norm(x, 32, Some(weight), Some(bias), 1e-6)
-}
-
-// ---------------------------------------------------------------------------
-// ResNet Block (2D)
-// ---------------------------------------------------------------------------
-
-/// Audio VAE ResNet block.
-///
-/// ## PyTorch reference:
-/// ```python
-/// h = self.norm1(x)
-/// h = silu(h)
-/// h = self.conv1(h)
-/// h = self.norm2(h)
-/// h = silu(h)
-/// h = self.conv2(h)
-/// if in_ch != out_ch: x = self.nin_shortcut(x)
-/// return x + h
-/// ```
-fn resnet_block(
-    x: &Tensor,
-    weights: &Weights,
-    prefix: &str,
-    in_ch: usize,
-    out_ch: usize,
-) -> Result<Tensor> {
-    let w = |suffix: &str| -> Result<&Tensor> {
-        let key = format!("{prefix}.{suffix}");
-        weights.get(&key).ok_or_else(|| {
-            flame_core::Error::InvalidInput(format!("Missing audio VAE weight: {key}"))
-        })
-    };
-
-    let h = group_norm_32(x, w("norm1.weight")?, w("norm1.bias")?)?;
-    let h = h.silu()?;
-    let h = causal_conv2d(&h, w("conv1.conv.weight")?, Some(w("conv1.conv.bias")?), 1)?;
-    let h = group_norm_32(&h, w("norm2.weight")?, w("norm2.bias")?)?;
-    let h = h.silu()?;
-    let h = causal_conv2d(&h, w("conv2.conv.weight")?, Some(w("conv2.conv.bias")?), 1)?;
-
-    let x = if in_ch != out_ch {
-        causal_conv2d(x, w("nin_shortcut.conv.weight")?, Some(w("nin_shortcut.conv.bias")?), 1)?
+    // Build horizontally padded rows: [B, C, H, W + left + right]
+    let mut with_w = if left > 0 || right > 0 {
+        let mut parts: Vec<Tensor> = Vec::new();
+        if left > 0 {
+            parts.push(Tensor::zeros_dtype(
+                Shape::from_dims(&[b, c, h, left]),
+                x.dtype(),
+                x.device().clone(),
+            )?);
+        }
+        parts.push(x.clone());
+        if right > 0 {
+            parts.push(Tensor::zeros_dtype(
+                Shape::from_dims(&[b, c, h, right]),
+                x.dtype(),
+                x.device().clone(),
+            )?);
+        }
+        let refs: Vec<&Tensor> = parts.iter().collect();
+        Tensor::cat(&refs, 3)?
     } else {
         x.clone()
     };
 
-    x.add(&h)
-}
-
-// ---------------------------------------------------------------------------
-// Self-Attention (Conv2d 1x1 QKV)
-// ---------------------------------------------------------------------------
-
-/// Self-attention block using Conv2d 1x1 for Q/K/V projections.
-///
-/// ## PyTorch reference:
-/// ```python
-/// h = norm(x)
-/// q = q_conv(h)  # 1x1 conv
-/// k = k_conv(h)
-/// v = v_conv(h)
-/// # Reshape to [B, C, N] → attention → reshape back
-/// attn = softmax(q^T @ k / sqrt(C)) @ v
-/// h = proj_out(attn)
-/// return x + h
-/// ```
-fn self_attention(
-    x: &Tensor,
-    weights: &Weights,
-    prefix: &str,
-) -> Result<Tensor> {
-    let w = |suffix: &str| -> Result<&Tensor> {
-        let key = format!("{prefix}.{suffix}");
-        weights.get(&key).ok_or_else(|| {
-            flame_core::Error::InvalidInput(format!("Missing: {key}"))
-        })
-    };
-
-    let dims = x.shape().dims().to_vec();
-    let (b, c, h_dim, w_dim) = (dims[0], dims[1], dims[2], dims[3]);
-    let n = h_dim * w_dim;
-
-    let normed = group_norm_32(x, w("norm.weight")?, w("norm.bias")?)?;
-
-    // QKV via 1x1 conv (equivalent to linear projection per spatial position)
-    let q = causal_conv2d(&normed, w("q.weight")?, Some(w("q.bias")?), 1)?;
-    let k = causal_conv2d(&normed, w("k.weight")?, Some(w("k.bias")?), 1)?;
-    let v = causal_conv2d(&normed, w("v.weight")?, Some(w("v.bias")?), 1)?;
-
-    // Reshape to [B, C, N] for attention
-    let q = q.reshape(&[b, c, n])?;
-    let k = k.reshape(&[b, c, n])?;
-    let v = v.reshape(&[b, c, n])?;
-
-    // scores = q^T @ k / sqrt(C)
-    let q_t = q.permute(&[0, 2, 1])?; // [B, N, C]
-    let scores = q_t.matmul(&k)?; // [B, N, N]
-    let scale = (c as f32).powf(-0.5);
-    let scores = scores.mul_scalar(scale)?;
-    let attn = scores.softmax(-1)?;
-
-    // out = v @ attn^T → [B, C, N]
-    let v_out = v.matmul(&attn.permute(&[0, 2, 1])?)?; // [B, C, N]
-    let v_out = v_out.reshape(&[b, c, h_dim, w_dim])?;
-
-    // Output projection
-    let out = causal_conv2d(&v_out, w("proj_out.weight")?, Some(w("proj_out.bias")?), 1)?;
-
-    x.add(&out)
-}
-
-// ---------------------------------------------------------------------------
-// Mid block
-// ---------------------------------------------------------------------------
-
-fn mid_block(x: &Tensor, weights: &Weights, prefix: &str, ch: usize) -> Result<Tensor> {
-    let x = resnet_block(x, weights, &format!("{prefix}.block_1"), ch, ch)?;
-    let x = self_attention(&x, weights, &format!("{prefix}.attn_1"))?;
-    resnet_block(&x, weights, &format!("{prefix}.block_2"), ch, ch)
-}
-
-// ---------------------------------------------------------------------------
-// Audio VAE Decoder
-// ---------------------------------------------------------------------------
-
-pub struct AudioVaeDecoder {
-    weights: Weights,
-    ch_mult: Vec<usize>,
-    base_ch: usize,
-    num_res_blocks: usize,
-}
-
-impl AudioVaeDecoder {
-    /// Load audio VAE decoder weights from checkpoint.
-    ///
-    /// `weights` should contain keys with prefix `audio_vae.decoder.*`.
-    pub fn load(weights: &Weights) -> Result<Self> {
-        // Filter to audio_vae keys only
-        let audio_weights: Weights = weights.iter()
-            .filter(|(k, _)| k.starts_with("audio_vae."))
-            .map(|(k, v)| {
-                // Strip "audio_vae." prefix
-                let short = k.strip_prefix("audio_vae.").unwrap_or(k);
-                (short.to_string(), v.clone())
-            })
-            .collect();
-
-        if audio_weights.is_empty() {
-            return Err(flame_core::Error::InvalidInput(
-                "No audio_vae keys found in weights".into(),
-            ));
+    // Now pad rows: [B, C, H + top + bottom, new_w]
+    if top > 0 || bottom > 0 {
+        let mut parts: Vec<Tensor> = Vec::new();
+        if top > 0 {
+            parts.push(Tensor::zeros_dtype(
+                Shape::from_dims(&[b, c, top, new_w]),
+                x.dtype(),
+                x.device().clone(),
+            )?);
         }
+        parts.push(with_w);
+        if bottom > 0 {
+            parts.push(Tensor::zeros_dtype(
+                Shape::from_dims(&[b, c, bottom, new_w]),
+                x.dtype(),
+                x.device().clone(),
+            )?);
+        }
+        let refs: Vec<&Tensor> = parts.iter().collect();
+        with_w = Tensor::cat(&refs, 2)?;
+    }
 
-        log::info!("[AudioVAE] Loaded {} weights", audio_weights.len());
+    let _ = new_h;
+    Ok(with_w)
+}
 
+// ---------------------------------------------------------------------------
+// CausalConv2d — zero-pads time axis on the "top" (dim 2), symmetric on W.
+// ---------------------------------------------------------------------------
+
+struct CausalConv2d {
+    weight: Tensor,
+    bias: Tensor,
+    kernel: (usize, usize),
+}
+
+impl CausalConv2d {
+    fn load(weights: &Weights, prefix: &str) -> Result<Self> {
+        let weight = get_bf16(weights, &format!("{prefix}.weight"))?;
+        let bias = get_bf16(weights, &format!("{prefix}.bias"))?;
+        let dims = weight.shape().dims().to_vec();
         Ok(Self {
-            weights: audio_weights,
-            ch_mult: vec![1, 2, 4, 4], // Standard LDM channel multipliers
-            base_ch: 128,
-            num_res_blocks: 2,
+            weight,
+            bias,
+            kernel: (dims[2], dims[3]),
         })
     }
 
-    /// Decode audio latent → mel spectrogram.
-    ///
-    /// Input: [B, 8, T, mel_bins] latent
-    /// Output: [B, 2, T', mel_bins] mel spectrogram
-    pub fn decode(&self, latent: &Tensor) -> Result<Tensor> {
-        let w = &self.weights;
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let kh = self.kernel.0;
+        let kw = self.kernel.1;
+        let pad_h = kh - 1; // all on top (causal time)
+        let pad_w = kw - 1; // symmetric split below
+        let pad_w_left = pad_w / 2;
+        let pad_w_right = pad_w - pad_w_left;
 
-        // 1. Denormalize latents
-        let mean = w.get("per_channel_statistics.mean-of-means")
-            .ok_or_else(|| flame_core::Error::InvalidInput("Missing per_channel_statistics.mean-of-means".into()))?;
-        let std = w.get("per_channel_statistics.std-of-means")
-            .ok_or_else(|| flame_core::Error::InvalidInput("Missing per_channel_statistics.std-of-means".into()))?;
-        let x = denormalize(latent, mean, std)?;
+        let padded = pad2d_zero(x, pad_w_left, pad_w_right, pad_h, 0)?;
+        // conv with padding=0 (we already padded manually)
+        flame_core::cudnn::cudnn_conv2d_bf16(
+            &padded,
+            &self.weight,
+            Some(&self.bias),
+            (1, 1), // stride
+            (0, 0), // padding
+            (1, 1), // dilation
+            1,      // groups
+        )
+    }
+}
 
-        // 2. conv_in: 8 → 512
-        let x = causal_conv2d(
-            &x,
-            w.get("decoder.conv_in.conv.weight").ok_or_else(|| flame_core::Error::InvalidInput("Missing decoder.conv_in".into()))?,
-            w.get("decoder.conv_in.conv.bias"),
-            1,
-        )?;
+// ---------------------------------------------------------------------------
+// PixelNorm — x / sqrt(mean(x^2, dim=1, keepdim=True) + eps), no weights.
+// ---------------------------------------------------------------------------
 
-        // 3. Mid block (512 channels)
-        let block_in = self.base_ch * self.ch_mult[self.ch_mult.len() - 1]; // 128 * 4 = 512
-        let x = mid_block(&x, w, "decoder.mid", block_in)?;
+fn pixel_norm(x: &Tensor) -> Result<Tensor> {
+    let x_f32 = x.to_dtype(DType::F32)?;
+    let x_sq = x_f32.mul(&x_f32)?;
+    let mean_sq = x_sq.mean_along_dims(&[1], true)?;
+    let denom = mean_sq.add_scalar(PIXEL_NORM_EPS)?.rsqrt()?;
+    x_f32.mul(&denom)?.to_dtype(x.dtype())
+}
 
-        // 4. Up blocks (reversed)
-        let mut x = x;
-        let num_resolutions = self.ch_mult.len();
-        for level in (0..num_resolutions).rev() {
-            let ch = self.base_ch * self.ch_mult[level];
-            let ch_prev = if level == num_resolutions - 1 {
-                block_in
-            } else {
-                self.base_ch * self.ch_mult[level + 1]
-            };
+// ---------------------------------------------------------------------------
+// ResnetBlock — norm → silu → conv → norm → silu → conv + skip (nin if needed)
+// ---------------------------------------------------------------------------
 
-            for block_idx in 0..=self.num_res_blocks {
-                let in_ch = if block_idx == 0 { ch_prev } else { ch };
-                let prefix = format!("decoder.up.{level}.block.{block_idx}");
-                x = resnet_block(&x, w, &prefix, in_ch, ch)?;
-            }
+struct ResnetBlock {
+    conv1: CausalConv2d,
+    conv2: CausalConv2d,
+    nin_shortcut: Option<CausalConv2d>,
+}
 
-            if level != 0 {
-                let up_w = w.get(&format!("decoder.up.{level}.upsample.conv.weight"))
-                    .ok_or_else(|| flame_core::Error::InvalidInput(
-                        format!("Missing decoder.up.{level}.upsample.conv.weight")))?;
-                let up_b = w.get(&format!("decoder.up.{level}.upsample.conv.bias"));
-                // Upsample: nearest-neighbor 2x then conv
-                let dims = x.shape().dims().to_vec();
-                let (b, c, h, ww) = (dims[0], dims[1], dims[2], dims[3]);
-                x = x.upsample_nearest2d(h * 2, ww * 2)?;
-                x = causal_conv2d(&x, up_w, up_b, 1)?;
-            }
+impl ResnetBlock {
+    fn load(weights: &Weights, prefix: &str) -> Result<Self> {
+        let conv1 = CausalConv2d::load(weights, &format!("{prefix}.conv1.conv"))?;
+        let conv2 = CausalConv2d::load(weights, &format!("{prefix}.conv2.conv"))?;
+        let nin_key = format!("{prefix}.nin_shortcut.conv.weight");
+        let nin_shortcut = if has_key(weights, &nin_key) {
+            Some(CausalConv2d::load(weights, &format!("{prefix}.nin_shortcut.conv"))?)
+        } else {
+            None
+        };
+        Ok(Self { conv1, conv2, nin_shortcut })
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let h = pixel_norm(x)?;
+        let h = h.silu()?;
+        let h = self.conv1.forward(&h)?;
+        let h = pixel_norm(&h)?;
+        let h = h.silu()?;
+        let h = self.conv2.forward(&h)?;
+
+        let skip = match &self.nin_shortcut {
+            Some(nin) => nin.forward(x)?,
+            None => x.clone(),
+        };
+        skip.add(&h)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Mid block — block_1 → (Identity) → block_2
+// ---------------------------------------------------------------------------
+
+struct MidBlock {
+    block_1: ResnetBlock,
+    block_2: ResnetBlock,
+}
+
+impl MidBlock {
+    fn load(weights: &Weights, prefix: &str) -> Result<Self> {
+        Ok(Self {
+            block_1: ResnetBlock::load(weights, &format!("{prefix}.block_1"))?,
+            block_2: ResnetBlock::load(weights, &format!("{prefix}.block_2"))?,
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let h = self.block_1.forward(x)?;
+        // attn_1 = Identity in production (no op)
+        self.block_2.forward(&h)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Upsample — nearest 2× → causal conv2d → drop first frame on time axis.
+// ---------------------------------------------------------------------------
+
+struct Upsample {
+    conv: CausalConv2d,
+}
+
+impl Upsample {
+    fn load(weights: &Weights, prefix: &str) -> Result<Self> {
+        Ok(Self {
+            conv: CausalConv2d::load(weights, &format!("{prefix}.conv.conv"))?,
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let d = x.shape().dims();
+        let (h, w) = (d[2], d[3]);
+        let up = x.upsample_nearest2d(h * 2, w * 2)?;
+        let conv_out = self.conv.forward(&up)?;
+        // Drop the first frame on the causal (HEIGHT) axis.
+        let new_h = conv_out.shape().dims()[2];
+        conv_out.narrow(2, 1, new_h - 1)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// UpStage — list of ResnetBlocks + optional Upsample
+// ---------------------------------------------------------------------------
+
+struct UpStage {
+    blocks: Vec<ResnetBlock>,
+    upsample: Option<Upsample>,
+}
+
+impl UpStage {
+    fn load(weights: &Weights, prefix: &str, n_blocks: usize, has_upsample: bool) -> Result<Self> {
+        let mut blocks = Vec::with_capacity(n_blocks);
+        for i in 0..n_blocks {
+            blocks.push(ResnetBlock::load(weights, &format!("{prefix}.block.{i}"))?);
         }
+        let upsample = if has_upsample {
+            Some(Upsample::load(weights, &format!("{prefix}.upsample"))?)
+        } else {
+            None
+        };
+        Ok(Self { blocks, upsample })
+    }
 
-        // 5. Final: norm → silu → conv_out
-        let norm_w = w.get("decoder.norm_out.weight")
-            .ok_or_else(|| flame_core::Error::InvalidInput("Missing decoder.norm_out.weight".into()))?;
-        let norm_b = w.get("decoder.norm_out.bias")
-            .ok_or_else(|| flame_core::Error::InvalidInput("Missing decoder.norm_out.bias".into()))?;
-        let x = group_norm_32(&x, norm_w, norm_b)?;
-        let x = x.silu()?;
-        let x = causal_conv2d(
-            &x,
-            w.get("decoder.conv_out.conv.weight").ok_or_else(|| flame_core::Error::InvalidInput("Missing decoder.conv_out".into()))?,
-            w.get("decoder.conv_out.conv.bias"),
-            1,
-        )?;
-
-        log::info!("[AudioVAE] Decoded: {:?}", x.shape());
+    fn forward(&self, mut x: Tensor) -> Result<Tensor> {
+        for block in &self.blocks {
+            x = block.forward(&x)?;
+        }
+        if let Some(up) = &self.upsample {
+            x = up.forward(&x)?;
+        }
         Ok(x)
     }
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn test_ch_mult() {
-        let ch_mult = vec![1, 2, 4, 4];
-        let base = 128;
-        assert_eq!(base * ch_mult[3], 512); // top = 512
-        assert_eq!(base * ch_mult[0], 128); // bottom = 128
+// ---------------------------------------------------------------------------
+// PerChannelStatistics — denormalize on the patched representation
+// ---------------------------------------------------------------------------
+
+struct PerChannelStatistics {
+    mean: Tensor, // [PATCHED_CH]
+    std: Tensor,  // [PATCHED_CH]
+}
+
+impl PerChannelStatistics {
+    fn load(weights: &Weights) -> Result<Self> {
+        Ok(Self {
+            mean: get_bf16(weights, "per_channel_statistics.mean-of-means")?,
+            std: get_bf16(weights, "per_channel_statistics.std-of-means")?,
+        })
+    }
+
+    /// `x`: `[B, 8, T, 16]`. Returns same shape, denormalized via:
+    ///   rearrange "b c t f -> b t (c f)"  (so channel dim becomes 128)
+    ///   x_128 * std + mean
+    ///   rearrange back.
+    fn un_normalize(&self, x: &Tensor) -> Result<Tensor> {
+        let d = x.shape().dims();
+        let (b, c, t, f) = (d[0], d[1], d[2], d[3]);
+        let cf = c * f;
+
+        // [B, C, T, F] → [B, T, C, F] → [B, T, C*F]
+        let flat = x.permute(&[0, 2, 1, 3])?.reshape(&[b, t, cf])?;
+        let std = self.std.reshape(&[1, 1, cf])?;
+        let mean = self.mean.reshape(&[1, 1, cf])?;
+        let denorm = flat.mul(&std)?.add(&mean)?;
+        // [B, T, C*F] → [B, T, C, F] → [B, C, T, F]
+        denorm.reshape(&[b, t, c, f])?.permute(&[0, 2, 1, 3])
     }
 }
+
+// ---------------------------------------------------------------------------
+// Public decoder
+// ---------------------------------------------------------------------------
+
+pub struct LTX2AudioVaeDecoder {
+    stats: PerChannelStatistics,
+    conv_in: CausalConv2d,
+    mid: MidBlock,
+    /// Stages stored in ascending order (up[0], up[1], up[2]); forward
+    /// iterates in REVERSE to match Python's `_run_upsampling_path`.
+    ups: Vec<UpStage>,
+    conv_out: CausalConv2d,
+}
+
+impl LTX2AudioVaeDecoder {
+    pub fn load(weights: &Weights) -> Result<Self> {
+        let stats = PerChannelStatistics::load(weights)?;
+        let conv_in = CausalConv2d::load(weights, "decoder.conv_in.conv")?;
+        let mid = MidBlock::load(weights, "decoder.mid")?;
+
+        // 3 up stages; up[0] has no upsample, up[1]/up[2] do.
+        let ups = vec![
+            UpStage::load(weights, "decoder.up.0", 3, false)?,
+            UpStage::load(weights, "decoder.up.1", 3, true)?,
+            UpStage::load(weights, "decoder.up.2", 3, true)?,
+        ];
+
+        let conv_out = CausalConv2d::load(weights, "decoder.conv_out.conv")?;
+
+        Ok(Self { stats, conv_in, mid, ups, conv_out })
+    }
+
+    /// Decode normalized audio latent `[B, 8, T_lat, F_lat]` → mel spectrogram
+    /// `[B, 2, T_out, F_out]` where `T_out ≈ T_lat * 4`, `F_out = F_lat * 4`.
+    pub fn decode(&self, latent: &Tensor) -> Result<Tensor> {
+        // 1. Denormalize via patchify → un_normalize → unpatchify
+        let h = self.stats.un_normalize(latent)?;
+
+        // 2. conv_in: 8 → 512
+        let mut h = self.conv_in.forward(&h)?;
+
+        // 3. mid block
+        h = self.mid.forward(&h)?;
+
+        // 4. Up stages in REVERSE order: up[2] → up[1] → up[0]
+        for stage in self.ups.iter().rev() {
+            h = stage.forward(h)?;
+        }
+
+        // 5. norm_out → silu → conv_out
+        h = pixel_norm(&h)?;
+        h = h.silu()?;
+        self.conv_out.forward(&h)
+    }
+
+    /// Load from a full LTX-2.3 safetensors checkpoint. Strips the
+    /// `audio_vae.` prefix and only pulls decoder + stats keys into GPU.
+    pub fn from_file(path: &str, device: &Arc<CudaDevice>) -> Result<Self> {
+        eprintln!("Loading LTX-2.3 Audio VAE from: {path}");
+        let raw = serialization::load_file_filtered(
+            std::path::Path::new(path),
+            device,
+            |k| k.starts_with("audio_vae.decoder.") || k.starts_with("audio_vae.per_channel_statistics."),
+        )?;
+
+        let mut normalized: Weights = HashMap::new();
+        for (key, value) in raw {
+            let stripped = key.strip_prefix("audio_vae.").unwrap_or(&key).to_string();
+            normalized.insert(stripped, value);
+        }
+
+        let dec_count = normalized.keys().filter(|k| k.starts_with("decoder.")).count();
+        let stat_count = normalized
+            .keys()
+            .filter(|k| k.starts_with("per_channel_statistics."))
+            .count();
+        eprintln!("  {dec_count} audio decoder keys, {stat_count} statistics keys");
+
+        Self::load(&normalized)
+    }
+}
+
+// Suppress unused const warning if compile excludes patched_ch usage.
+const _: usize = LATENT_CH + PATCHED_CH;
