@@ -93,11 +93,16 @@ fn main() -> anyhow::Result<()> {
     drop(upsampler);
     stats("video_x (after Rust upsampler)", &video_x)?;
 
-    // --- Load Rust stage 1 audio latent ---
+    // --- Load stage 1 audio latent ---
+    // Optionally load from a custom path via LTX2_AUDIO_INPUT (used to test
+    // stage 2 with Python's clean stage 1 audio for the matched-noise test).
+    let audio_input_path = std::env::var("LTX2_AUDIO_INPUT")
+        .unwrap_or_else(|_| format!("{OUTPUT_DIR}/ltx2_stage1_audio_latents.safetensors"));
+    println!("  audio input: {audio_input_path}");
     let rust_s1_audio = flame_core::serialization::load_file(
-        std::path::Path::new(&format!("{OUTPUT_DIR}/ltx2_stage1_audio_latents.safetensors")), &device)?;
+        std::path::Path::new(&audio_input_path), &device)?;
     let mut audio_x = rust_s1_audio.get("latents").unwrap().to_dtype(DType::BF16)?;
-    stats("audio_x (from Rust stage 1)", &audio_x)?;
+    stats("audio_x (loaded)", &audio_x)?;
 
     // --- Load transformer ---
     println!("\n--- Load Transformer ---");
@@ -114,16 +119,45 @@ fn main() -> anyhow::Result<()> {
     let noise_scale = s2_sigmas[0];
     println!("  noise_scale = {:.4} ({} steps)", noise_scale, s2_steps);
 
+    // Optionally load deterministic noise shared with Python via
+    // LTX2_NOISE_FILE=path/to/matched_noise.safetensors. Used for the
+    // apples-to-apples Rust↔Python comparison: with identical input
+    // (audio_x) AND identical noise, both pipelines should produce
+    // identical output if the model forward is correct.
+    let matched_noise_path = std::env::var("LTX2_NOISE_FILE").ok();
     let v_dims = video_x.shape().dims().to_vec();
-    let s2_numel = v_dims.iter().product::<usize>();
-    let noise = make_noise(s2_numel, SEED + 100, &v_dims, &device)?;
-    video_x = video_x.mul_scalar(1.0 - noise_scale)?.add(&noise.mul_scalar(noise_scale)?)?;
-    drop(noise);
+    let a_dims = audio_x.shape().dims().to_vec();
+
+    let (video_noise, audio_noise) = if let Some(path) = &matched_noise_path {
+        println!("  [matched noise] loading from {path}");
+        let loaded = flame_core::serialization::load_file(
+            std::path::Path::new(path), &device,
+        )?;
+        let vn = loaded.get("video_noise")
+            .ok_or_else(|| anyhow::anyhow!("matched noise file missing video_noise"))?
+            .to_dtype(DType::BF16)?;
+        let an = loaded.get("audio_noise")
+            .ok_or_else(|| anyhow::anyhow!("matched noise file missing audio_noise"))?
+            .to_dtype(DType::BF16)?;
+        if vn.shape().dims() != v_dims.as_slice() {
+            anyhow::bail!("video_noise shape mismatch: file {:?} vs expected {:?}", vn.shape().dims(), v_dims);
+        }
+        if an.shape().dims() != a_dims.as_slice() {
+            anyhow::bail!("audio_noise shape mismatch: file {:?} vs expected {:?}", an.shape().dims(), a_dims);
+        }
+        (vn, an)
+    } else {
+        let s2_numel = v_dims.iter().product::<usize>();
+        let a_numel = a_dims.iter().product::<usize>();
+        let vn = make_noise(s2_numel, SEED + 100, &v_dims, &device)?;
+        let an = make_noise(a_numel, SEED + 101, &a_dims, &device)?;
+        (vn, an)
+    };
+
+    video_x = video_x.mul_scalar(1.0 - noise_scale)?.add(&video_noise.mul_scalar(noise_scale)?)?;
+    drop(video_noise);
     stats("video_x (after noise injection)", &video_x)?;
 
-    let a_dims = audio_x.shape().dims().to_vec();
-    let a_numel = a_dims.iter().product::<usize>();
-    let audio_noise = make_noise(a_numel, SEED + 101, &a_dims, &device)?;
     audio_x = audio_x.mul_scalar(1.0 - noise_scale)?.add(&audio_noise.mul_scalar(noise_scale)?)?;
     drop(audio_noise);
     stats("audio_x (after noise injection)", &audio_x)?;

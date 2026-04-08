@@ -2966,8 +2966,13 @@ impl LTX2StreamingModel {
     pub fn load_block_from_weights_static(
         config: &LTX2Config,
         block_idx: usize,
-        block_weights: HashMap<String, Tensor>,
+        mut block_weights: HashMap<String, Tensor>,
     ) -> Result<LTX2TransformerBlock> {
+        // FLAME_SIMULATE_FP8=1 — round-trip BF16 weights through FP8 e4m3
+        // bytes via the production GPU dequant kernel. Mirrors Python's
+        // QuantizationPolicy.fp8_cast(). No-op when env var is unset.
+        super::fp8_quant::quantize_block_weights_inplace(&mut block_weights, block_idx)?;
+
         let device = flame_core::global_cuda_device();
 
         let eps = config.norm_eps;
@@ -3838,6 +3843,11 @@ impl LTX2StreamingModel {
                     }
                     log::info!("[LTX2] Block {}: loaded BF16 audio weights from disk", i);
                 }
+
+                // FLAME_SIMULATE_FP8=1 — round-trip BF16 audio boundary
+                // weights through FP8 e4m3 to match Python's fp8_cast.
+                // No-op when env var is unset.
+                super::fp8_quant::quantize_block_weights_inplace(&mut block_weights, i)?;
 
                 let block = Self::load_block_from_weights_pretransposed(&config_clone, i, block_weights)?;
                 let (new_hs, new_ahs) = block.forward(
