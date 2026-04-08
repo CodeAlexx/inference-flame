@@ -212,36 +212,14 @@ fn gelu_approximate(x: &Tensor) -> Result<Tensor> {
 
 /// RMSNorm: x / sqrt(mean(x^2) + eps), optionally scaled by weight.
 ///
-/// For BF16 inputs (the common case in inference), routes to flame-core's
-/// fused `rms_norm_bf16` kernel — single launch, single allocation. The old
-/// path round-tripped through FP32 with ~7 separate ops + allocations per
-/// call and was responsible for ~100 ms per call on `[1, 1320, 4096]`
-/// shapes. The fused kernel is sub-millisecond on the same shape.
-///
-/// For F32 inputs (rare — F32 scale_shift_table internals only), falls back
-/// to the manual path. Weight dtype is currently expected to match input.
+/// REVERTED to the slow F32 manual path for diagnosis: the BF16 fast kernel
+/// (`flame_core::cuda_ops_bf16::rms_norm_bf16`) was producing slightly
+/// different values from PyTorch's `torch.nn.functional.rms_norm`, which
+/// compounds to gray output across 48 blocks.  Performance regressed to the
+/// pre-1f32f84 baseline; if the F32 path produces real video, we know the
+/// fast kernel is the culprit and we can either fix the kernel or keep the
+/// F32 path.
 fn rms_norm(x: &Tensor, weight: Option<&Tensor>, eps: f32) -> Result<Tensor> {
-    if x.dtype() == DType::BF16 {
-        // Make sure the weight (if present) is BF16; the cached F32
-        // scale_shift_table tensors don't pass through here so this branch
-        // is the steady-state hot path.
-        let w_bf16;
-        let weight_arg = if let Some(w) = weight {
-            if w.dtype() == DType::BF16 {
-                Some(w)
-            } else {
-                w_bf16 = w.to_dtype(DType::BF16)?;
-                // Lifetime trick — bind to outer var so the &Tensor below stays valid.
-                // We do this via a Box leak avoidance: just compute and stash.
-                return flame_core::cuda_ops_bf16::rms_norm_bf16(x, Some(&w_bf16), eps);
-            }
-        } else {
-            None
-        };
-        return flame_core::cuda_ops_bf16::rms_norm_bf16(x, weight_arg, eps);
-    }
-
-    // Slow F32 fallback for the rare case where x is F32.
     let dims = x.shape().dims().to_vec();
     let last_dim = dims[dims.len() - 1];
 
@@ -874,10 +852,28 @@ impl LTX2TransformerBlock {
         };
         let mut phases: Vec<(&'static str, u128)> = Vec::with_capacity(8);
 
+        // Tensor dump scaffolding for python_block0_forward.py diff. Fires once
+        // per process and only when LTX2_DUMP_BLOCK0=1. Outputs go to
+        // rust_block0_intermediates.safetensors. Each save is gated by a static
+        // OnceLock so subsequent block forwards don't overwrite.
+        let dump_intermediates = std::env::var("LTX2_DUMP_BLOCK0").is_ok();
+        let mut intermediate_dump: HashMap<String, Tensor> = HashMap::new();
+
+        if dump_intermediates {
+            intermediate_dump.insert("dump_input_hs".into(), hidden_states.clone());
+            intermediate_dump.insert("dump_input_ahs".into(), audio_hidden_states.clone());
+        }
+
         // ---- 1. Video Self-Attention with AdaLN-Zero ----
         // Compute 6 modulation params from scale_shift_table + temb
         let (shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp) =
             self.compute_ada_params_6(&self.scale_shift_table, temb, b, video_dim)?;
+
+        if dump_intermediates {
+            intermediate_dump.insert("dump_shift_msa".into(), shift_msa.clone());
+            intermediate_dump.insert("dump_scale_msa".into(), scale_msa.clone());
+            intermediate_dump.insert("dump_gate_msa".into(), gate_msa.clone());
+        }
 
         // Fused: rms_norm + (1+scale)*x + shift in one kernel.  Falls back
         // to separate calls when no affine weight is present.
@@ -887,9 +883,18 @@ impl LTX2TransformerBlock {
             let norm_h = rms_norm(hidden_states, None, self.eps)?;
             fused_modulate(&norm_h, &scale_msa, &shift_msa)?
         };
+        if dump_intermediates {
+            intermediate_dump.insert("dump_mod_h".into(), mod_h.clone());
+        }
         let attn_out = self.attn1.forward(&mod_h, None, None, video_rotary_emb, None)?;
+        if dump_intermediates {
+            intermediate_dump.insert("dump_vsa_attn_out".into(), attn_out.clone());
+        }
         // Fused: x + attn_out * gate in one kernel.
         let mut hidden_states = fused_residual_gate(hidden_states, &attn_out, &gate_msa)?;
+        if dump_intermediates {
+            intermediate_dump.insert("dump_after_vsa".into(), hidden_states.clone());
+        }
         take(&mut phases, "vsa", &mut t);
 
         // ---- Audio Self-Attention with AdaLN-Zero ----
@@ -903,6 +908,9 @@ impl LTX2TransformerBlock {
         };
         let attn_a_out = self.audio_attn1.forward(&mod_a, None, None, audio_rotary_emb, None)?;
         let mut audio_hidden_states = fused_residual_gate(audio_hidden_states, &attn_a_out, &a_gate_msa)?;
+        if dump_intermediates {
+            intermediate_dump.insert("dump_after_asa".into(), audio_hidden_states.clone());
+        }
         take(&mut phases, "asa", &mut t);
 
         // ---- 2. Video/Audio Cross-Attention with text (AdaLN modulated) ----
@@ -937,6 +945,9 @@ impl LTX2TransformerBlock {
 
         let ca_out = self.attn2.forward(&mod_h2, Some(&modulated_v_context), encoder_attention_mask, None, None)?;
         hidden_states = fused_residual_gate(&hidden_states, &ca_out, &v_gate_ca)?;
+        if dump_intermediates {
+            intermediate_dump.insert("dump_after_vca".into(), hidden_states.clone());
+        }
         drop(modulated_v_context);
         take(&mut phases, "vca", &mut t);
 
@@ -966,6 +977,9 @@ impl LTX2TransformerBlock {
 
         let ca_a_out = self.audio_attn2.forward(&mod_a2, Some(&modulated_a_context), audio_encoder_attention_mask, None, None)?;
         audio_hidden_states = fused_residual_gate(&audio_hidden_states, &ca_a_out, &a_gate_ca)?;
+        if dump_intermediates {
+            intermediate_dump.insert("dump_after_aca".into(), audio_hidden_states.clone());
+        }
         drop(modulated_a_context);
         take(&mut phases, "aca", &mut t);
 
@@ -1008,6 +1022,9 @@ impl LTX2TransformerBlock {
         // a2v_gate is [B, 1, dim] broadcast — fused_residual_gate doesn't
         // broadcast, so use manual mul+add (same as A2V/V2A modulation above).
         hidden_states = hidden_states.add(&a2v_out.mul(&a2v_gate)?)?;
+        if dump_intermediates {
+            intermediate_dump.insert("dump_after_a2v".into(), hidden_states.clone());
+        }
         drop(mod_video_a2v);
         drop(mod_audio_a2v);
 
@@ -1026,6 +1043,9 @@ impl LTX2TransformerBlock {
         take(&mut phases, "v2a_attn", &mut t);
         // v2a_gate is [B, 1, dim] broadcast — manual residual.
         audio_hidden_states = audio_hidden_states.add(&v2a_out.mul(&v2a_gate)?)?;
+        if dump_intermediates {
+            intermediate_dump.insert("dump_after_v2a".into(), audio_hidden_states.clone());
+        }
         take(&mut phases, "av_tail", &mut t);
 
         // ---- 4. FeedForward ----
@@ -1037,6 +1057,9 @@ impl LTX2TransformerBlock {
         };
         let ff_out = self.ff.forward(&mod_ff)?;
         hidden_states = fused_residual_gate(&hidden_states, &ff_out, &gate_mlp)?;
+        if dump_intermediates {
+            intermediate_dump.insert("dump_after_vff".into(), hidden_states.clone());
+        }
         take(&mut phases, "vff", &mut t);
 
         let mod_aff = if let Some(w) = self.audio_norm3_weight.as_ref() {
@@ -1047,11 +1070,29 @@ impl LTX2TransformerBlock {
         };
         let aff_out = self.audio_ff.forward(&mod_aff)?;
         audio_hidden_states = fused_residual_gate(&audio_hidden_states, &aff_out, &a_gate_mlp)?;
+        if dump_intermediates {
+            intermediate_dump.insert("dump_after_aff".into(), audio_hidden_states.clone());
+        }
         take(&mut phases, "aff", &mut t);
 
         if prof {
             let parts: Vec<String> = phases.iter().map(|(n, ms)| format!("{}={}ms", n, ms)).collect();
             log::info!("[FWD-PROF] {}", parts.join(" "));
+        }
+
+        if dump_intermediates && !intermediate_dump.is_empty() {
+            // Save once per process. The OnceLock ensures only the first call
+            // (block 0 of step 0) writes the file.
+            static SAVED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            if SAVED.set(()).is_ok() {
+                let _ = dev.synchronize();
+                let _ = flame_core::serialization::save_tensors(
+                    &intermediate_dump,
+                    std::path::Path::new("/home/alex/EriDiffusion/inference-flame/output/rust_block0_intermediates.safetensors"),
+                    flame_core::serialization::SerializationFormat::SafeTensors,
+                );
+                log::info!("[LTX2 DUMP] saved {} intermediate tensors", intermediate_dump.len());
+            }
         }
 
         Ok((hidden_states, audio_hidden_states))
@@ -2007,62 +2048,118 @@ pub struct VideoEmbeddingsConnector {
     _head_dim: usize,
     eps: f32,
     rope_theta: f64,
+    /// `connector_positional_embedding_max_pos` from the checkpoint config
+    /// (LTX-2.3 22B uses 4096). Default for LTX-2 prior to 2.3 was 1.
+    rope_max_pos: u32,
 }
 
 impl VideoEmbeddingsConnector {
     /// Forward: process text embeddings through connector blocks with 1D RoPE.
     ///
-    /// `x`: [B, seq, inner_dim] text embeddings
-    /// `mask`: Optional [B, seq] attention mask (< -9000 means padded)
-    fn forward(&self, x: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
+    /// `x`: [B, seq, inner_dim] left-padded text embeddings (Gemma is causal,
+    ///      so real tokens sit at the right end of the sequence).
+    /// `mask`: Optional additive attention mask `[B, 1, 1, seq]`. Real
+    ///      positions are 0, padded positions are <= -9000.
+    ///
+    /// Mirrors `Embeddings1DConnector.forward` in
+    /// `ltx_core/text_encoders/gemma/embeddings_connector.py`:
+    ///   1. Compress real tokens to the front of `seq`, fill the rest with
+    ///      tiled `learnable_registers`.
+    ///   2. Compute 1D RoPE with `position = i`, `max_pos = [1]`.
+    ///   3. Run N transformer blocks (rms_norm / self-attn + residual /
+    ///      rms_norm / FFN + residual).
+    ///   4. Final unweighted RMSNorm.
+    pub fn forward(&self, x: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
         let dims = x.shape().dims().to_vec();
         let (batch_size, seq_len, _dim) = (dims[0], dims[1], dims[2]);
         let device = x.device().clone();
 
-        // 1. Replace padded positions with learnable registers
-        let mut x = if let (Some(registers), Some(m)) = (&self.learnable_registers, mask) {
-            // Tile registers to [B, seq, dim]
-            let reg_tiled = registers.narrow(0, 0, seq_len.min(self.num_registers))?;
-            // Expand to match: if seq > num_registers, tile
-            let reg_expanded = if seq_len > self.num_registers {
-                // Repeat registers to fill seq_len
-                let repeats = (seq_len + self.num_registers - 1) / self.num_registers;
-                let mut parts = Vec::new();
-                for _ in 0..repeats {
-                    parts.push(registers.clone());
-                }
-                let refs: Vec<&Tensor> = parts.iter().collect();
-                let tiled = Tensor::cat(&refs, 0)?;
-                tiled.narrow(0, 0, seq_len)?
+        // 1. Replace padded positions with learnable registers (compress real
+        //    tokens to the front + tile registers to fill the rest).
+        let mut x = if let Some(registers) = &self.learnable_registers {
+            // Determine number of real tokens N from the additive mask if
+            // provided. With no mask we treat the whole sequence as real.
+            let num_real: usize = if let Some(m) = mask {
+                // Extract last dim of the mask to a flat F32 tensor and count
+                // positions whose value is >= -9000 (real).
+                let m_dims = m.shape().dims().to_vec();
+                let last = m_dims[m_dims.len() - 1];
+                // Take batch 0 only — left-padding is identical across batch
+                // for our pipeline (always batch_size=1 in inference).
+                let m_b0 = if m_dims.len() == 4 {
+                    m.narrow(0, 0, 1)?.squeeze_dim(0)?.squeeze_dim(0)?.squeeze_dim(0)?
+                } else if m_dims.len() == 3 {
+                    m.narrow(0, 0, 1)?.squeeze_dim(0)?.squeeze_dim(0)?
+                } else {
+                    m.narrow(0, 0, 1)?.squeeze_dim(0)?
+                };
+                let m_f32 = m_b0.to_dtype(DType::F32)?;
+                let cpu = m_f32.to_vec()?;
+                debug_assert_eq!(cpu.len(), last);
+                cpu.iter().filter(|v| **v >= -9000.0).count()
             } else {
-                reg_tiled
+                seq_len
             };
-            let reg_bc = reg_expanded.unsqueeze(0)?.expand(&[batch_size, seq_len, self.inner_dim])?;
 
-            // mask: [B, seq] — padded where mask < -9000
-            let m_f32 = m.to_dtype(DType::F32)?;
-            // is_padded: 1 where padded, 0 where real
-            let threshold = Tensor::from_vec(
-                vec![-9000.0f32],
-                Shape::from_dims(&[1, 1]),
-                device.clone(),
-            )?;
-            // Compare: m < -9000 → padded
-            let is_padded = m_f32.lt(&threshold.expand(m_f32.shape().dims())?)?.to_dtype(DType::BF16)?;
-            let is_real = is_padded.mul_scalar(-1.0)?.add_scalar(1.0)?; // 1 - is_padded
+            // For batch_size > 1 we'd need per-batch handling. For our
+            // inference pipeline batch is always 1, so this simple path is
+            // sufficient.
+            assert_eq!(
+                batch_size, 1,
+                "VideoEmbeddingsConnector currently supports batch_size=1 only"
+            );
 
-            // x = x * is_real + registers * is_padded
-            let is_padded_3d = is_padded.unsqueeze(2)?.expand(&[batch_size, seq_len, self.inner_dim])?;
-            let is_real_3d = is_real.unsqueeze(2)?.expand(&[batch_size, seq_len, self.inner_dim])?;
-            x.mul(&is_real_3d)?.add(&reg_bc.mul(&is_padded_3d)?)?
+            // Real tokens live at the right end of the sequence (left-padded).
+            // [1, num_real, dim]
+            let real_tokens = x.narrow(1, seq_len - num_real, num_real)?;
+
+            // Tile registers to [seq, dim] then slice the [num_real..seq] tail
+            // (Python uses tile then masked-blend; this gives the same
+            // register indices as the Python algorithm).
+            let registers_dim = registers.shape().dims()[1];
+            assert_eq!(registers_dim, self.inner_dim);
+            let n_reg = self.num_registers;
+            let registers_seq = if seq_len <= n_reg {
+                registers.narrow(0, 0, seq_len)?
+            } else {
+                assert_eq!(
+                    seq_len % n_reg,
+                    0,
+                    "seq_len {} must be divisible by num_learnable_registers {}",
+                    seq_len, n_reg
+                );
+                let n_copies = seq_len / n_reg;
+                let parts: Vec<Tensor> = (0..n_copies).map(|_| registers.clone()).collect();
+                let refs: Vec<&Tensor> = parts.iter().collect();
+                Tensor::cat(&refs, 0)?
+            };
+
+            let registers_tail = if num_real < seq_len {
+                Some(registers_seq.narrow(0, num_real, seq_len - num_real)?
+                    .unsqueeze(0)?  // [1, seq - num_real, dim]
+                    .to_dtype(x.dtype())?)
+            } else {
+                None
+            };
+
+            if let Some(tail) = registers_tail {
+                Tensor::cat(&[&real_tokens, &tail], 1)?
+            } else {
+                real_tokens
+            }
         } else {
             x.clone()
         };
 
-        // 2. Compute 1D RoPE for connector
+        // 2. Compute 1D RoPE for connector. Python uses `position = i` with
+        //    `max_pos = connector_positional_embedding_max_pos` from the
+        //    checkpoint config (LTX-2.3 22B uses [4096]; the Python class
+        //    default of [1] is overridden). The Rust `compute_rope_frequencies`
+        //    expects [start, end) coord pairs and takes their midpoint, so we
+        //    pass `(i, i)` to make the midpoint exactly `i`.
         let coords_data: Vec<f32> = (0..batch_size)
             .flat_map(|_| {
-                (0..seq_len).flat_map(|i| vec![i as f32, (i + 1) as f32])
+                (0..seq_len).flat_map(|i| vec![i as f32, i as f32])
             })
             .collect();
         let coords = Tensor::from_vec_dtype(
@@ -2071,29 +2168,28 @@ impl VideoEmbeddingsConnector {
             device.clone(),
             DType::F32,
         )?;
-        let max_pos = [1.0f64]; // Official default: no normalization, positions grow linearly
+        let max_pos = [self.rope_max_pos as f64];
         let (cos_freqs, sin_freqs) = compute_rope_frequencies(
             &coords, self.inner_dim, &max_pos,
             self.rope_theta, self.num_heads,
         )?;
 
-        // 3. Run connector blocks
-        log::info!("[LTX2] Connector: x dtype={:?}, cos dtype={:?}", x.dtype(), cos_freqs.dtype());
-        for (i, block) in self.blocks.iter().enumerate() {
+        // 3. Run connector blocks. After the register replacement step the
+        //    full sequence is "real" content (Python sets the mask to all
+        //    zeros after this), so we pass `None` as the attention mask.
+        for block in self.blocks.iter() {
             x = block.forward(&x, Some((&cos_freqs, &sin_freqs)))?;
-            if i == 0 {
-                log::info!("[LTX2] Connector block 0 done, x dtype={:?}", x.dtype());
-            }
         }
 
-        // 4. Final RMSNorm
+        // 4. Final unweighted RMSNorm (matches `rms_norm(hidden_states)`
+        //    at the bottom of Embeddings1DConnector.forward).
         rms_norm(&x, None, self.eps)
     }
 }
 
 /// Load a VideoEmbeddingsConnector from checkpoint weights.
 /// Auto-detects number of blocks from keys.
-fn load_video_embeddings_connector(
+pub fn load_video_embeddings_connector(
     weights: &HashMap<String, Tensor>,
     prefix: &str,
     eps: f32,
@@ -2184,6 +2280,10 @@ fn load_video_embeddings_connector(
         _head_dim: head_dim,
         eps,
         rope_theta,
+        // LTX-2.3 22B distilled checkpoint sets max_pos=[4096]. We hard-code
+        // it here because we don't currently parse the safetensors metadata
+        // config; for older LTX-2 variants this would need to come from cfg.
+        rope_max_pos: 4096,
     })
 }
 
@@ -2205,12 +2305,15 @@ pub struct LTX2StreamingModel {
     pub proj_in_weight: Tensor,
     pub proj_in_bias: Tensor,
     pub caption_projection: Option<CaptionProjection>,
-    pub connector: Option<VideoEmbeddingsConnector>,  // ComfyUI: replaces caption_projection
+    pub connector: Option<VideoEmbeddingsConnector>,  // ComfyUI: replaces caption_projection (video)
+    pub audio_connector: Option<VideoEmbeddingsConnector>,  // ComfyUI: same struct, audio dims
     pub prompt_adaln_single: Option<AdaLayerNormSingle>,  // ComfyUI: 2-param for cross-attn context (video)
     pub audio_prompt_adaln_single: Option<AdaLayerNormSingle>,  // ComfyUI: 2-param for cross-attn context (audio)
-    // Text embedding projection: packed Gemma (188160-dim) → connector dim (4096)
-    pub aggregate_embed_weight: Option<Tensor>,  // [4096, 188160]
+    // Text embedding projection: packed Gemma (188160-dim) → connector dim (4096 video / 2048 audio)
+    pub aggregate_embed_weight: Option<Tensor>,  // [4096, 188160] (pre-transposed)
     pub aggregate_embed_bias: Option<Tensor>,    // [4096]
+    pub audio_aggregate_embed_weight: Option<Tensor>,  // [2048, 188160] (pre-transposed)
+    pub audio_aggregate_embed_bias: Option<Tensor>,    // [2048]
     pub time_embed: AdaLayerNormSingle,
     pub scale_shift_table: Tensor,  // [2, inner_dim]
     pub proj_out_weight: Tensor,
@@ -2274,11 +2377,10 @@ impl LTX2StreamingModel {
                 let k = key.strip_prefix(&prefix).unwrap_or(key);
                 // Skip per-block weights (loaded later by FP8 resident or FlameSwap)
                 if k.starts_with("transformer_blocks.") { return false; }
-                // Skip connector + aggregate_embed to save ~3.6GB VRAM
-                // (not needed when using pre-processed 4096-dim embeddings)
-                if k.starts_with("video_embeddings_connector.") { return false; }
-                if k.contains("aggregate_embed") { return false; }
-                // Load both video and audio globals
+                // Load both video and audio globals (incl. video_embeddings_connector,
+                // audio_embeddings_connector, and text_embedding_projection.* aggregate_embed
+                // weights — needed to run text encoding fully in Rust without
+                // pre-computed Python embeddings).
                 true
             },
         )?;
@@ -2317,16 +2419,28 @@ impl LTX2StreamingModel {
             &globals, "video_embeddings_connector", config.norm_eps, config.rope_theta,
         ) {
             Ok(c) => Some(c),
-            Err(e) => { log::warn!("[LTX2] Connector load failed: {:?}", e); None }
+            Err(e) => { log::warn!("[LTX2] Video connector load failed: {:?}", e); None }
+        };
+        // audio_embeddings_connector — same module structure as video, but with
+        // audio dims (typically 16 heads × 128 = 2048 inner). Auto-detected from
+        // weights so it works for any LTX-2 variant.
+        let audio_connector = match load_video_embeddings_connector(
+            &globals, "audio_embeddings_connector", config.norm_eps, config.rope_theta,
+        ) {
+            Ok(c) => Some(c),
+            Err(e) => { log::warn!("[LTX2] Audio connector load failed: {:?}", e); None }
         };
 
         if caption_proj.is_none() && connector.is_none() {
-            log::warn!("[LTX2] No connector or caption_projection loaded (OK if using 4096-dim cached embeddings)");
+            log::warn!("[LTX2] No video connector or caption_projection loaded (OK if using 4096-dim cached embeddings)");
         }
         if connector.is_some() {
             log::info!("[LTX2] Using VideoEmbeddingsConnector (ComfyUI format)");
         } else {
             log::info!("[LTX2] Using CaptionProjection (diffusers format)");
+        }
+        if audio_connector.is_some() {
+            log::info!("[LTX2] Using AudioEmbeddingsConnector (ComfyUI format)");
         }
 
         // prompt_adaln_single (ComfyUI LTX-2.3): 2-param conditioning for cross-attn context (video)
@@ -2349,12 +2463,20 @@ impl LTX2StreamingModel {
             let w_shape = agg_w.as_ref().unwrap().shape().dims().to_vec();
             log::info!("[LTX2] Found video_aggregate_embed: {:?}", w_shape);
         }
+        // audio_aggregate_embed: projects packed Gemma embeddings (188160-dim) → 2048
+        let audio_agg_w = globals.get("text_embedding_projection.audio_aggregate_embed.weight").cloned();
+        let audio_agg_b = globals.get("text_embedding_projection.audio_aggregate_embed.bias").cloned();
+        if audio_agg_w.is_some() {
+            let w_shape = audio_agg_w.as_ref().unwrap().shape().dims().to_vec();
+            log::info!("[LTX2] Found audio_aggregate_embed: {:?}", w_shape);
+        }
 
         // time_embed / adaln_single (may output 6 or 9 params)
         let time_emb = load_ada_layer_norm_single(&globals, "time_embed", 6)
             .or_else(|_| load_ada_layer_norm_single(&globals, "adaln_single", 9))?;
 
         let agg_w_t = agg_w.as_ref().map(|w| pre_transpose_weight(w)).transpose()?;
+        let audio_agg_w_t = audio_agg_w.as_ref().map(|w| pre_transpose_weight(w)).transpose()?;
 
         // Audio globals (optional — None if keys not found)
         // Key names vary: audio_proj_in / audio_patchify_proj, audio_time_embed / audio_adaln_single
@@ -2403,10 +2525,13 @@ impl LTX2StreamingModel {
             proj_in_bias: proj_in_b,
             caption_projection: caption_proj,
             connector,
+            audio_connector,
             prompt_adaln_single: prompt_adaln,
             audio_prompt_adaln_single: audio_prompt_adaln,
             aggregate_embed_weight: agg_w_t,
             aggregate_embed_bias: agg_b,
+            audio_aggregate_embed_weight: audio_agg_w_t,
+            audio_aggregate_embed_bias: audio_agg_b,
             time_embed: time_emb,
             scale_shift_table: get("scale_shift_table")?,
             proj_out_weight: pre_transpose_weight(&get("proj_out.weight")?)?,
@@ -3296,6 +3421,8 @@ impl LTX2StreamingModel {
         context: &Tensor,        // [B, seq, caption_channels] text for video
         audio_context: &Tensor,  // [B, seq, caption_channels] text for audio
         frame_rate: f32,
+        encoder_attention_mask: Option<&Tensor>,        // [B, 1, 1, seq] additive mask (video text)
+        audio_encoder_attention_mask: Option<&Tensor>,  // [B, 1, 1, seq] additive mask (audio text)
     ) -> Result<(Tensor, Tensor)> {
         // Verify audio globals are loaded
         let audio_proj_in_w = self.audio_proj_in_weight.as_ref()
@@ -3438,25 +3565,64 @@ impl LTX2StreamingModel {
             Tensor::zeros_dtype(Shape::from_dims(&[batch_size, 1, audio_inner_dim]), DType::BF16, device.clone())?
         };
 
-        // 7. Text embeddings
-        let context_dim = context.shape().dims()[2];
-        let enc_hs = if context_dim == inner_dim {
+        // 7. Text embeddings.
+        // Three accepted input formats per modality:
+        //   (a) already inner_dim: pre-processed context, used directly.
+        //   (b) packed Gemma 188160-dim: project via aggregate_embed, then
+        //       run through embeddings_connector (Q-Former).
+        //   (c) feature_extractor 4096/2048 features: skip aggregate_embed
+        //       and feed directly into the connector.
+        let video_context_dim = context.shape().dims()[2];
+        let enc_hs = if video_context_dim == inner_dim && self.connector.is_none() {
             context.clone()
+        } else if let Some(connector) = &self.connector {
+            let projected = if video_context_dim == inner_dim {
+                context.clone()
+            } else if let (Some(w), Some(b)) = (
+                &self.aggregate_embed_weight,
+                &self.aggregate_embed_bias,
+            ) {
+                let rescale = ((inner_dim as f64) / (video_context_dim as f64)).sqrt() as f32;
+                linear3d(&context.mul_scalar(rescale)?, w, Some(b))?
+            } else {
+                return Err(flame_core::Error::InvalidInput(format!(
+                    "Video context dim {} != inner_dim {} and no aggregate_embed loaded",
+                    video_context_dim, inner_dim,
+                )));
+            };
+            connector.forward(&projected, encoder_attention_mask)?
         } else if let Some(ref cap_proj) = self.caption_projection {
             cap_proj.forward(context)?
         } else {
             return Err(flame_core::Error::InvalidInput("No video text projection".into()));
         };
 
-        let audio_enc_hs = if let Some(ref cap_proj) = self.audio_caption_projection {
-            cap_proj.forward(audio_context)?
-        } else if audio_context.shape().dims()[2] == audio_inner_dim {
-            // Already projected to audio_inner_dim (e.g. from feature extractor)
+        let audio_context_dim = audio_context.shape().dims()[2];
+        let audio_enc_hs = if audio_context_dim == audio_inner_dim && self.audio_connector.is_none() {
+            // Already projected to audio_inner_dim (e.g. from feature extractor or cache)
             audio_context.clone()
+        } else if let Some(connector) = &self.audio_connector {
+            let projected = if audio_context_dim == audio_inner_dim {
+                audio_context.clone()
+            } else if let (Some(w), Some(b)) = (
+                &self.audio_aggregate_embed_weight,
+                &self.audio_aggregate_embed_bias,
+            ) {
+                let rescale = ((audio_inner_dim as f64) / (audio_context_dim as f64)).sqrt() as f32;
+                linear3d(&audio_context.mul_scalar(rescale)?, w, Some(b))?
+            } else {
+                return Err(flame_core::Error::InvalidInput(format!(
+                    "Audio context dim {} != audio_inner_dim {} and no audio_aggregate_embed loaded",
+                    audio_context_dim, audio_inner_dim,
+                )));
+            };
+            connector.forward(&projected, audio_encoder_attention_mask)?
+        } else if let Some(ref cap_proj) = self.audio_caption_projection {
+            cap_proj.forward(audio_context)?
         } else {
             return Err(flame_core::Error::InvalidInput(format!(
-                "Audio context dim {} != audio_inner_dim {}, and no audio_caption_projection loaded",
-                audio_context.shape().dims()[2], audio_inner_dim)));
+                "Audio context dim {} != audio_inner_dim {}, and no audio path available",
+                audio_context_dim, audio_inner_dim)));
         };
 
         // 7b. Compute prompt_timestep tensors for cross-attention KV modulation
@@ -3598,6 +3764,45 @@ impl LTX2StreamingModel {
                 if prof { let _ = device.synchronize(); }
                 let t_after_build = t_block.elapsed().as_millis();
 
+                // Dump block 0 inputs ONCE per process for python_block0_forward.py to diff against.
+                if i == 0 && std::env::var("LTX2_DUMP_BLOCK0").is_ok() {
+                    static DUMPED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                    if DUMPED.set(()).is_ok() {
+                        let _ = device.synchronize();
+                        let mut dump: HashMap<String, Tensor> = HashMap::new();
+                        dump.insert("hs".into(), hs.clone());
+                        dump.insert("ahs".into(), ahs.clone());
+                        dump.insert("enc_hs".into(), enc_hs.clone());
+                        dump.insert("audio_enc_hs".into(), audio_enc_hs.clone());
+                        dump.insert("v_timestep".into(), v_timestep.clone());
+                        dump.insert("a_timestep".into(), a_timestep.clone());
+                        dump.insert("v_ca_ss".into(), v_ca_ss.clone());
+                        dump.insert("a_ca_ss".into(), a_ca_ss.clone());
+                        dump.insert("v_ca_gate".into(), v_ca_gate.clone());
+                        dump.insert("a_ca_gate".into(), a_ca_gate.clone());
+                        dump.insert("v_cos".into(), v_cos.clone());
+                        dump.insert("v_sin".into(), v_sin.clone());
+                        dump.insert("a_cos".into(), a_cos.clone());
+                        dump.insert("a_sin".into(), a_sin.clone());
+                        dump.insert("ca_v_cos".into(), ca_v_cos.clone());
+                        dump.insert("ca_v_sin".into(), ca_v_sin.clone());
+                        dump.insert("ca_a_cos".into(), ca_a_cos.clone());
+                        dump.insert("ca_a_sin".into(), ca_a_sin.clone());
+                        if let Some(ref t) = video_prompt_ts {
+                            dump.insert("video_prompt_ts".into(), t.clone());
+                        }
+                        if let Some(ref t) = audio_prompt_ts {
+                            dump.insert("audio_prompt_ts".into(), t.clone());
+                        }
+                        flame_core::serialization::save_tensors(
+                            &dump,
+                            std::path::Path::new("/home/alex/EriDiffusion/inference-flame/output/rust_block0_dump.safetensors"),
+                            flame_core::serialization::SerializationFormat::SafeTensors,
+                        )?;
+                        log::info!("[LTX2 DUMP] Saved block 0 inputs to rust_block0_dump.safetensors");
+                    }
+                }
+
                 let (new_hs, new_ahs) = block.forward(
                     &hs, &ahs,
                     &enc_hs, &audio_enc_hs,
@@ -3614,6 +3819,25 @@ impl LTX2StreamingModel {
                 )?;
                 if prof { let _ = device.synchronize(); }
                 let t_after_forward = t_block.elapsed().as_millis();
+
+                // Dump block 0 outputs (the last thing fired in the OnceLock above
+                // already saved inputs; we save outputs to a separate file).
+                if i == 0 && std::env::var("LTX2_DUMP_BLOCK0").is_ok() {
+                    static OUT_DUMPED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                    if OUT_DUMPED.set(()).is_ok() {
+                        let _ = device.synchronize();
+                        let mut out: HashMap<String, Tensor> = HashMap::new();
+                        out.insert("hs_out".into(), new_hs.clone());
+                        out.insert("ahs_out".into(), new_ahs.clone());
+                        flame_core::serialization::save_tensors(
+                            &out,
+                            std::path::Path::new("/home/alex/EriDiffusion/inference-flame/output/rust_block0_output.safetensors"),
+                            flame_core::serialization::SerializationFormat::SafeTensors,
+                        )?;
+                        log::info!("[LTX2 DUMP] Saved block 0 outputs. Exiting after this block to keep dump fast.");
+                        return Err(flame_core::Error::Io("LTX2_DUMP_BLOCK0 early exit".into()));
+                    }
+                }
 
                 hs = new_hs;
                 ahs = new_ahs;

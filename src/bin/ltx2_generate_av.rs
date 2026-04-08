@@ -219,6 +219,7 @@ fn main() -> anyhow::Result<()> {
             &video_x, &audio_x, &sigma_t,
             &video_context, &audio_context,
             FRAME_RATE,
+            None, None,  // attention masks: None = pre-projected embeddings
         )?;
 
         // Euler step for video

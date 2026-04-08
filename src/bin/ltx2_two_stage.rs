@@ -20,8 +20,17 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 // Model paths
+// IMPORTANT: use the BF16 distilled checkpoint, NOT the FP8 distilled.
+// Per the LTX-2 README:
+//   * `fp8-cast` policy is for BF16 checkpoints (downcasts on the fly)
+//   * `fp8-scaled-mm` policy is for FP8 checkpoints (requires tensorrt_llm)
+// We don't have tensorrt_llm, and our flame-swap can stream BF16 weights
+// directly (no per-block dequant needed). Loading the FP8 distilled file
+// without scale-aware dequant produces dim/gray output (verified by running
+// the official Python pipeline with `fp8_cast` on the FP8 file: same noise;
+// same pipeline on the BF16 file produces real content).
 const MODEL_PATH: &str =
-    "/home/alex/.serenity/models/checkpoints/ltx-2.3-22b-distilled-fp8.safetensors";
+    "/home/alex/.serenity/models/checkpoints/ltx-2.3-22b-distilled.safetensors";
 const GEMMA_ROOT: &str = "/home/alex/.serenity/models/text_encoders/gemma-3-12b-it-standalone";
 const LTX_CHECKPOINT: &str = "/home/alex/.serenity/models/checkpoints/ltx-2.3-22b-dev.safetensors";
 const UPSAMPLER_PATH: &str =
@@ -223,7 +232,27 @@ fn main() -> anyhow::Result<()> {
             &video_x, &audio_x, &sigma_t,
             &video_context, &audio_context,
             FRAME_RATE,
+            None, None,  // attention masks: None = pre-projected embeddings
         )?;
+
+        // Dump first-step velocity for diff against Python.
+        if step == 0 && std::env::var("LTX2_DUMP_VELOCITY").is_ok() {
+            let mut vel_dump = HashMap::new();
+            vel_dump.insert("video_vel".to_string(), video_vel.clone());
+            vel_dump.insert("audio_vel".to_string(), audio_vel.clone());
+            vel_dump.insert("video_x_in".to_string(), video_x.clone());
+            vel_dump.insert("audio_x_in".to_string(), audio_x.clone());
+            vel_dump.insert("video_context".to_string(), video_context.clone());
+            vel_dump.insert("audio_context".to_string(), audio_context.clone());
+            vel_dump.insert("sigma".to_string(), sigma_t.clone());
+            flame_core::serialization::save_tensors(
+                &vel_dump,
+                std::path::Path::new("/home/alex/EriDiffusion/inference-flame/output/rust_step0_velocity.safetensors"),
+                flame_core::serialization::SerializationFormat::SafeTensors,
+            )?;
+            println!("  [LTX2_DUMP_VELOCITY] saved step 0 velocity to rust_step0_velocity.safetensors");
+            return Ok(());
+        }
 
         // Euler step: x_{t+1} = x_t + velocity * dt, where dt = sigma_next - sigma
         let dt = sigma_next - sigma;
@@ -258,6 +287,30 @@ fn main() -> anyhow::Result<()> {
     if let Ok(v) = audio_x.to_vec() {
         let nan_count = v.iter().filter(|x| x.is_nan()).count();
         println!("  Stage 1 audio latents: nan={}/{}", nan_count, v.len());
+    }
+
+    // Save stage 1 latents for diff against Python's stage 1.
+    {
+        let s1_video_path = format!("{OUTPUT_DIR}/ltx2_stage1_video_latents.safetensors");
+        let s1_audio_path = format!("{OUTPUT_DIR}/ltx2_stage1_audio_latents.safetensors");
+        let mut s1v = HashMap::new();
+        s1v.insert("latents".to_string(), video_x.clone());
+        flame_core::serialization::save_tensors(
+            &s1v, std::path::Path::new(&s1_video_path),
+            flame_core::serialization::SerializationFormat::SafeTensors,
+        )?;
+        let mut s1a = HashMap::new();
+        s1a.insert("latents".to_string(), audio_x.clone());
+        flame_core::serialization::save_tensors(
+            &s1a, std::path::Path::new(&s1_audio_path),
+            flame_core::serialization::SerializationFormat::SafeTensors,
+        )?;
+        println!("  Stage 1 latents saved to ltx2_stage1_*.safetensors");
+    }
+
+    if std::env::var("LTX2_STAGE1_ONLY").is_ok() {
+        println!("\nLTX2_STAGE1_ONLY set — exiting after stage 1.");
+        return Ok(());
     }
 
     // ========================================
@@ -329,6 +382,7 @@ fn main() -> anyhow::Result<()> {
             &video_x, &audio_x, &sigma_t,
             &video_context, &audio_context,
             FRAME_RATE,
+            None, None,  // attention masks: None = pre-projected embeddings
         )?;
 
         // Euler step: sample += velocity * dt
