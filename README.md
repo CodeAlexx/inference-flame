@@ -7,10 +7,12 @@ Pure Rust diffusion model inference using [flame-core](https://github.com/CodeAl
 | ![Klein 9B](docs/klein9b_sample.png) | ![Z-Image](docs/zimage_sample.png) | ![Anima 2B](docs/anima_sample.png) |
 | *50 steps, CFG 4.0* | *8 steps, turbo* | *30 steps, CFG 4.5* |
 
-| SDXL | | |
+| SDXL | Chroma 8.9B | LTX-2.3 Video |
 |---|---|---|
-| ![SDXL](docs/sdxl_sample.png) | | |
-| *30 steps, CFG 7.5* | | |
+| ![SDXL](docs/sdxl_sample.png) | ![Chroma](docs/chroma_sample.png) | ![LTX-2.3](docs/ltx2_sample.png) |
+| *30 steps, CFG 7.5* | *40 steps, CFG 4.0* | *10s video + audio — [sample.mp4](docs/ltx2_sample.mp4)* |
+
+https://github.com/CodeAlexx/inference-flame/raw/master/docs/ltx2_sample.mp4
 
 ## Performance
 
@@ -33,9 +35,10 @@ Denoise is **10% faster per-step** than PyTorch. Fits entirely on a single 24GB 
 | Klein 4B | Flux 2 DiT (5+20 blocks) | Working |
 | Klein 9B | Flux 2 DiT (8+24 blocks) | Working |
 | Z-Image | NextDiT (6.15B) | Working |
+| Chroma 8.9B | FLUX-schnell DiT + distilled guidance (19+38 blocks) | Working — real CFG, 1024²/40 on a 24 GB card via FlameSwap |
 | SD3.5 | MMDiT | Built, needs TE |
 | SDXL | LDM UNet | Working |
-| LTX-2 | Video DiT | Ported, needs testing |
+| LTX-2.3 | Video DiT + 3D VAE + BigVGAN vocoder | **World's first pure-Rust video pipeline.** Video working end-to-end (prompt → MP4). Audio path runs but still has artifacts — needs more work. |
 | Anima 2B | Cosmos Predict2 DiT | Working |
 
 ## Pipeline
