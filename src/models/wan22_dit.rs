@@ -139,7 +139,13 @@ impl Wan22Dit {
         let part = load_file_filtered(Path::new(checkpoint_path), device, |key| {
             shared_prefixes.iter().any(|p| key.starts_with(p))
         })?;
-        let shared: HashMap<String, Tensor> = part.into_iter().collect();
+        // Convert all shared weights to BF16 (source may be F16 loaded as F32).
+        let shared: HashMap<String, Tensor> = part.into_iter().map(|(k, v)| {
+            let v_bf16 = if v.dtype() != DType::BF16 {
+                v.to_dtype(DType::BF16).unwrap_or(v)
+            } else { v };
+            (k, v_bf16)
+        }).collect();
 
         log::info!(
             "[Wan22] Loaded: {} blocks via FlameSwap, {} shared weights",
@@ -524,9 +530,8 @@ impl Wan22Dit {
 
         // x = head(norm(x) * (1 + scale) + shift)  where shift/scale each get e added
         // Doing this token-by-token in a flat compute
-        let img_f32 = img.to_dtype(DType::F32)?;
-        let img_normed = Self::layer_norm_no_affine(&img_f32, cfg.eps)?;
-        let normed_data = img_normed.to_vec1::<f32>()?;
+        let img_normed_bf16 = Self::layer_norm_no_affine(&img, cfg.eps)?;
+        let normed_data = img_normed_bf16.to_dtype(DType::F32)?.to_vec1::<f32>()?;
         let e_data = e_f32.to_vec1::<f32>()?;
 
         let mut head_input = vec![0.0f32; seq_len * dim];
@@ -707,9 +712,11 @@ impl Wan22Dit {
 
         // ── Self-attention ──
         // mod_input = norm1(x) * (1 + e[1]) + e[0]   (in FP32 for modulation)
+        // LayerNorm needs BF16 input, then convert to F32 for modulation math.
+        let x_normed_bf16 = Self::layer_norm_no_affine(x, cfg.eps)?;
+        let x_normed_f32 = x_normed_bf16.to_dtype(DType::F32)?;
+        let normed_data = x_normed_f32.to_vec1::<f32>()?;
         let x_f32 = x.to_dtype(DType::F32)?;
-        let x_normed = Self::layer_norm_no_affine(&x_f32, cfg.eps)?;
-        let normed_data = x_normed.to_vec1::<f32>()?;
 
         let mut sa_input_data = vec![0.0f32; sl * dim];
         for s in 0..sl {
@@ -801,9 +808,9 @@ impl Wan22Dit {
 
         // ── FFN ──
         // mod_input = norm2(x) * (1 + e[4]) + e[3], gated by e[5]
+        let x_ca_normed_bf16 = Self::layer_norm_no_affine(&x_after_ca, cfg.eps)?;
         let x_ca_f32 = x_after_ca.to_dtype(DType::F32)?;
-        let x_ca_normed = Self::layer_norm_no_affine(&x_ca_f32, cfg.eps)?;
-        let normed_data = x_ca_normed.to_vec1::<f32>()?;
+        let normed_data = x_ca_normed_bf16.to_dtype(DType::F32)?.to_vec1::<f32>()?;
 
         let mut ffn_input_data = vec![0.0f32; sl * dim];
         for s in 0..sl {

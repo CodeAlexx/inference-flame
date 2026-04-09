@@ -42,6 +42,7 @@ use crate::ffi::{self, Event, Stream};
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum SourceDtype {
     BF16,
+    F16,
     F32,
     F8E4M3 { scale: f32 },
 }
@@ -148,7 +149,7 @@ unsafe impl Send for SendPtr {}
 /// pinned staging buffer once raw-copied).
 fn raw_byte_size(t: &TensorMeta) -> usize {
     match t.src_dtype {
-        SourceDtype::BF16 => t.numel * 2,
+        SourceDtype::BF16 | SourceDtype::F16 => t.numel * 2,
         SourceDtype::F32 => t.numel * 4,
         SourceDtype::F8E4M3 { .. } => t.numel, // 1 byte per element
     }
@@ -298,6 +299,7 @@ impl FlameSwap {
                     let bf16_bytes = t.numel * 2;
                     let (this_raw_off, this_raw_bytes) = match t.src_dtype {
                         SourceDtype::BF16 => (final_off, bf16_bytes),
+                        SourceDtype::F16 => (final_off, bf16_bytes), // same 2 bytes, in-place convert after H2D
                         SourceDtype::F32 => (final_off, t.numel * 4),
                         SourceDtype::F8E4M3 { .. } => {
                             let off = raw_off;
@@ -454,6 +456,21 @@ impl FlameSwap {
                 let dst = (gpu_base + gl.raw_offset as u64) as *mut c_void;
                 let src = host_base.add(sl.offset) as *const c_void;
                 ffi::flame_cuda_memcpy_async(dst, src, gl.raw_bytes, 1, transfer_raw);
+            }
+            if gl.src_dtype == SourceDtype::F16 {
+                // In-place FP16 → BF16 conversion (both 2 bytes per element).
+                let ptr = (gpu_base + gl.final_offset as u64) as *mut c_void;
+                let ret = unsafe {
+                    ffi::flame_fp16_to_bf16(
+                        ptr as *const c_void,
+                        ptr,
+                        gl.final_numel,
+                        transfer_raw,
+                    )
+                };
+                if ret != 0 {
+                    return Err(format!("flame_fp16_to_bf16 failed for {} ({})", t_meta.name, ret).into());
+                }
             }
             if let SourceDtype::F8E4M3 { scale } = gl.src_dtype {
                 let raw_ptr = (gpu_base + gl.raw_offset as u64) as *const c_void;
@@ -625,6 +642,7 @@ fn parse_safetensors_header(mmap: &[u8]) -> Result<Vec<HeaderEntry>, Box<dyn std
         let dtype = extract_string_field(obj_str, "dtype").unwrap_or_default();
         let src_dtype = match dtype.as_str() {
             "BF16" => SourceDtype::BF16,
+            "F16" => SourceDtype::F16,
             "F32" => SourceDtype::F32,
             "F8_E4M3" => SourceDtype::F8E4M3 { scale: 1.0 },
             _ => continue,

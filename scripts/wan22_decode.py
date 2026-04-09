@@ -17,13 +17,23 @@ import numpy as np
 import torch
 from safetensors.torch import load_file
 
-# Add Wan2.2 source to path
+# Add Wan2.2 source to path — load module directly to avoid librosa dependency
 WAN_ROOT = "/home/alex/Wan2.2"
 sys.path.insert(0, WAN_ROOT)
 
-from wan.modules.vae2_1 import Wan2_1_VAE  # noqa: E402
+import importlib.util
 
-VAE_PATH = "/home/alex/.serenity/models/vaes/wan_2.1_vae.safetensors"
+def _load_module(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+_vae_mod = _load_module("wan.modules.vae2_1", f"{WAN_ROOT}/wan/modules/vae2_1.py")
+Wan2_1_VAE = _vae_mod.Wan2_1_VAE
+
+VAE_PATH = "/home/alex/.serenity/models/upscalers/Wan2.1_VAE.safetensors"
 SAMPLE_FPS = 16
 
 
@@ -80,14 +90,44 @@ def main() -> int:
     print("--- Loading Wan2.1 VAE ---")
     t0 = time.time()
 
-    # Wan2_1_VAE expects a .pth file. We have safetensors — load manually.
-    # First check if we have the .pth version
-    vae_pth = "/home/alex/.serenity/models/upscalers/Wan2.1_VAE.safetensors"
-    if not os.path.exists(vae_pth):
-        vae_pth = VAE_PATH
+    # Build VAE model on meta device, then load safetensors weights
+    WanVAE_ = _vae_mod.WanVAE_
+    cfg = dict(
+        dim=96, z_dim=16, dim_mult=[1, 2, 4, 4],
+        num_res_blocks=2, attn_scales=[],
+        temperal_downsample=[False, True, True], dropout=0.0,
+    )
+    with torch.device("meta"):
+        vae_model = WanVAE_(**cfg)
 
-    # Use the Wan VAE class which handles chunked decoding
-    vae = Wan2_1_VAE(vae_pth=vae_pth, device=device)
+    state_dict = load_file(VAE_PATH, device=device)
+    vae_model.load_state_dict(state_dict, assign=True)
+    vae_model = vae_model.eval().requires_grad_(False).to(device)
+
+    # Build the Wan2_1_VAE wrapper manually (avoids torch.load)
+    vae = type("VAEWrapper", (), {})()
+    vae.model = vae_model
+    vae.dtype = torch.float
+    vae.device = device
+    mean = [
+        -0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508,
+        0.4134, -0.0715, 0.5517, -0.3632, -0.1922, -0.9497, 0.2503, -0.2921
+    ]
+    std = [
+        2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.7708, 2.6052, 2.0743,
+        3.2687, 2.1526, 2.8652, 1.5579, 1.6382, 1.1253, 2.8251, 1.9160
+    ]
+    vae.mean = torch.tensor(mean, dtype=torch.float, device=device)
+    vae.std = torch.tensor(std, dtype=torch.float, device=device)
+    vae.scale = [vae.mean, 1.0 / vae.std]
+
+    def decode_fn(zs):
+        with torch.amp.autocast("cuda", dtype=torch.float):
+            return [
+                vae.model.decode(u.unsqueeze(0), vae.scale).float().clamp_(-1, 1).squeeze(0)
+                for u in zs
+            ]
+    vae.decode = decode_fn
     print(f"  VAE loaded in {time.time() - t0:.1f}s")
 
     # ------------------------------------------------------------------
