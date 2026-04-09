@@ -5,7 +5,7 @@ edition = "2021"
 description = "Double-buffered async block swapper for FLAME inference"
 
 [dependencies]
-flame-core = { git = "https://github.com/CodeAlexx/Flame", rev = "c7efeb556157b677cefef7a4af1bc92d8bc5b0b2", features = ["cuda", "bf16_u16"] }
+flame-core = { path = "../../flame-core", features = ["cuda", "bf16_u16"] }
 cudarc = { version = "0.11.9", features = ["driver", "cuda-12050"] }
 half = { version = "2.3", features = ["num-traits"] }
 memmap2 = "0.9"

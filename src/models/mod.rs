@@ -17,3 +17,4 @@ pub mod chroma_dit;
 pub mod qwenimage_dit;
 pub mod ltx2_upsampler;
 pub mod lora_loader;
+pub mod wan22_dit;

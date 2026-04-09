@@ -42,10 +42,7 @@ PROMPT_TEMPLATE_ENCODE_START_IDX = 34
 TOKENIZER_MAX_LENGTH = 1024
 
 REPO = "Qwen/Qwen-Image-2512"
-SNAP = (
-    "/home/alex/.cache/huggingface/hub/models--Qwen--Qwen-Image-2512/snapshots/"
-    "25468b98e3276ca6700de15c6628e51b7de54a26"
-)
+SNAP = "/home/alex/.serenity/models/checkpoints/qwen-image-2512"
 
 
 def extract_masked_hidden(hidden_states: torch.Tensor, mask: torch.Tensor):

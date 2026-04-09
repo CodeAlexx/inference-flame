@@ -7,7 +7,7 @@ license = "MIT"
 description = "Pure Rust diffusion model inference using flame-core"
 
 [dependencies]
-flame-core = { git = "https://github.com/CodeAlexx/Flame", rev = "c7efeb556157b677cefef7a4af1bc92d8bc5b0b2", default-features = false, features = ["cuda", "bf16_u16", "cudnn", "shared_storage"] }
+flame-core = { path = "../flame-core", default-features = false, features = ["cuda", "bf16_u16", "cudnn", "shared_storage"] }
 flame-swap = { path = "flame-swap" }
 cudarc = { version = "0.11.9", default-features = false, features = ["driver", "cublas", "cublaslt", "nvrtc", "cuda-12050", "f16"] }
 half = { version = "2.3", features = ["num-traits"] }
@@ -136,3 +136,7 @@ path = "src/bin/flux1_test.rs"
 [[bin]]
 name = "flux1_infer"
 path = "src/bin/flux1_infer.rs"
+
+[[bin]]
+name = "wan22_t2v_gen"
+path = "src/bin/wan22_t2v_gen.rs"

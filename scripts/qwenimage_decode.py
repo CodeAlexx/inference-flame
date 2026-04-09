@@ -23,10 +23,7 @@ from safetensors.torch import load_file
 
 from diffusers import AutoencoderKLQwenImage
 
-REPO_SNAP = (
-    "/home/alex/.cache/huggingface/hub/models--Qwen--Qwen-Image-2512/snapshots/"
-    "25468b98e3276ca6700de15c6628e51b7de54a26"
-)
+REPO_SNAP = "/home/alex/.serenity/models/checkpoints/qwen-image-2512"
 VAE_SCALE_FACTOR = 8  # 2 ** len(temperal_downsample) = 2^3
 
 
@@ -80,7 +77,7 @@ def main() -> int:
     snap = Path(REPO_SNAP)
     vae = AutoencoderKLQwenImage.from_pretrained(
         snap / "vae",
-        dtype=torch.bfloat16,
+        torch_dtype=torch.bfloat16,
     ).to(device)
     vae.eval()
 

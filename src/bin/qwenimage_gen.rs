@@ -52,15 +52,15 @@ use flame_core::{global_cuda_device, DType, Shape, Tensor};
 use inference_flame::models::qwenimage_dit::QwenImageDit;
 
 const DEFAULT_DIT_SHARDS: &[&str] = &[
-    "/home/alex/.cache/huggingface/hub/models--Qwen--Qwen-Image-2512/snapshots/25468b98e3276ca6700de15c6628e51b7de54a26/transformer/diffusion_pytorch_model-00001-of-00009.safetensors",
-    "/home/alex/.cache/huggingface/hub/models--Qwen--Qwen-Image-2512/snapshots/25468b98e3276ca6700de15c6628e51b7de54a26/transformer/diffusion_pytorch_model-00002-of-00009.safetensors",
-    "/home/alex/.cache/huggingface/hub/models--Qwen--Qwen-Image-2512/snapshots/25468b98e3276ca6700de15c6628e51b7de54a26/transformer/diffusion_pytorch_model-00003-of-00009.safetensors",
-    "/home/alex/.cache/huggingface/hub/models--Qwen--Qwen-Image-2512/snapshots/25468b98e3276ca6700de15c6628e51b7de54a26/transformer/diffusion_pytorch_model-00004-of-00009.safetensors",
-    "/home/alex/.cache/huggingface/hub/models--Qwen--Qwen-Image-2512/snapshots/25468b98e3276ca6700de15c6628e51b7de54a26/transformer/diffusion_pytorch_model-00005-of-00009.safetensors",
-    "/home/alex/.cache/huggingface/hub/models--Qwen--Qwen-Image-2512/snapshots/25468b98e3276ca6700de15c6628e51b7de54a26/transformer/diffusion_pytorch_model-00006-of-00009.safetensors",
-    "/home/alex/.cache/huggingface/hub/models--Qwen--Qwen-Image-2512/snapshots/25468b98e3276ca6700de15c6628e51b7de54a26/transformer/diffusion_pytorch_model-00007-of-00009.safetensors",
-    "/home/alex/.cache/huggingface/hub/models--Qwen--Qwen-Image-2512/snapshots/25468b98e3276ca6700de15c6628e51b7de54a26/transformer/diffusion_pytorch_model-00008-of-00009.safetensors",
-    "/home/alex/.cache/huggingface/hub/models--Qwen--Qwen-Image-2512/snapshots/25468b98e3276ca6700de15c6628e51b7de54a26/transformer/diffusion_pytorch_model-00009-of-00009.safetensors",
+    "/home/alex/.serenity/models/checkpoints/qwen-image-2512/transformer/diffusion_pytorch_model-00001-of-00009.safetensors",
+    "/home/alex/.serenity/models/checkpoints/qwen-image-2512/transformer/diffusion_pytorch_model-00002-of-00009.safetensors",
+    "/home/alex/.serenity/models/checkpoints/qwen-image-2512/transformer/diffusion_pytorch_model-00003-of-00009.safetensors",
+    "/home/alex/.serenity/models/checkpoints/qwen-image-2512/transformer/diffusion_pytorch_model-00004-of-00009.safetensors",
+    "/home/alex/.serenity/models/checkpoints/qwen-image-2512/transformer/diffusion_pytorch_model-00005-of-00009.safetensors",
+    "/home/alex/.serenity/models/checkpoints/qwen-image-2512/transformer/diffusion_pytorch_model-00006-of-00009.safetensors",
+    "/home/alex/.serenity/models/checkpoints/qwen-image-2512/transformer/diffusion_pytorch_model-00007-of-00009.safetensors",
+    "/home/alex/.serenity/models/checkpoints/qwen-image-2512/transformer/diffusion_pytorch_model-00008-of-00009.safetensors",
+    "/home/alex/.serenity/models/checkpoints/qwen-image-2512/transformer/diffusion_pytorch_model-00009-of-00009.safetensors",
 ];
 
 // VAE scale factor: 2 ** len(temperal_downsample) = 2^3 = 8
@@ -218,10 +218,12 @@ fn main() -> anyhow::Result<()> {
     //
     // Note: the pipeline uses max_seq=4096 (hardcoded at call site) even though
     // scheduler_config has max_image_seq_len=8192. We follow the pipeline.
+    // From scheduler_config.json — pipeline uses .get() so these config values win
+    // over the function defaults (base_shift=0.5, max_shift=1.15).
     let base_shift: f32 = 0.5;
-    let max_shift: f32 = 1.15;
+    let max_shift: f32 = 0.9;
     let base_seq_len: f32 = 256.0;
-    let max_seq_len_shift: f32 = 4096.0;
+    let max_seq_len_shift: f32 = 8192.0;
     let shift_terminal: f32 = 0.02;
 
     let m = (max_shift - base_shift) / (max_seq_len_shift - base_seq_len);

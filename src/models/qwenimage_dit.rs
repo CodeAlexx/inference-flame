@@ -606,9 +606,9 @@ impl QwenImageDit {
         let temb_silu = temb.silu()?;
         let mods = Self::linear_bias(&temb_silu.unsqueeze(1)?, norm_out_w, norm_out_b)?
             .squeeze(Some(1))?;
-        // mods: [B, 2*dim]. Shift first, then scale (per diffusers convention).
-        let shift = mods.narrow(1, 0, cfg.inner_dim)?;
-        let scale = mods.narrow(1, cfg.inner_dim, cfg.inner_dim)?;
+        // mods: [B, 2*dim]. Scale first, shift second (AdaLayerNormContinuous convention).
+        let scale = mods.narrow(1, 0, cfg.inner_dim)?;
+        let shift = mods.narrow(1, cfg.inner_dim, cfg.inner_dim)?;
         let normed = Self::layer_norm_no_affine(&img, 1e-6)?;
         let one_plus = scale.add_scalar(1.0)?;
         let scaled = normed.mul(&one_plus.unsqueeze(1)?)?;
@@ -732,8 +732,8 @@ impl QwenImageDit {
         let temb_silu = temb.silu()?;
         let mods = Self::linear_bias(&temb_silu.unsqueeze(1)?, norm_out_w, norm_out_b)?
             .squeeze(Some(1))?;
-        let shift = mods.narrow(1, 0, cfg.inner_dim)?;
-        let scale = mods.narrow(1, cfg.inner_dim, cfg.inner_dim)?;
+        let scale = mods.narrow(1, 0, cfg.inner_dim)?;
+        let shift = mods.narrow(1, cfg.inner_dim, cfg.inner_dim)?;
         let normed = Self::layer_norm_no_affine(&img, 1e-6)?;
         let one_plus = scale.add_scalar(1.0)?;
         let scaled = normed.mul(&one_plus.unsqueeze(1)?)?;
