@@ -863,4 +863,287 @@ impl Wan22Dit {
         let _ = Self::linear_nobias; // silence unused
         Ok(x_final)
     }
+
+    // -----------------------------------------------------------------------
+    // Public accessors for WanVaceDit
+    // -----------------------------------------------------------------------
+
+    pub fn patchify_public(&self, x: &Tensor, f: usize, h: usize, w: usize) -> Result<Tensor> {
+        self.patchify(x, f, h, w)
+    }
+
+    pub fn unpatchify_public(&self, x: &Tensor, grid: (usize, usize, usize)) -> Result<Tensor> {
+        self.unpatchify(x, grid)
+    }
+
+    pub fn shared_weight(&self, key: &str) -> Result<&Tensor> {
+        self.shared.get(key).ok_or_else(|| {
+            flame_core::Error::InvalidInput(format!("Missing shared weight: {key}"))
+        })
+    }
+
+    pub fn linear_bias_pub(x: &Tensor, weight: &Tensor, bias: &Tensor) -> Result<Tensor> {
+        Self::linear_bias(x, weight, bias)
+    }
+
+    /// Compute time + text embeddings (shared between base and VACE paths).
+    /// Returns (e, e0, txt) where:
+    /// - e: [1, seq_len, dim] BF16 — time embedding
+    /// - e0: [1, seq_len, 6, dim] F32 — time projection
+    /// - txt: [1, text_len, dim] BF16 — text embedding
+    pub fn compute_embeddings(
+        &self,
+        timestep: f32,
+        context: &Tensor,
+        seq_len: usize,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        let cfg = &self.config;
+
+        // Time embedding
+        let t_vals = vec![timestep; seq_len];
+        let sin_emb = self.sinusoidal_embedding(&t_vals)?;
+        let sin_emb_bf16 = sin_emb.to_dtype(DType::BF16)?.unsqueeze(0)?;
+
+        let te_w0 = self.shared.get("time_embedding.0.weight").unwrap();
+        let te_b0 = self.shared.get("time_embedding.0.bias").unwrap();
+        let te_w2 = self.shared.get("time_embedding.2.weight").unwrap();
+        let te_b2 = self.shared.get("time_embedding.2.bias").unwrap();
+        let e = Self::linear_bias(&sin_emb_bf16, te_w0, te_b0)?;
+        let e = e.silu()?;
+        let e = Self::linear_bias(&e, te_w2, te_b2)?;
+
+        let tp_w = self.shared.get("time_projection.1.weight").unwrap();
+        let tp_b = self.shared.get("time_projection.1.bias").unwrap();
+        let e_silu = e.silu()?;
+        let e0_flat = Self::linear_bias(&e_silu, tp_w, tp_b)?;
+        let e0 = e0_flat.reshape(&[1, seq_len, 6, cfg.dim])?.to_dtype(DType::F32)?;
+
+        // Text embedding
+        let txt_w0 = self.shared.get("text_embedding.0.weight").unwrap();
+        let txt_b0 = self.shared.get("text_embedding.0.bias").unwrap();
+        let txt_w2 = self.shared.get("text_embedding.2.weight").unwrap();
+        let txt_b2 = self.shared.get("text_embedding.2.bias").unwrap();
+        let ctx_len = context.shape().dims()[1];
+        let ctx_padded = if ctx_len < cfg.text_len {
+            let pad = Tensor::zeros_dtype(
+                Shape::from_dims(&[1, cfg.text_len - ctx_len, cfg.text_dim]),
+                context.dtype(), self.device.clone(),
+            )?;
+            Tensor::cat(&[context, &pad], 1)?
+        } else {
+            context.narrow(1, 0, cfg.text_len)?
+        };
+        let txt = Self::linear_bias(&ctx_padded, txt_w0, txt_b0)?;
+        let txt = txt.gelu()?;
+        let txt = Self::linear_bias(&txt, txt_w2, txt_b2)?;
+
+        Ok((e, e0, txt))
+    }
+
+    /// Run a single block forward with configurable prefix (for VACE reuse).
+    pub fn block_forward_pub(
+        &self,
+        x: &Tensor,
+        e0: &Tensor,
+        e: &Tensor,
+        context: &Tensor,
+        seq_len_actual: usize,
+        grid_sizes: (usize, usize, usize),
+        weights: &HashMap<String, Tensor>,
+        block_idx: usize,
+        prefix_base: &str,  // "blocks" or "vace_blocks"
+    ) -> Result<Tensor> {
+        // Delegate to block_forward but with custom prefix
+        self.block_forward_with_prefix(x, e0, e, context, seq_len_actual, grid_sizes, weights, block_idx, prefix_base)
+    }
+
+    /// FlameSwap accessors for VACE
+    pub fn swap_prefetch(&mut self, idx: usize) -> Result<()> {
+        self.swap.prefetch(idx)
+            .map_err(|e| flame_core::Error::InvalidInput(format!("prefetch: {e}")))
+    }
+
+    pub fn swap_await(&mut self, idx: usize) -> Result<HashMap<String, Tensor>> {
+        self.swap.await_block(idx)
+            .map_err(|e| flame_core::Error::InvalidInput(format!("await: {e}")))
+    }
+
+    /// Head forward (norm_out + proj_out)
+    pub fn head_forward(&self, img: &Tensor, e: &Tensor, seq_len: usize) -> Result<Tensor> {
+        let cfg = &self.config;
+        let dim = cfg.dim;
+
+        let head_mod = self.shared.get("head.modulation").unwrap();
+        let head_w = self.shared.get("head.head.weight").unwrap();
+        let head_b = self.shared.get("head.head.bias").unwrap();
+
+        let head_mod_f32 = head_mod.to_dtype(DType::F32)?;
+        let e_f32 = e.to_dtype(DType::F32)?;
+        let bm_data = head_mod_f32.to_vec1::<f32>()?;
+        let head_shift: Vec<f32> = bm_data[..dim].to_vec();
+        let head_scale: Vec<f32> = bm_data[dim..2*dim].to_vec();
+
+        let img_normed_bf16 = Self::layer_norm_no_affine(img, cfg.eps)?;
+        let normed_data = img_normed_bf16.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+        let e_data = e_f32.to_vec1::<f32>()?;
+
+        let mut head_input = vec![0.0f32; seq_len * dim];
+        for s in 0..seq_len {
+            for d in 0..dim {
+                let e_val = e_data[s * dim + d];
+                let shift = head_shift[d] + e_val;
+                let scale = head_scale[d] + e_val;
+                head_input[s * dim + d] = normed_data[s * dim + d] * (1.0 + scale) + shift;
+            }
+        }
+
+        let head_in = Tensor::from_vec(
+            head_input, Shape::from_dims(&[1, seq_len, dim]), self.device.clone(),
+        )?.to_dtype(DType::BF16)?;
+        Self::linear_bias(&head_in, head_w, head_b)
+    }
+
+    /// Block forward with configurable key prefix
+    fn block_forward_with_prefix(
+        &self,
+        x: &Tensor,
+        e0: &Tensor,
+        _e: &Tensor,
+        context: &Tensor,
+        _seq_len_actual: usize,
+        grid_sizes: (usize, usize, usize),
+        weights: &HashMap<String, Tensor>,
+        block_idx: usize,
+        prefix_base: &str,
+    ) -> Result<Tensor> {
+        let cfg = &self.config;
+        let dim = cfg.dim;
+        let nh = cfg.num_heads;
+        let hd = cfg.head_dim;
+        let prefix = format!("{prefix_base}.{block_idx}");
+
+        let w = |suffix: &str| -> Result<&Tensor> {
+            let key = format!("{prefix}.{suffix}");
+            weights.get(&key).ok_or_else(|| {
+                flame_core::Error::InvalidInput(format!("Missing: {key}"))
+            })
+        };
+
+        let sl = x.shape().dims()[1];
+
+        // Block modulation
+        let block_mod = w("modulation")?;
+        let block_mod_f32 = block_mod.to_dtype(DType::F32)?;
+        let bm_data = block_mod_f32.to_vec1::<f32>()?;
+        let e0_data = e0.to_vec1::<f32>()?;
+
+        let mut mods = vec![vec![0.0f32; sl * dim]; 6];
+        for s in 0..sl {
+            for m in 0..6 {
+                for d in 0..dim {
+                    mods[m][s * dim + d] = bm_data[m * dim + d] + e0_data[s * 6 * dim + m * dim + d];
+                }
+            }
+        }
+
+        // Self-attention
+        let x_normed_bf16 = Self::layer_norm_no_affine(x, cfg.eps)?;
+        let x_normed_f32 = x_normed_bf16.to_dtype(DType::F32)?;
+        let normed_data = x_normed_f32.to_vec1::<f32>()?;
+        let x_f32 = x.to_dtype(DType::F32)?;
+
+        let mut sa_input_data = vec![0.0f32; sl * dim];
+        for s in 0..sl {
+            for d in 0..dim {
+                let idx = s * dim + d;
+                sa_input_data[idx] = normed_data[idx] * (1.0 + mods[1][idx]) + mods[0][idx];
+            }
+        }
+        let sa_input = Tensor::from_vec(
+            sa_input_data, Shape::from_dims(&[1, sl, dim]), self.device.clone(),
+        )?.to_dtype(DType::BF16)?;
+
+        let q = Self::linear_bias(&sa_input, w("self_attn.q.weight")?, w("self_attn.q.bias")?)?;
+        let k = Self::linear_bias(&sa_input, w("self_attn.k.weight")?, w("self_attn.k.bias")?)?;
+        let v = Self::linear_bias(&sa_input, w("self_attn.v.weight")?, w("self_attn.v.bias")?)?;
+        let q = Self::rms_norm(&q, w("self_attn.norm_q.weight")?, cfg.eps)?;
+        let k = Self::rms_norm(&k, w("self_attn.norm_k.weight")?, cfg.eps)?;
+        let q = q.reshape(&[1, sl, nh, hd])?;
+        let k = k.reshape(&[1, sl, nh, hd])?;
+        let v = v.reshape(&[1, sl, nh, hd])?;
+        let q = self.apply_rope(&q, grid_sizes)?;
+        let k = self.apply_rope(&k, grid_sizes)?;
+        let q = q.permute(&[0, 2, 1, 3])?;
+        let k = k.permute(&[0, 2, 1, 3])?;
+        let v = v.permute(&[0, 2, 1, 3])?;
+        let attn_out = flame_core::attention::sdpa(&q, &k, &v, None)?;
+        let attn_out = attn_out.permute(&[0, 2, 1, 3])?.reshape(&[1, sl, nh * hd])?;
+        let sa_out = Self::linear_bias(&attn_out, w("self_attn.o.weight")?, w("self_attn.o.bias")?)?;
+
+        let sa_out_f32 = sa_out.to_dtype(DType::F32)?;
+        let sa_out_data = sa_out_f32.to_vec1::<f32>()?;
+        let x_data = x_f32.to_vec1::<f32>()?;
+        let mut x_new_data = vec![0.0f32; sl * dim];
+        for s in 0..sl {
+            for d in 0..dim {
+                let idx = s * dim + d;
+                x_new_data[idx] = x_data[idx] + sa_out_data[idx] * mods[2][idx];
+            }
+        }
+        let x_after_sa = Tensor::from_vec(
+            x_new_data, Shape::from_dims(&[1, sl, dim]), self.device.clone(),
+        )?.to_dtype(DType::BF16)?;
+
+        // Cross-attention
+        let ca_input = if let (Ok(n3w), Ok(n3b)) = (w("norm3.weight"), w("norm3.bias")) {
+            Self::layer_norm_affine(&x_after_sa, n3w, n3b, cfg.eps)?
+        } else {
+            x_after_sa.clone()
+        };
+        let ca_q = Self::linear_bias(&ca_input, w("cross_attn.q.weight")?, w("cross_attn.q.bias")?)?;
+        let ca_k = Self::linear_bias(context, w("cross_attn.k.weight")?, w("cross_attn.k.bias")?)?;
+        let ca_v = Self::linear_bias(context, w("cross_attn.v.weight")?, w("cross_attn.v.bias")?)?;
+        let ca_q = Self::rms_norm(&ca_q, w("cross_attn.norm_q.weight")?, cfg.eps)?;
+        let ca_k = Self::rms_norm(&ca_k, w("cross_attn.norm_k.weight")?, cfg.eps)?;
+        let ca_k_len = context.shape().dims()[1];
+        let ca_q = ca_q.reshape(&[1, sl, nh, hd])?.permute(&[0, 2, 1, 3])?;
+        let ca_k = ca_k.reshape(&[1, ca_k_len, nh, hd])?.permute(&[0, 2, 1, 3])?;
+        let ca_v = ca_v.reshape(&[1, ca_k_len, nh, hd])?.permute(&[0, 2, 1, 3])?;
+        let ca_out = flame_core::attention::sdpa(&ca_q, &ca_k, &ca_v, None)?;
+        let ca_out = ca_out.permute(&[0, 2, 1, 3])?.reshape(&[1, sl, nh * hd])?;
+        let ca_out = Self::linear_bias(&ca_out, w("cross_attn.o.weight")?, w("cross_attn.o.bias")?)?;
+        let x_after_ca = x_after_sa.add(&ca_out)?;
+
+        // FFN
+        let x_ca_normed_bf16 = Self::layer_norm_no_affine(&x_after_ca, cfg.eps)?;
+        let x_ca_f32 = x_after_ca.to_dtype(DType::F32)?;
+        let normed_data = x_ca_normed_bf16.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+        let mut ffn_input_data = vec![0.0f32; sl * dim];
+        for s in 0..sl {
+            for d in 0..dim {
+                let idx = s * dim + d;
+                ffn_input_data[idx] = normed_data[idx] * (1.0 + mods[4][idx]) + mods[3][idx];
+            }
+        }
+        let ffn_input = Tensor::from_vec(
+            ffn_input_data, Shape::from_dims(&[1, sl, dim]), self.device.clone(),
+        )?.to_dtype(DType::BF16)?;
+        let ffn_h = Self::linear_bias(&ffn_input, w("ffn.0.weight")?, w("ffn.0.bias")?)?;
+        let ffn_h = ffn_h.gelu()?;
+        let ffn_out = Self::linear_bias(&ffn_h, w("ffn.2.weight")?, w("ffn.2.bias")?)?;
+
+        let ffn_out_f32 = ffn_out.to_dtype(DType::F32)?;
+        let ffn_data = ffn_out_f32.to_vec1::<f32>()?;
+        let x_ca_data = x_ca_f32.to_vec1::<f32>()?;
+        let mut x_final_data = vec![0.0f32; sl * dim];
+        for s in 0..sl {
+            for d in 0..dim {
+                let idx = s * dim + d;
+                x_final_data[idx] = x_ca_data[idx] + ffn_data[idx] * mods[5][idx];
+            }
+        }
+        Tensor::from_vec(
+            x_final_data, Shape::from_dims(&[1, sl, dim]), self.device.clone(),
+        )?.to_dtype(DType::BF16)
+    }
 }

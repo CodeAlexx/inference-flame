@@ -144,3 +144,7 @@ path = "src/bin/wan22_t2v_gen.rs"
 [[bin]]
 name = "wan22_i2v_gen"
 path = "src/bin/wan22_i2v_gen.rs"
+
+[[bin]]
+name = "wan_vace_gen"
+path = "src/bin/wan_vace_gen.rs"
