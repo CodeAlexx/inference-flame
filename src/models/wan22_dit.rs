@@ -563,7 +563,7 @@ impl Wan22Dit {
     /// Patchify: [C, F, H, W] → [F*(H/2)*(W/2), C*1*2*2]
     fn patchify(&self, x: &Tensor, f: usize, h: usize, w: usize) -> Result<Tensor> {
         let cfg = &self.config;
-        let c = cfg.in_channels;
+        let c = x.shape().dims()[0]; // read from tensor, not config (I2V has 36, T2V has 16)
         let (pf, ph, pw) = (cfg.patch_size[0], cfg.patch_size[1], cfg.patch_size[2]);
         let fo = f / pf;
         let ho = h / ph;
@@ -639,6 +639,20 @@ impl Wan22Dit {
         }
 
         Tensor::from_f32_to_bf16(out, Shape::from_dims(&[c, out_f, out_h, out_w]), self.device.clone())
+    }
+
+    /// I2V forward pass. Input `x` is `[36, F, H, W]` (noise + y already concatenated).
+    /// Output is still `[16, F, H, W]` (the head outputs out_channels=16).
+    /// Internally identical to `forward` — the patchify and patch_embedding handle
+    /// the larger input channels automatically.
+    pub fn forward_i2v(
+        &mut self,
+        x: &Tensor,
+        timestep: f32,
+        context: &Tensor,
+        seq_len: usize,
+    ) -> Result<Tensor> {
+        self.forward(x, timestep, context, seq_len)
     }
 
     // -----------------------------------------------------------------------
