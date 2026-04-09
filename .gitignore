@@ -2,3 +2,11 @@
 /output/
 *.py
 *.safetensors
+
+# Internal dev notes — kept locally, not on github
+AUDIT_*.md
+PERF_*.md
+LTX2_AV_BUGS.md
+alexltx.md
+debug/FINDINGS.md
+flame-swap/FLAME-CORE-PATCH.md
