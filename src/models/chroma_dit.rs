@@ -253,11 +253,12 @@ impl ChromaDit {
 
     /// Modulate: out = LayerNorm(x) * (1 + scale) + shift
     /// `scale` and `shift` are `[B, dim]`, broadcast over the seq dim.
+    ///
+    /// Fused path: `flame_core::bf16_ops::modulate_pre_fused_bf16` does
+    /// LayerNorm → (1 + scale) → shift in a single kernel. Replaces the
+    /// 4-kernel unfused version (layer_norm → add_scalar → mul → add).
     fn modulate_pre(x: &Tensor, shift: &Tensor, scale: &Tensor) -> Result<Tensor> {
-        let normed = Self::layer_norm_no_affine(x, 1e-6)?;
-        let one_plus = scale.add_scalar(1.0)?;
-        let scaled = normed.mul(&one_plus.unsqueeze(1)?)?;
-        scaled.add(&shift.unsqueeze(1)?)
+        flame_core::bf16_ops::modulate_pre_fused_bf16(x, shift, scale, 1e-6)
     }
 
     /// Sinusoidal `Timesteps` embedding (FLUX/diffusers style:
@@ -484,6 +485,24 @@ impl ChromaDit {
     /// - `timesteps`: `[B]` sigmas in `[0, 1]`
     /// - `img_ids`: `[N_img, 3]`
     /// - `txt_ids`: `[N_txt, 3]`
+    /// Precompute per-step tensors that are constant across the CFG loop
+    /// (cond and uncond forwards share the same `timesteps`/`img_ids`/`txt_ids`).
+    ///
+    /// Returns `(pooled_temb, pe_cos, pe_sin)`. Pass to `forward_cached` to
+    /// skip ~10 approximator matmuls and 1 RoPE table build on the second
+    /// CFG forward.
+    pub fn precompute_step_cache(
+        &self,
+        timesteps: &Tensor,
+        img_ids: &Tensor,
+        txt_ids: &Tensor,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        let approx_in = self.approximator_input(timesteps)?;
+        let pooled_temb = self.approximator_forward(&approx_in)?;
+        let (pe_cos, pe_sin) = Self::build_rope_2d(img_ids, txt_ids, &self.config, &self.device)?;
+        Ok((pooled_temb, pe_cos, pe_sin))
+    }
+
     pub fn forward(
         &mut self,
         img: &Tensor,
@@ -491,6 +510,23 @@ impl ChromaDit {
         timesteps: &Tensor,
         img_ids: &Tensor,
         txt_ids: &Tensor,
+    ) -> Result<Tensor> {
+        // Back-compat wrapper: compute step cache inline then delegate.
+        let (pooled_temb, pe_cos, pe_sin) =
+            self.precompute_step_cache(timesteps, img_ids, txt_ids)?;
+        self.forward_cached(img, txt, &pooled_temb, &pe_cos, &pe_sin)
+    }
+
+    /// Forward with externally-computed per-step cache. Use in CFG loops:
+    /// call `precompute_step_cache` once per step, then `forward_cached`
+    /// twice (cond + uncond) reusing the same cache.
+    pub fn forward_cached(
+        &mut self,
+        img: &Tensor,
+        txt: &Tensor,
+        pooled_temb: &Tensor,
+        pe_cos: &Tensor,
+        pe_sin: &Tensor,
     ) -> Result<Tensor> {
         let cfg = self.config.clone();
         let _dim = cfg.inner_dim;
@@ -510,20 +546,13 @@ impl ChromaDit {
             .ok_or_else(|| flame_core::Error::InvalidInput("Missing context_embedder.bias".into()))?;
         let mut txt = Self::linear_bias(txt, ctx_w, ctx_b)?;
 
-        // --- Distilled guidance: compute pooled_temb once ---
-        let approx_in = self.approximator_input(timesteps)?;
-        let pooled_temb = self.approximator_forward(&approx_in)?;
-        // pooled_temb shape: [B, mod_index_length, inner_dim]
-        // Indexing layout (matching diffusers transformer_chroma.py):
+        // --- Block indexing constants (layout from diffusers transformer_chroma.py) ---
         //   single block i:  [3*i : 3*i + 3]                          for i in 0..38
         //   double img i:    [114 + 6*i : 114 + 6*i + 6]               for i in 0..19
         //   double txt i:    [114 + 114 + 6*i : 114 + 114 + 6*i + 6]   for i in 0..19
         //   norm_out:        [-2:]
         let img_offset_dbl = 3 * cfg.num_single_blocks;     // 114
         let txt_offset_dbl = img_offset_dbl + 6 * cfg.num_double_blocks; // 228
-
-        // --- RoPE tables ---
-        let (pe_cos, pe_sin) = Self::build_rope_2d(img_ids, txt_ids, &cfg, &self.device)?;
 
         // --- Double blocks ---
         let total_blocks = cfg.num_double_blocks + cfg.num_single_blocks;
@@ -544,7 +573,7 @@ impl ChromaDit {
             let txt_mod = pooled_temb.narrow(1, txt_offset_dbl + 6 * i, 6)?; // [B, 6, dim]
 
             let (new_img, new_txt) = self.double_block_forward(
-                &img, &txt, &img_mod, &txt_mod, &pe_cos, &pe_sin, &raw, i,
+                &img, &txt, &img_mod, &txt_mod, pe_cos, pe_sin, &raw, i,
             )?;
             img = new_img;
             txt = new_txt;
@@ -567,7 +596,7 @@ impl ChromaDit {
             }
 
             let single_mod = pooled_temb.narrow(1, 3 * i, 3)?; // [B, 3, dim]
-            x = self.single_block_forward(&x, &single_mod, &pe_cos, &pe_sin, &raw, i)?;
+            x = self.single_block_forward(&x, &single_mod, pe_cos, pe_sin, &raw, i)?;
 
             if i % 10 == 0 || i == cfg.num_single_blocks - 1 {
                 log::info!("[Chroma] Single block {}/{}", i + 1, cfg.num_single_blocks);
@@ -692,9 +721,9 @@ impl ChromaDit {
         let img_attn = Self::linear_bias(&img_attn, w("attn.to_out.0.weight")?, w("attn.to_out.0.bias")?)?;
         let txt_attn = Self::linear_bias(&txt_attn, w("attn.to_add_out.weight")?, w("attn.to_add_out.bias")?)?;
 
-        // ── 8. Gated residual (using gate_msa) ──
-        let img = img.add(&img_gate_msa.unsqueeze(1)?.mul(&img_attn)?)?;
-        let txt = txt.add(&txt_gate_msa.unsqueeze(1)?.mul(&txt_attn)?)?;
+        // ── 8. Gated residual (using gate_msa) — fused ──
+        let img = flame_core::bf16_ops::gate_residual_fused_bf16(&img, &img_gate_msa, &img_attn)?;
+        let txt = flame_core::bf16_ops::gate_residual_fused_bf16(&txt, &txt_gate_msa, &txt_attn)?;
 
         // ── 9. FFN: norm + (1+scale_mlp) + shift_mlp → linear → gelu → linear → gate ──
         let img_mlp_in = Self::modulate_pre(&img, &img_shift_mlp, &img_scale_mlp)?;
@@ -708,8 +737,8 @@ impl ChromaDit {
         let txt_mlp = txt_mlp.gelu()?;
         let txt_mlp = Self::linear_bias(&txt_mlp, w("ff_context.net.2.weight")?, w("ff_context.net.2.bias")?)?;
 
-        let img = img.add(&img_gate_mlp.unsqueeze(1)?.mul(&img_mlp)?)?;
-        let txt = txt.add(&txt_gate_mlp.unsqueeze(1)?.mul(&txt_mlp)?)?;
+        let img = flame_core::bf16_ops::gate_residual_fused_bf16(&img, &img_gate_mlp, &img_mlp)?;
+        let txt = flame_core::bf16_ops::gate_residual_fused_bf16(&txt, &txt_gate_mlp, &txt_mlp)?;
 
         Ok((img, txt))
     }
@@ -780,7 +809,7 @@ impl ChromaDit {
         let out = Self::linear_bias(&cat, w("proj_out.weight")?, w("proj_out.bias")?)?;
 
         let _ = mlp_hidden; // silence unused warning if mlp_ratio path differs
-        x.add(&gate.unsqueeze(1)?.mul(&out)?)
+        flame_core::bf16_ops::gate_residual_fused_bf16(x, &gate, &out)
     }
 }
 

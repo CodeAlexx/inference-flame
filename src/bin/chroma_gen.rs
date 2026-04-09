@@ -190,8 +190,13 @@ fn main() -> anyhow::Result<()> {
             )?
             .to_dtype(DType::BF16)?;
 
-            let cond_pred = dit.forward(&x, &t5_cond,   &t_vec, &img_ids, &txt_ids)?;
-            let uncond_pred = dit.forward(&x, &t5_uncond, &t_vec, &img_ids, &txt_ids)?;
+            // Approximator + RoPE are identical for cond and uncond (same
+            // timestep/ids), so compute once per step.
+            let (pooled_temb, pe_cos, pe_sin) =
+                dit.precompute_step_cache(&t_vec, &img_ids, &txt_ids)?;
+
+            let cond_pred = dit.forward_cached(&x, &t5_cond,   &pooled_temb, &pe_cos, &pe_sin)?;
+            let uncond_pred = dit.forward_cached(&x, &t5_uncond, &pooled_temb, &pe_cos, &pe_sin)?;
 
             // noise = uncond + scale * (cond - uncond)
             let diff = cond_pred.sub(&uncond_pred)?;

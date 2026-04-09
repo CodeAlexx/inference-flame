@@ -1,0 +1,9 @@
+# Bake libtorch's cuDNN path into the binary rpath so that
+# `./target/release/<binary>` runs without setting LD_LIBRARY_PATH manually.
+#
+# libcudnn.so.9 lives in libtorch-cu124 on this machine; flame-core's `cudnn`
+# feature dynamically loads it at runtime.
+[target.x86_64-unknown-linux-gnu]
+rustflags = [
+    "-C", "link-arg=-Wl,-rpath,/home/alex/libtorch-cu124/libtorch/lib",
+]
