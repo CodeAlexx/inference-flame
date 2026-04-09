@@ -105,6 +105,12 @@ fn main() -> anyhow::Result<()> {
     let t5_uncond = ensure_bf16(t5_uncond)?;
     println!("  cond:   {:?}", t5_cond.shape().dims());
     println!("  uncond: {:?}", t5_uncond.shape().dims());
+    // Pre-stack [cond, uncond] into a single B=2 tensor. CFG loop runs
+    // a single forward per step instead of two, halving block fetches.
+    let t5_batched = Tensor::cat(&[&t5_cond, &t5_uncond], 0)?;
+    drop(t5_cond);
+    drop(t5_uncond);
+    println!("  batched: {:?}", t5_batched.shape().dims());
     println!("  Loaded in {:.1}s", t0.elapsed().as_secs_f32());
     println!();
 
@@ -183,20 +189,27 @@ fn main() -> anyhow::Result<()> {
         // Scoped block: every per-step temporary drops at the closing `}`
         // BEFORE the next iteration allocates. Prevents VRAM accumulation.
         let next_x = {
+            // Batched timestep [t, t] so the approximator and SDPA run in
+            // one B=2 pass that serves both cond (row 0) and uncond (row 1).
             let t_vec = Tensor::from_vec(
-                vec![t_curr],
-                Shape::from_dims(&[1]),
+                vec![t_curr, t_curr],
+                Shape::from_dims(&[2]),
                 device.clone(),
             )?
             .to_dtype(DType::BF16)?;
 
-            // Approximator + RoPE are identical for cond and uncond (same
-            // timestep/ids), so compute once per step.
             let (pooled_temb, pe_cos, pe_sin) =
                 dit.precompute_step_cache(&t_vec, &img_ids, &txt_ids)?;
 
-            let cond_pred = dit.forward_cached(&x, &t5_cond,   &pooled_temb, &pe_cos, &pe_sin)?;
-            let uncond_pred = dit.forward_cached(&x, &t5_uncond, &pooled_temb, &pe_cos, &pe_sin)?;
+            // Stack x twice to match B=2. Same latent feeds both rows; the
+            // split happens in the output based on the T5 side.
+            let x_batched = Tensor::cat(&[&x, &x], 0)?;
+            let preds = dit.forward_cached(&x_batched, &t5_batched, &pooled_temb, &pe_cos, &pe_sin)?;
+            drop(x_batched);
+
+            // preds[0] = cond, preds[1] = uncond (matches t5_batched order).
+            let cond_pred = preds.narrow(0, 0, 1)?;
+            let uncond_pred = preds.narrow(0, 1, 1)?;
 
             // noise = uncond + scale * (cond - uncond)
             let diff = cond_pred.sub(&uncond_pred)?;
@@ -216,7 +229,7 @@ fn main() -> anyhow::Result<()> {
     }
     let dt_denoise = t_denoise.elapsed().as_secs_f32();
     println!(
-        "  Denoised in {:.1}s ({:.2}s/step, 2 forwards/step)",
+        "  Denoised in {:.1}s ({:.2}s/step, 1 batched B=2 forward/step)",
         dt_denoise,
         dt_denoise / num_steps as f32,
     );
@@ -224,8 +237,7 @@ fn main() -> anyhow::Result<()> {
 
     // Drop DiT before VAE load (DiT FlameSwap holds ~17 GB worth of weights).
     drop(dit);
-    drop(t5_cond);
-    drop(t5_uncond);
+    drop(t5_batched);
     println!("  DiT + cached embeddings evicted");
 
     // ------------------------------------------------------------------

@@ -223,12 +223,35 @@ impl ChromaDit {
     // Helpers (mirror of flux1_dit helpers)
     // -----------------------------------------------------------------------
 
+    /// Flatten [B, N, C] → [1, B*N, C], call fused_linear3d, reshape back.
+    /// `fused_linear3d_bf16_native` uses cuBLASLt strided batched GEMM with
+    /// BATCH_COUNT=1 on the weight and BATCH_COUNT=B on input/output, which
+    /// cuBLASLt treats as invalid when B>1 (error 7). Linear is a per-position
+    /// op so flattening is mathematically identical and works for any B.
     fn linear_bias(x: &Tensor, weight: &Tensor, bias: &Tensor) -> Result<Tensor> {
-        flame_core::ops::fused_inference::fused_linear3d_native(x, weight, Some(bias))
+        let dims = x.shape().dims().to_vec();
+        if dims.len() == 3 && dims[0] > 1 {
+            let (b, n, c) = (dims[0], dims[1], dims[2]);
+            let flat = x.reshape(&[1, b * n, c])?;
+            let out = flame_core::ops::fused_inference::fused_linear3d_native(&flat, weight, Some(bias))?;
+            let out_c = weight.shape().dims()[0];
+            out.reshape(&[b, n, out_c])
+        } else {
+            flame_core::ops::fused_inference::fused_linear3d_native(x, weight, Some(bias))
+        }
     }
 
     fn linear_nobias(x: &Tensor, weight: &Tensor) -> Result<Tensor> {
-        flame_core::ops::fused_inference::fused_linear3d_native(x, weight, None)
+        let dims = x.shape().dims().to_vec();
+        if dims.len() == 3 && dims[0] > 1 {
+            let (b, n, c) = (dims[0], dims[1], dims[2]);
+            let flat = x.reshape(&[1, b * n, c])?;
+            let out = flame_core::ops::fused_inference::fused_linear3d_native(&flat, weight, None)?;
+            let out_c = weight.shape().dims()[0];
+            out.reshape(&[b, n, out_c])
+        } else {
+            flame_core::ops::fused_inference::fused_linear3d_native(x, weight, None)
+        }
     }
 
     fn rms_norm(x: &Tensor, scale: &Tensor, eps: f32) -> Result<Tensor> {
