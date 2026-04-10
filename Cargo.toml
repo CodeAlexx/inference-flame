@@ -58,6 +58,10 @@ name = "klein_infer"
 path = "src/bin/klein_infer.rs"
 
 [[bin]]
+name = "klein_edit_infer"
+path = "src/bin/klein_edit_infer.rs"
+
+[[bin]]
 name = "sd3_infer"
 path = "src/bin/sd3_infer.rs"
 
@@ -88,6 +92,10 @@ path = "src/bin/klein9b_compare.rs"
 [[bin]]
 name = "ltx2_generate"
 path = "src/bin/ltx2_generate.rs"
+
+[[bin]]
+name = "ltx2_i2v_gen"
+path = "src/bin/ltx2_i2v_gen.rs"
 
 [[bin]]
 name = "ltx2_load_test"
@@ -152,3 +160,11 @@ path = "src/bin/wan_vace_gen.rs"
 [[bin]]
 name = "hunyuan15_gen"
 path = "src/bin/hunyuan15_gen.rs"
+
+[[bin]]
+name = "klein9b_edit_infer"
+path = "src/bin/klein9b_edit_infer.rs"
+
+[[bin]]
+name = "kandinsky5_infer"
+path = "src/bin/kandinsky5_infer.rs"

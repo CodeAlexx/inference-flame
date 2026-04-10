@@ -3356,6 +3356,34 @@ impl LTX2StreamingModel {
         frame_rate: f32,
         encoder_attention_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
+        self.forward_video_only_inner(x, timestep, context, frame_rate, encoder_attention_mask, None)
+    }
+
+    /// Same as `forward_video_only` but with an optional per-token conditioning mask
+    /// for image-to-video. When `conditioning_mask` is Some, it should be shape
+    /// `[B, num_tokens]` with 1.0 for conditioned positions and 0.0 elsewhere.
+    /// The timestep for conditioned positions is zeroed: `ts * (1 - mask)`.
+    pub fn forward_video_only_i2v(
+        &mut self,
+        x: &Tensor,
+        timestep: &Tensor,
+        context: &Tensor,
+        frame_rate: f32,
+        encoder_attention_mask: Option<&Tensor>,
+        conditioning_mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        self.forward_video_only_inner(x, timestep, context, frame_rate, encoder_attention_mask, conditioning_mask)
+    }
+
+    fn forward_video_only_inner(
+        &mut self,
+        x: &Tensor,
+        timestep: &Tensor,
+        context: &Tensor,
+        frame_rate: f32,
+        encoder_attention_mask: Option<&Tensor>,
+        conditioning_mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
         let x_dims = x.shape().dims().to_vec();
         let (batch_size, channels, num_frames, height, width) =
             (x_dims[0], x_dims[1], x_dims[2], x_dims[3], x_dims[4]);
@@ -3392,6 +3420,15 @@ impl LTX2StreamingModel {
         let num_mod_params = self.time_embed.num_mod_params;
         log::info!("[LTX2] timestep dtype={:?}, x dtype={:?}", timestep.dtype(), x.dtype());
         let ts_expanded = timestep.unsqueeze(1)?.expand(&[batch_size, num_tokens])?;
+        // I2V: zero out timestep at conditioned positions so the model sees sigma=0 there
+        let ts_expanded = if let Some(mask) = conditioning_mask {
+            // mask is [B, num_tokens] with 1.0 for conditioned, 0.0 for unconditioned
+            // We want ts * (1 - mask)
+            let inv_mask = mask.mul_scalar(-1.0)?.add_scalar(1.0)?;
+            ts_expanded.mul(&inv_mask)?
+        } else {
+            ts_expanded
+        };
         let ts_scaled = ts_expanded.mul_scalar(self.config.timestep_scale_multiplier as f32)?;
         let ts_flat = ts_scaled.reshape(&[batch_size * num_tokens])?;
         log::info!("[LTX2] ts_flat dtype={:?}", ts_flat.dtype());

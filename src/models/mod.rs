@@ -20,3 +20,5 @@ pub mod lora_loader;
 pub mod wan22_dit;
 pub mod wan_vace_dit;
 pub mod hunyuan15_dit;
+pub mod kandinsky5_dit;
+pub mod qwen25vl_encoder;
