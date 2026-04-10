@@ -168,3 +168,7 @@ path = "src/bin/klein9b_edit_infer.rs"
 [[bin]]
 name = "kandinsky5_infer"
 path = "src/bin/kandinsky5_infer.rs"
+
+[[bin]]
+name = "ltx2_decode_av"
+path = "src/bin/ltx2_decode_av.rs"
