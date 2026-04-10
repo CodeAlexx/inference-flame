@@ -390,6 +390,11 @@ impl FlameSwap {
 
     pub fn num_blocks(&self) -> usize { self.blocks.len() }
 
+    /// Clear any pending prefetch state (for reuse across training steps).
+    pub fn clear_pending(&mut self) {
+        self.pending = None;
+    }
+
     /// Submit a staging request for `idx` and return immediately.  No DMA,
     /// no kernel launches.  Slot reuse hazards are guarded by `done_event`:
     /// if the chosen slot is still flagged InCompute from the previous
@@ -398,10 +403,12 @@ impl FlameSwap {
     /// stream to wait on it before any subsequent DMA fires.
     pub fn prefetch(&mut self, idx: usize) -> Result<(), Box<dyn std::error::Error>> {
         assert!(idx < self.blocks.len(), "block index {idx} out of range");
-        assert!(
-            self.pending.is_none(),
-            "prefetch({idx}) called before await_block consumed the previous prefetch"
-        );
+        if self.pending.is_some() {
+            // Drain stale prefetch — wait for staging, reset slot to idle
+            let prev = self.pending.take().unwrap();
+            self.wait_staging(prev.block_idx, prev.slot)?;
+            self.slot_state[prev.slot.idx()] = SlotState::Idle;
+        }
 
         let slot = self.next_slot;
         let prior = self.slot_state[slot.idx()];
