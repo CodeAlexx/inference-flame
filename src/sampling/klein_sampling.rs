@@ -7,7 +7,7 @@
 //! - Direct velocity integration: x += (t_prev - t_curr) * pred
 //! - No denoised conversion (model output IS velocity)
 
-use flame_core::{Result, Tensor};
+use flame_core::{Result, Shape, Tensor};
 
 // ---------------------------------------------------------------------------
 // Schedule — dynamic mu from image sequence length
@@ -116,6 +116,47 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// Edit helpers — reference IDs and img2img schedule
+// ---------------------------------------------------------------------------
+
+/// Build position IDs for reference image tokens with distinct T-coordinate.
+///
+/// Returns `[H*W, 4]` BF16 tensor where each row = `[t_offset, row, col, 0]`.
+/// The T-offset (typically 10.0) ensures RoPE distinguishes reference from noise tokens.
+pub fn prepare_reference_ids(
+    latent_height: usize,
+    latent_width: usize,
+    t_offset: f32,
+    device: &std::sync::Arc<cudarc::driver::CudaDevice>,
+) -> flame_core::Result<Tensor> {
+    let n = latent_height * latent_width;
+    let mut data = Vec::with_capacity(n * 4);
+    for row in 0..latent_height {
+        for col in 0..latent_width {
+            data.push(t_offset);
+            data.push(row as f32);
+            data.push(col as f32);
+            data.push(0.0);
+        }
+    }
+    Tensor::from_f32_to_bf16(data, Shape::from_dims(&[n, 4]), device.clone())
+}
+
+/// Build a truncated sigma schedule for img2img / edit with partial denoising.
+///
+/// At `denoise >= 1.0`, equivalent to `build_sigma_schedule(num_steps, shift)`.
+/// At lower values, builds a longer schedule and takes the last `num_steps + 1` entries.
+pub fn build_img2img_sigmas(num_steps: usize, shift: f32, denoise: f32) -> Vec<f32> {
+    if denoise >= 0.9999 {
+        return build_sigma_schedule(num_steps, shift);
+    }
+    let new_steps = (num_steps as f32 / denoise) as usize;
+    let full = build_sigma_schedule(new_steps, shift);
+    let start = full.len().saturating_sub(num_steps + 1);
+    full[start..].to_vec()
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -179,5 +220,53 @@ mod tests {
         assert_eq!(sigmas.len(), 36);
         assert!(sigmas[0] > 0.9);
         assert_eq!(sigmas[35], 0.0);
+    }
+
+    #[test]
+    fn test_reference_ids_shape() {
+        // Verify the CPU-side Vec math: H*W rows of 4 elements each
+        let h = 64;
+        let w = 48;
+        let t_offset = 10.0f32;
+        let n = h * w;
+        let mut data = Vec::with_capacity(n * 4);
+        for row in 0..h {
+            for col in 0..w {
+                data.push(t_offset);
+                data.push(row as f32);
+                data.push(col as f32);
+                data.push(0.0);
+            }
+        }
+        assert_eq!(data.len(), n * 4);
+        // Check first row
+        assert_eq!(data[0], 10.0); // t_offset
+        assert_eq!(data[1], 0.0); // row 0
+        assert_eq!(data[2], 0.0); // col 0
+        assert_eq!(data[3], 0.0); // l_coord
+        // Check last row
+        let last = (n - 1) * 4;
+        assert_eq!(data[last], 10.0);
+        assert_eq!(data[last + 1], (h - 1) as f32);
+        assert_eq!(data[last + 2], (w - 1) as f32);
+        assert_eq!(data[last + 3], 0.0);
+    }
+
+    #[test]
+    fn test_img2img_sigmas_full_denoise() {
+        let full = build_img2img_sigmas(35, 2.02, 1.0);
+        let reference = build_sigma_schedule(35, 2.02);
+        assert_eq!(full.len(), reference.len());
+        for (a, b) in full.iter().zip(reference.iter()) {
+            assert!((a - b).abs() < 1e-7, "mismatch: {} vs {}", a, b);
+        }
+    }
+
+    #[test]
+    fn test_img2img_sigmas_partial() {
+        let num_steps = 35;
+        let sigmas = build_img2img_sigmas(num_steps, 2.02, 0.7);
+        assert_eq!(sigmas.len(), num_steps + 1, "partial denoise should return num_steps+1 entries");
+        assert_eq!(*sigmas.last().unwrap(), 0.0, "last sigma must be 0.0");
     }
 }

@@ -217,6 +217,18 @@ fn main() -> anyhow::Result<()> {
             let cond_pred = dit.forward(&latent, ts, &cond, seq_len)?;
             let uncond_pred = dit.forward(&latent, ts, &uncond, seq_len)?;
 
+            // Diagnostic: print prediction stats for first step
+            if step == 0 {
+                let cp = cond_pred.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+                let up = uncond_pred.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+                let cp_mean: f32 = cp.iter().sum::<f32>() / cp.len() as f32;
+                let cp_absm: f32 = cp.iter().map(|v| v.abs()).sum::<f32>() / cp.len() as f32;
+                let up_mean: f32 = up.iter().sum::<f32>() / up.len() as f32;
+                let up_absm: f32 = up.iter().map(|v| v.abs()).sum::<f32>() / up.len() as f32;
+                println!("  [PARITY] cond_pred:   mean={:.6}, abs_mean={:.6}, len={}", cp_mean, cp_absm, cp.len());
+                println!("  [PARITY] uncond_pred: mean={:.6}, abs_mean={:.6}, len={}", up_mean, up_absm, up.len());
+            }
+
             // CFG: noise_pred = uncond + scale * (cond - uncond)
             let diff = cond_pred.sub(&uncond_pred)?;
             let scaled = diff.mul_scalar(guide_scale)?;

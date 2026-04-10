@@ -864,6 +864,36 @@ impl KleinVaeEncoder {
         let _ = (b, h_, w_); // suppress unused
         centered.mul(&scale)
     }
+
+    /// Encode WITHOUT BatchNorm — returns raw patchified latents `[B, 128, H/16, W/16]`.
+    ///
+    /// Use this for edit/reference conditioning where the model expects
+    /// un-normalized latents (matching the Python `vae.encode()` + patchify path).
+    /// The standard `encode()` applies BN which is correct for training cache
+    /// but wrong for edit reference tokens.
+    pub fn encode_raw(&self, image: &Tensor) -> Result<Tensor> {
+        let mut h = self.conv_in.forward(image)?;
+        for block in &self.down_blocks {
+            h = block.forward(&h)?;
+        }
+        h = self.mid_block.forward(&h)?;
+        h = self.conv_norm_out.forward_nchw(&h)?;
+        h = h.silu()?;
+        h = self.conv_out.forward(&h)?;
+        if let Some(qc) = &self.quant_conv {
+            h = qc.forward(&h)?;
+        }
+
+        let c = h.shape().dims()[1];
+        if c != 2 * LATENT_CH {
+            return Err(Error::InvalidOperation(format!(
+                "encoder conv_out produced {c} channels, expected {}",
+                2 * LATENT_CH
+            )));
+        }
+        let mu = h.narrow(1, 0, LATENT_CH)?;
+        patchify_latents(&mu)
+    }
 }
 
 // ---------------------------------------------------------------------------

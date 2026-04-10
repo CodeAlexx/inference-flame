@@ -390,9 +390,18 @@ impl FlameSwap {
 
     pub fn num_blocks(&self) -> usize { self.blocks.len() }
 
-    /// Clear any pending prefetch state (for reuse across training steps).
+    /// Clear any pending prefetch state and reset slot states.
+    /// Safe to call between forward passes (e.g., sampling Euler steps).
     pub fn clear_pending(&mut self) {
-        self.pending = None;
+        if let Some(prev) = self.pending.take() {
+            // Wait for in-flight staging to complete before resetting
+            let _ = self.wait_staging(prev.block_idx, prev.slot);
+            self.slot_state[prev.slot.idx()] = SlotState::Idle;
+        }
+        // Reset both slots to Idle
+        self.slot_state[0] = SlotState::Idle;
+        self.slot_state[1] = SlotState::Idle;
+        self.next_slot = Slot::A;
     }
 
     /// Submit a staging request for `idx` and return immediately.  No DMA,

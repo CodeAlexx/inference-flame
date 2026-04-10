@@ -10,3 +10,5 @@ pub mod ltx2_audio_vae;
 pub use ltx2_audio_vae::LTX2AudioVaeDecoder;
 pub mod ltx2_vocoder;
 pub use ltx2_vocoder::LTX2Vocoder;
+pub mod hunyuan_vae;
+pub use hunyuan_vae::HunyuanVaeDecoder;
