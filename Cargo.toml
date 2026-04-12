@@ -172,3 +172,11 @@ path = "src/bin/kandinsky5_infer.rs"
 [[bin]]
 name = "ltx2_decode_av"
 path = "src/bin/ltx2_decode_av.rs"
+
+[[bin]]
+name = "wan_infer"
+path = "src/bin/wan_infer.rs"
+
+[[bin]]
+name = "wan_smoke"
+path = "src/bin/wan_smoke.rs"

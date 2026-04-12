@@ -112,11 +112,23 @@ impl Wan22Dit {
         checkpoint_path: &str,
         device: &Arc<CudaDevice>,
     ) -> Result<Self> {
-        let config = Wan22Config::default();
+        Self::load_with_config(&[checkpoint_path], Wan22Config::default(), device)
+    }
 
+    /// Load Wan2.2 DiT from one or more safetensors shards with a custom config.
+    ///
+    /// Used by the TI2V-5B path (`wan::transformer::WanTransformer`), which has
+    /// `dim=3072, num_layers=30, num_heads=24`, and by any future Wan2.2
+    /// variant that reuses the same block architecture.
+    pub fn load_with_config(
+        checkpoint_paths: &[&str],
+        config: Wan22Config,
+        device: &Arc<CudaDevice>,
+    ) -> Result<Self> {
         // FlameSwap classifies blocks by the `blocks.{i}` prefix.
+        // FlameSwap::load already accepts multiple shards.
         let swap = FlameSwap::load(
-            &[checkpoint_path],
+            checkpoint_paths,
             device,
             |name| {
                 if let Some(rest) = name.strip_prefix("blocks.") {
@@ -136,9 +148,16 @@ impl Wan22Dit {
             "time_projection.",
             "head.",
         ];
-        let part = load_file_filtered(Path::new(checkpoint_path), device, |key| {
-            shared_prefixes.iter().any(|p| key.starts_with(p))
-        })?;
+        // Scan every shard and merge shared weights.
+        let mut part: HashMap<String, Tensor> = HashMap::new();
+        for path in checkpoint_paths {
+            let partial = load_file_filtered(Path::new(path), device, |key| {
+                shared_prefixes.iter().any(|p| key.starts_with(p))
+            })?;
+            for (k, v) in partial {
+                part.insert(k, v);
+            }
+        }
         // Convert all shared weights to BF16 (source may be F16 loaded as F32).
         let shared: HashMap<String, Tensor> = part.into_iter().map(|(k, v)| {
             let v_bf16 = if v.dtype() != DType::BF16 {

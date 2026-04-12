@@ -423,43 +423,44 @@ pub fn apply_rotary_emb(x: &Tensor, cos_freqs: &Tensor, sin_freqs: &Tensor) -> R
     let x_dims = x.shape().dims().to_vec();
     let cos_dims = cos_freqs.shape().dims().to_vec();
 
-    // If x is 3D [B, N, D] but cos is 4D [B, H, N, D_head/2], reshape x
-    let (x4d, needs_reshape) = if x_dims.len() == 3 && cos_dims.len() == 4 {
-        let (b, h, t, _half_d) = (cos_dims[0], cos_dims[1], cos_dims[2], cos_dims[3]);
+    // Determine head count from cos shape or infer from x.
+    // cos can be 3D [B, N, half] or 4D [B, H, N, half].
+    let (h, half_d) = if cos_dims.len() == 4 {
+        (cos_dims[1], cos_dims[3])
+    } else if cos_dims.len() == 3 {
+        // cos is [B, N, half]. Infer H from x: D = H * D_head, half = D_head/2.
+        let d_full = if x_dims.len() == 3 { x_dims[2] } else { x_dims[1] * x_dims[3] };
+        let d_head = 2 * cos_dims[2]; // half * 2
+        (d_full / d_head, cos_dims[2])
+    } else {
+        return Err(flame_core::Error::InvalidInput(format!(
+            "apply_rotary_emb: cos must be 3D or 4D, got {:?}", cos_dims
+        )));
+    };
+
+    // Ensure x is [B, H, N, D_head] for the kernel.
+    let (x4d, needs_reshape) = if x_dims.len() == 3 {
+        let (b, n) = (x_dims[0], x_dims[1]);
         let d_head = x_dims[2] / h;
-        let reshaped = x.reshape(&[b, t, h, d_head])?.permute(&[0, 2, 1, 3])?; // [B, H, N, D_head]
+        let reshaped = x.reshape(&[b, n, h, d_head])?.permute(&[0, 2, 1, 3])?;
         (reshaped, true)
     } else {
         (x.clone(), false)
     };
 
-    let xd = x4d.shape().dims().to_vec();
-    let (b, h, n, d_head) = (xd[0], xd[1], xd[2], xd[3]);
-    let half = d_head / 2;
+    // cos/sin can be [B, H, N, half] (per-head) or [1, N, half] (broadcast).
+    // The fused kernel accepts both via cos_bh parameter.
+    let to_bf16 = |t: &Tensor| -> Result<Tensor> {
+        if t.dtype() != DType::BF16 { t.to_dtype(DType::BF16) } else { Ok(t.clone()) }
+    };
+    let cos_bf16 = to_bf16(cos_freqs)?;
+    let sin_bf16 = to_bf16(sin_freqs)?;
 
-    // RoPE rotation in FP32 for numerical stability (BF16 path produced NaN).
-    // The narrow() calls materialize contiguous BF16 halves first; cast each
-    // to FP32 just before the rotation math, then cast the result back to BF16.
-    let first_half = x4d.narrow(3, 0, half)?;       // [B, H, N, half] BF16
-    let second_half = x4d.narrow(3, half, half)?;    // [B, H, N, half] BF16
-
-    let cos_f32 = cos_freqs.to_dtype(DType::F32)?;
-    let sin_f32 = sin_freqs.to_dtype(DType::F32)?;
-    let first_f32 = first_half.to_dtype(DType::F32)?;
-    let second_f32 = second_half.to_dtype(DType::F32)?;
-
-    // Split RoPE rotation:
-    //   first_out  = first * cos - second * sin
-    //   second_out = second * cos + first * sin
-    let first_out = first_f32.mul(&cos_f32)?.sub(&second_f32.mul(&sin_f32)?)?;
-    let second_out = second_f32.mul(&cos_f32)?.add(&first_f32.mul(&sin_f32)?)?;
-
-    // Concatenate halves back and cast: [B, H, N, D_head] BF16
-    let out = Tensor::cat(&[&first_out, &second_out], 3)?.to_dtype(DType::BF16)?;
+    let out = flame_core::bf16_ops::rope_halfsplit_bf16(&x4d, &cos_bf16, &sin_bf16)?;
 
     if needs_reshape {
-        // [B, H, N, D_head] → [B, N, H*D_head]
-        let (b, h, n, d) = (xd[0], xd[1], xd[2], xd[3]);
+        let od = out.shape().dims().to_vec();
+        let (b, h, n, d) = (od[0], od[1], od[2], od[3]);
         out.permute(&[0, 2, 1, 3])?.reshape(&[b, n, h * d])
     } else {
         Ok(out)

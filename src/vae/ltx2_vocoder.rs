@@ -38,7 +38,9 @@
 //! SnakeBeta: `x + (1/(exp(beta) + eps)) * sin²(exp(alpha) * x)`
 //! alpha, beta are both per-channel and log-scale.
 
-use flame_core::conv1d::{conv1d, conv1d_grouped};
+use cudarc::driver::{DevicePtr, LaunchAsync};
+use cudarc::nvrtc::compile_ptx_with_opts;
+use flame_core::conv1d::conv1d;
 use flame_core::{serialization, CudaDevice, DType, Error, Result, Shape, Tensor};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -283,6 +285,210 @@ fn activation1d(
 }
 
 // ---------------------------------------------------------------------------
+// Fused activation1d CUDA kernel
+// ---------------------------------------------------------------------------
+//
+// Replaces 20+ tensor ops per call with a single kernel launch.
+// Each thread computes one output element by:
+//   1. Computing ~12 upsampled (2×) positions via 12-tap FIR on
+//      the zero-inserted, replicate-padded input
+//   2. Applying SnakeBeta pointwise to each upsampled position
+//   3. Applying 12-tap FIR downsample (stride 2) on the snake outputs
+//
+// Input/output: [BC, L] BF16 (channel dim folded into batch).
+// Per-channel params: alpha_exp[BC], inv_beta_exp_eps[BC] as F32.
+// Filters: up_filter[12], down_filter[12] as F32.
+
+const CUDA_FUSED_ACT1D: &str = r#"
+#include <cuda_bf16.h>
+
+// Read from the replicate-padded input (pad=5 on each side).
+__device__ __forceinline__ float read_repl(
+    const __nv_bfloat16* __restrict__ X,
+    long bc_idx, long L, long i)
+{
+    // i is in [0, L+10) after replicate pad
+    long orig = i - 5;  // map back to [0, L)
+    if (orig < 0) orig = 0;
+    if (orig >= L) orig = L - 1;
+    return __bfloat162float(X[bc_idx * L + orig]);
+}
+
+// Read from the zero-inserted signal: zi[n] for n in [0, 2*(L+10)-1).
+// zi[2k] = repl[k], zi[2k+1] = 0.
+__device__ __forceinline__ float read_zi(
+    const __nv_bfloat16* __restrict__ X,
+    long bc_idx, long L, long n)
+{
+    long repl_len = L + 10;
+    if (n < 0 || n >= 2 * repl_len - 1) return 0.0f;
+    if (n & 1) return 0.0f;  // odd positions are zero
+    return read_repl(X, bc_idx, L, n / 2);
+}
+
+// Compute one upsampled position p in [0, 2L).
+// ups(p) = 2 * sum_{k=0..11} up_filter[k] * zi_pad[p + 15 + k]
+// where zi_pad = pad1d(zi, 11, 11).
+// zi_pad[m] = (m >= 11 && m < 11 + zi_len) ? zi[m-11] : 0
+__device__ __forceinline__ float compute_ups(
+    const __nv_bfloat16* __restrict__ X,
+    const float* __restrict__ up_filter,
+    long bc_idx, long L, long p)
+{
+    float acc = 0.0f;
+    long zi_len = 2 * (L + 10) - 1;  // = 2L + 19
+    #pragma unroll
+    for (int k = 0; k < 12; k++) {
+        long m = p + 15 + k;  // position in zi_pad
+        long n = m - 11;      // position in zi
+        float val = 0.0f;
+        if (n >= 0 && n < zi_len) {
+            if (!(n & 1)) {
+                val = read_repl(X, bc_idx, L, n / 2);
+            }
+        }
+        acc += up_filter[k] * val;
+    }
+    return 2.0f * acc;
+}
+
+extern "C" __global__
+void fused_activation1d_bf16(
+    const __nv_bfloat16* __restrict__ X,     // [BC, L]
+    __nv_bfloat16* __restrict__ Y,           // [BC, L]
+    const float* __restrict__ alpha_exp,     // [BC]
+    const float* __restrict__ inv_beta,      // [BC]
+    const float* __restrict__ up_filter,     // [12]
+    const float* __restrict__ down_filter,   // [12]
+    long BC, long L)
+{
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    long total = BC * L;
+
+    while (idx < total) {
+        long bc = idx / L;
+        long o  = idx % L;  // output position
+
+        float a = alpha_exp[bc];
+        float inv_b = inv_beta[bc];
+
+        // Downsample: out[o] = sum_{j=0..11} down_filter[j] * snake(ups(2*o + j - pad))
+        // The snake input comes from the upsampled signal of length 2L.
+        // Before downsample: replicate_pad(snake_out, 5, 6) then conv(stride=2).
+        // Downsample conv at output o reads from padded positions [2*o, 2*o+11].
+        // Padded position p maps to snake position p - 5 (replicate pad left=5).
+        float acc = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < 12; j++) {
+            long sp = 2 * o + j - 5;  // position in snake output [0, 2L)
+            float snake_val;
+            if (sp < 0) sp = 0;
+            if (sp >= 2 * L) sp = 2 * L - 1;
+
+            float ups_val = compute_ups(X, up_filter, bc, L, sp);
+            // SnakeBeta: x + inv_b * sin^2(a * x)
+            float ax = a * ups_val;
+            float s = sinf(ax);
+            snake_val = ups_val + inv_b * s * s;
+
+            acc += down_filter[j] * snake_val;
+        }
+
+        Y[idx] = __float2bfloat16(acc);
+        idx += (long)gridDim.x * blockDim.x;
+    }
+}
+"#;
+
+fn ensure_kernel(dev: &Arc<CudaDevice>, name: &'static str, code: &'static str) -> Result<()> {
+    if dev.get_func(name, name).is_some() {
+        return Ok(());
+    }
+    let include_dir = std::env::var("CUDA_INCLUDE_DIR")
+        .or_else(|_| std::env::var("CUDA_HOME").map(|home| format!("{home}/include")))
+        .unwrap_or_else(|_| "/usr/local/cuda/include".into());
+    let mut opts = cudarc::nvrtc::CompileOptions::default();
+    opts.include_paths.push(include_dir.into());
+    let ptx = compile_ptx_with_opts(code, opts)
+        .map_err(|e| Error::Cuda(format!("nvrtc {}: {:?}", name, e)))?;
+    dev.load_ptx(ptx, name, &[name])
+        .map_err(|e| Error::Cuda(format!("load_ptx {}: {:?}", name, e)))?;
+    Ok(())
+}
+
+/// Fused activation1d: upsample(2×, FIR12) → SnakeBeta → downsample(2×, FIR12).
+/// Single kernel launch replaces ~20 tensor ops per call.
+///
+/// Input/output: `[B, C, L]` BF16. Per-channel params in F32.
+fn activation1d_fused(
+    x: &Tensor,
+    alpha_exp_bc1: &Tensor,
+    inv_beta_exp_eps_bc1: &Tensor,
+    up_filter_f32: &Tensor,
+    down_filter_f32: &Tensor,
+) -> Result<Tensor> {
+    let dims = x.shape().dims().to_vec();
+    let (b, c, l) = (dims[0], dims[1], dims[2]);
+    let bc = b * c;
+
+    let device = x.device().clone();
+    ensure_kernel(&device, "fused_activation1d_bf16", CUDA_FUSED_ACT1D)?;
+    let f = device
+        .get_func("fused_activation1d_bf16", "fused_activation1d_bf16")
+        .ok_or_else(|| Error::Cuda("fused_activation1d_bf16 missing".into()))?;
+
+    // Flatten x to [BC, L] for the kernel.
+    let x_flat = x.reshape(&[bc, l])?;
+
+    // Alpha/inv_beta are [C, 1, 1] BF16 — we need [C] F32.
+    let alpha_f32 = alpha_exp_bc1.reshape(&[c])?.to_dtype(DType::F32)?;
+    let inv_b_f32 = inv_beta_exp_eps_bc1.reshape(&[c])?.to_dtype(DType::F32)?;
+    debug_assert_eq!(b, 1, "fused activation1d assumes B=1");
+
+    let total = bc * l;
+    let mut out = Tensor::empty_dtype(
+        Shape::from_dims(&[bc, l]),
+        DType::BF16,
+        device.clone(),
+    )?;
+
+    let x_ptr = x_flat.as_device_ptr_bf16("act1d_x")? as u64;
+    let out_ptr = out.as_mut_device_ptr_bf16("act1d_out")? as u64;
+    let alpha_ptr = alpha_f32.as_slice_f32("act1d_alpha")?.device_ptr().clone() as u64;
+    let inv_b_ptr = inv_b_f32.as_slice_f32("act1d_inv_b")?.device_ptr().clone() as u64;
+    let up_ptr = up_filter_f32.as_slice_f32("act1d_up")?.device_ptr().clone() as u64;
+    let down_ptr = down_filter_f32.as_slice_f32("act1d_down")?.device_ptr().clone() as u64;
+
+    let threads = 256u32;
+    let blocks = ((total as u32) + threads - 1) / threads;
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (blocks.min(65535), 1, 1),
+        block_dim: (threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    unsafe {
+        f.launch(
+            cfg,
+            (
+                x_ptr,
+                out_ptr,
+                alpha_ptr,
+                inv_b_ptr,
+                up_ptr,
+                down_ptr,
+                bc as i64,
+                l as i64,
+            ),
+        )
+        .map_err(|e| Error::Cuda(format!("fused_act1d launch: {:?}", e)))?;
+    }
+
+    out.reshape(&[b, c, l])
+}
+
+
+// ---------------------------------------------------------------------------
 // Resblock filter/param cache — broadcast filters once to save work.
 // ---------------------------------------------------------------------------
 
@@ -297,6 +503,9 @@ struct ActParams {
     up_filter_1_1_k: Tensor,
     /// Kaiser sinc down-filter in single-channel `[1, 1, K]` layout.
     down_filter_1_1_k: Tensor,
+    /// F32 versions of filters for the fused kernel — flat `[K]`.
+    up_filter_f32: Tensor,
+    down_filter_f32: Tensor,
 }
 
 impl ActParams {
@@ -314,22 +523,28 @@ impl ActParams {
         let beta_exp_bc1 = beta.reshape(&[c, 1, 1])?.exp()?;
         let inv_beta_exp_eps_bc1 = beta_exp_bc1.add_scalar(1e-9)?.reciprocal()?;
 
+        // F32 flat versions for the fused kernel.
+        let up_filter_f32 = up_raw.reshape(&[12])?.to_dtype(DType::F32)?;
+        let down_filter_f32 = down_raw.reshape(&[12])?.to_dtype(DType::F32)?;
+
         // The checkpoint stores both filters as [1, 1, K]; use them as-is.
         Ok(Self {
             alpha_exp_bc1,
             inv_beta_exp_eps_bc1,
             up_filter_1_1_k: up_raw,
             down_filter_1_1_k: down_raw,
+            up_filter_f32,
+            down_filter_f32,
         })
     }
 
     fn apply(&self, x: &Tensor) -> Result<Tensor> {
-        activation1d(
+        activation1d_fused(
             x,
             &self.alpha_exp_bc1,
             &self.inv_beta_exp_eps_bc1,
-            &self.up_filter_1_1_k,
-            &self.down_filter_1_1_k,
+            &self.up_filter_f32,
+            &self.down_filter_f32,
         )
     }
 }
@@ -557,12 +772,13 @@ impl LTX2Vocoder {
             let (w_preconv, bi) = &self.ups[i];
 
             let t_up = now();
-            // ConvTranspose1d via cached preconv weight: zero-insert → pad →
-            // regular cuDNN conv1d. The weight transform that used to run
-            // here on every call is now done once at load time.
-            let x_zi = zero_insert_len(&x, stride)?;
+            // ConvTranspose1d via cached preconv weight: fused zero-insert+pad
+            // (flame_core::conv1d::conv_transpose1d_prepare — single CUDA
+            // kernel) → regular cuDNN conv1d.
             let side_pad = (k - 1) - padding; // dilation = 1
-            let x_padded = x_zi.pad1d(side_pad, side_pad)?;
+            let x_padded = flame_core::conv1d::conv_transpose1d_prepare(
+                &x, stride, side_pad, side_pad,
+            )?;
             x = conv1d(&x_padded, w_preconv, Some(bi), 1, 0, 1, 1)?;
             sync();
             let t_up_done = t_up.elapsed().as_secs_f32();
