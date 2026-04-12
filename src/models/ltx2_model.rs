@@ -2511,6 +2511,44 @@ pub struct LTX2StreamingModel {
     fp8_blocks: Vec<super::fp8_resident::ResidentBlock>,
 }
 
+/// Intermediate state from [`LTX2StreamingModel::prepare_av_state`].
+///
+/// Contains all embeddings, projections, and RoPE tables needed by the
+/// block loop. The trainer uses this to run its own LoRA-aware block loop,
+/// then passes the results to [`LTX2StreamingModel::finish_av_output`].
+pub struct AvIntermediateState {
+    pub hs: Tensor,
+    pub ahs: Tensor,
+    pub enc_hs: Tensor,
+    pub audio_enc_hs: Tensor,
+    pub v_timestep: Tensor,
+    pub a_timestep: Tensor,
+    pub v_embedded: Tensor,
+    pub a_embedded: Tensor,
+    pub v_ca_ss: Tensor,
+    pub a_ca_ss: Tensor,
+    pub v_ca_gate: Tensor,
+    pub a_ca_gate: Tensor,
+    pub v_cos: Tensor,
+    pub v_sin: Tensor,
+    pub a_cos: Tensor,
+    pub a_sin: Tensor,
+    pub ca_v_cos: Tensor,
+    pub ca_v_sin: Tensor,
+    pub ca_a_cos: Tensor,
+    pub ca_a_sin: Tensor,
+    pub video_prompt_ts: Option<Tensor>,
+    pub audio_prompt_ts: Option<Tensor>,
+    pub batch_size: usize,
+    pub channels: usize,
+    pub num_frames: usize,
+    pub height: usize,
+    pub width: usize,
+    pub audio_channels: usize,
+    pub audio_frames: usize,
+    pub audio_freq: usize,
+}
+
 impl LTX2StreamingModel {
     /// Load global (non-block) params from checkpoint. Blocks are NOT loaded.
     ///
@@ -4172,6 +4210,236 @@ impl LTX2StreamingModel {
                 log::info!("[LTX2 AUDIO DUMP] saved {} tensors", dump.len());
             }
         }
+
+        Ok((v_output, a_output))
+    }
+
+    // =====================================================================
+    // Training API: split the AV forward into prepare → blocks → finish
+    // =====================================================================
+    // See `AvIntermediateState` struct defined below the impl block.
+
+    /// Prepare all embeddings, projections, and RoPE tables for the AV forward
+    /// WITHOUT running the block loop. Returns [`AvIntermediateState`] which
+    /// the trainer passes to its LoRA-aware block loop, then to [`finish_av_output`].
+    pub fn prepare_av_state(
+        &self,
+        x: &Tensor,
+        audio_x: &Tensor,
+        timestep: &Tensor,
+        context: &Tensor,
+        audio_context: &Tensor,
+        frame_rate: f32,
+        encoder_attention_mask: Option<&Tensor>,
+        audio_encoder_attention_mask: Option<&Tensor>,
+    ) -> Result<AvIntermediateState> {
+        let audio_proj_in_w = self.audio_proj_in_weight.as_ref()
+            .ok_or_else(|| flame_core::Error::InvalidInput("Missing audio_proj_in_weight".into()))?;
+        let audio_proj_in_b = self.audio_proj_in_bias.as_ref()
+            .ok_or_else(|| flame_core::Error::InvalidInput("Missing audio_proj_in_bias".into()))?;
+        let audio_time_emb = self.audio_time_embed.as_ref()
+            .ok_or_else(|| flame_core::Error::InvalidInput("Missing audio_time_embed".into()))?;
+
+        let x_dims = x.shape().dims().to_vec();
+        let (batch_size, channels, num_frames, height, width) =
+            (x_dims[0], x_dims[1], x_dims[2], x_dims[3], x_dims[4]);
+        let inner_dim = self.config.inner_dim();
+        let audio_inner_dim = self.config.audio_inner_dim();
+        let num_video_tokens = num_frames * height * width;
+
+        let audio_dims = audio_x.shape().dims().to_vec();
+        let audio_channels = audio_dims[1];
+        let audio_frames = audio_dims[2];
+        let audio_freq = audio_dims[3];
+        let num_audio_tokens = audio_frames;
+
+        let device = x.device().clone();
+
+        // 1. Patchify
+        let v_flat = x.reshape(&[batch_size, channels, num_video_tokens])?.permute(&[0, 2, 1])?;
+        let audio_in_features = audio_channels * audio_freq;
+        let a_flat = audio_x.permute(&[0, 2, 1, 3])?.reshape(&[batch_size, audio_frames, audio_in_features])?;
+
+        // 2. RoPE
+        let vae_sf = &self.config.vae_scale_factors;
+        let video_coords = build_video_coords(
+            batch_size, num_frames, height, width, vae_sf, self.config.causal_offset, frame_rate, device.clone(),
+        )?;
+        let audio_coords = build_audio_coords(
+            batch_size, audio_frames, audio_freq, self.config.audio_scale_factor,
+            vae_sf[0], self.config.causal_offset, frame_rate, device.clone(),
+        )?;
+        let video_max_pos = [self.config.pos_embed_max_pos as f64, self.config.base_height as f64, self.config.base_width as f64];
+        let audio_max_pos = [self.config.pos_embed_max_pos as f64];
+        let (v_cos, v_sin) = compute_rope_frequencies(&video_coords, inner_dim, &video_max_pos, self.config.rope_theta, self.config.num_attention_heads)?;
+        let (a_cos, a_sin) = compute_rope_frequencies(&audio_coords, audio_inner_dim, &audio_max_pos, self.config.rope_theta, self.config.audio_num_attention_heads)?;
+        let video_temporal_coords = video_coords.narrow(1, 0, 1)?;
+        let ca_audio_dim = self.config.audio_cross_attention_dim;
+        let ca_max_pos = [self.config.pos_embed_max_pos as f64];
+        let (ca_v_cos, ca_v_sin) = compute_rope_frequencies(&video_temporal_coords, ca_audio_dim, &ca_max_pos, self.config.rope_theta, self.config.num_attention_heads)?;
+        let audio_temporal_coords = audio_coords.narrow(1, 0, 1)?;
+        let (ca_a_cos, ca_a_sin) = compute_rope_frequencies(&audio_temporal_coords, ca_audio_dim, &ca_max_pos, self.config.rope_theta, self.config.audio_num_attention_heads)?;
+
+        // 3. Input projections
+        let hs = linear3d(&v_flat, &self.proj_in_weight, Some(&self.proj_in_bias))?;
+        let ahs = linear3d(&a_flat, audio_proj_in_w, Some(audio_proj_in_b))?;
+
+        // 4. Timestep embeddings
+        let num_mod_params = self.time_embed.num_mod_params;
+        let ts_expanded = timestep.unsqueeze(1)?.expand(&[batch_size, num_video_tokens])?;
+        let ts_scaled = ts_expanded.mul_scalar(self.config.timestep_scale_multiplier as f32)?;
+        let ts_flat = ts_scaled.reshape(&[batch_size * num_video_tokens])?;
+        let (v_timestep, v_embedded) = self.time_embed.forward(&ts_flat)?;
+        let v_timestep = v_timestep.reshape(&[batch_size, num_video_tokens, num_mod_params * inner_dim])?;
+        let v_embedded = v_embedded.reshape(&[batch_size, num_video_tokens, inner_dim])?;
+
+        let audio_num_mod = audio_time_emb.num_mod_params;
+        let ats_expanded = timestep.unsqueeze(1)?.expand(&[batch_size, num_audio_tokens])?;
+        let ats_scaled = ats_expanded.mul_scalar(self.config.timestep_scale_multiplier as f32)?;
+        let ats_flat = ats_scaled.reshape(&[batch_size * num_audio_tokens])?;
+        let (a_timestep, a_embedded) = audio_time_emb.forward(&ats_flat)?;
+        let a_timestep = a_timestep.reshape(&[batch_size, num_audio_tokens, audio_num_mod * audio_inner_dim])?;
+        let a_embedded = a_embedded.reshape(&[batch_size, num_audio_tokens, audio_inner_dim])?;
+
+        // 5. Cross-attention global modulation
+        let cross_gate_scale = (self.config.cross_attn_timestep_scale_multiplier / self.config.timestep_scale_multiplier) as f32;
+        let v_ca_ss = if let Some(ref adaln) = self.av_cross_attn_video_scale_shift {
+            let (ss, _) = adaln.forward(&ts_flat.narrow(0, 0, batch_size)?)?;
+            ss.reshape(&[batch_size, 1, ss.shape().dims()[ss.shape().rank() - 1]])?
+        } else {
+            Tensor::zeros_dtype(Shape::from_dims(&[batch_size, 1, 4 * inner_dim]), DType::BF16, device.clone())?
+        };
+        let v_ca_gate = if let Some(ref adaln) = self.av_cross_attn_video_a2v_gate {
+            let scaled_ts = ts_flat.narrow(0, 0, batch_size)?.mul_scalar(cross_gate_scale)?;
+            let (g, _) = adaln.forward(&scaled_ts)?;
+            g.reshape(&[batch_size, 1, g.shape().dims()[g.shape().rank() - 1]])?
+        } else {
+            Tensor::zeros_dtype(Shape::from_dims(&[batch_size, 1, inner_dim]), DType::BF16, device.clone())?
+        };
+        let a_ca_ss = if let Some(ref adaln) = self.av_cross_attn_audio_scale_shift {
+            let (ss, _) = adaln.forward(&ats_flat.narrow(0, 0, batch_size)?)?;
+            ss.reshape(&[batch_size, 1, ss.shape().dims()[ss.shape().rank() - 1]])?
+        } else {
+            Tensor::zeros_dtype(Shape::from_dims(&[batch_size, 1, 4 * audio_inner_dim]), DType::BF16, device.clone())?
+        };
+        let a_ca_gate = if let Some(ref adaln) = self.av_cross_attn_audio_v2a_gate {
+            let scaled_ats = ats_flat.narrow(0, 0, batch_size)?.mul_scalar(cross_gate_scale)?;
+            let (g, _) = adaln.forward(&scaled_ats)?;
+            g.reshape(&[batch_size, 1, g.shape().dims()[g.shape().rank() - 1]])?
+        } else {
+            Tensor::zeros_dtype(Shape::from_dims(&[batch_size, 1, audio_inner_dim]), DType::BF16, device.clone())?
+        };
+
+        // 6. Text embeddings
+        let video_context_dim = context.shape().dims()[2];
+        let enc_hs = if video_context_dim == inner_dim && self.connector.is_none() {
+            context.clone()
+        } else if let Some(connector) = &self.connector {
+            let projected = if video_context_dim == inner_dim {
+                context.clone()
+            } else if let (Some(w), Some(b)) = (&self.aggregate_embed_weight, &self.aggregate_embed_bias) {
+                let rescale = ((inner_dim as f64) / (video_context_dim as f64)).sqrt() as f32;
+                linear3d(&context.mul_scalar(rescale)?, w, Some(b))?
+            } else {
+                return Err(flame_core::Error::InvalidInput("No video aggregate_embed".into()));
+            };
+            connector.forward(&projected, encoder_attention_mask)?
+        } else if let Some(ref cap_proj) = self.caption_projection {
+            cap_proj.forward(context)?
+        } else {
+            return Err(flame_core::Error::InvalidInput("No video text projection".into()));
+        };
+
+        let audio_context_dim = audio_context.shape().dims()[2];
+        let audio_enc_hs = if audio_context_dim == audio_inner_dim && self.audio_connector.is_none() {
+            audio_context.clone()
+        } else if let Some(connector) = &self.audio_connector {
+            let projected = if audio_context_dim == audio_inner_dim {
+                audio_context.clone()
+            } else if let (Some(w), Some(b)) = (&self.audio_aggregate_embed_weight, &self.audio_aggregate_embed_bias) {
+                let rescale = ((audio_inner_dim as f64) / (audio_context_dim as f64)).sqrt() as f32;
+                linear3d(&audio_context.mul_scalar(rescale)?, w, Some(b))?
+            } else {
+                return Err(flame_core::Error::InvalidInput("No audio aggregate_embed".into()));
+            };
+            connector.forward(&projected, audio_encoder_attention_mask)?
+        } else if let Some(ref cap_proj) = self.audio_caption_projection {
+            cap_proj.forward(audio_context)?
+        } else {
+            return Err(flame_core::Error::InvalidInput("No audio text projection".into()));
+        };
+
+        // 7. Prompt timestep modulation
+        let video_prompt_ts: Option<Tensor> = if let Some(ref padaln) = self.prompt_adaln_single {
+            let text_seq_len = enc_hs.shape().dims()[1];
+            let prompt_ts = timestep.unsqueeze(1)?.expand(&[batch_size, text_seq_len])?;
+            let prompt_ts_scaled = prompt_ts.mul_scalar(self.config.timestep_scale_multiplier as f32)?;
+            let prompt_ts_flat = prompt_ts_scaled.reshape(&[batch_size * text_seq_len])?;
+            let (prompt_mod, _) = padaln.forward(&prompt_ts_flat)?;
+            Some(prompt_mod.reshape(&[batch_size, text_seq_len, 2 * inner_dim])?)
+        } else { None };
+
+        let audio_prompt_ts: Option<Tensor> = if let Some(ref apadaln) = self.audio_prompt_adaln_single {
+            let text_seq_len = audio_enc_hs.shape().dims()[1];
+            let prompt_ts = timestep.unsqueeze(1)?.expand(&[batch_size, text_seq_len])?;
+            let prompt_ts_scaled = prompt_ts.mul_scalar(self.config.timestep_scale_multiplier as f32)?;
+            let prompt_ts_flat = prompt_ts_scaled.reshape(&[batch_size * text_seq_len])?;
+            let (prompt_mod, _) = apadaln.forward(&prompt_ts_flat)?;
+            Some(prompt_mod.reshape(&[batch_size, text_seq_len, 2 * audio_inner_dim])?)
+        } else { None };
+
+        Ok(AvIntermediateState {
+            hs, ahs, enc_hs, audio_enc_hs,
+            v_timestep, a_timestep, v_embedded, a_embedded,
+            v_ca_ss, a_ca_ss, v_ca_gate, a_ca_gate,
+            v_cos, v_sin, a_cos, a_sin,
+            ca_v_cos, ca_v_sin, ca_a_cos, ca_a_sin,
+            video_prompt_ts, audio_prompt_ts,
+            batch_size, channels, num_frames, height, width,
+            audio_channels, audio_frames, audio_freq,
+        })
+    }
+
+    /// Apply output heads to post-block hidden states.
+    ///
+    /// Takes the `(hs, ahs)` produced by the block loop and the
+    /// `AvIntermediateState` from `prepare_av_state`, returns the final
+    /// `(video_output, audio_output)` tensors.
+    pub fn finish_av_output(
+        &self,
+        hs: &Tensor,
+        ahs: &Tensor,
+        state: &AvIntermediateState,
+    ) -> Result<(Tensor, Tensor)> {
+        let audio_sst = self.audio_scale_shift_table.as_ref()
+            .ok_or_else(|| flame_core::Error::InvalidInput("Missing audio_scale_shift_table".into()))?;
+        let audio_proj_out_w = self.audio_proj_out_weight.as_ref()
+            .ok_or_else(|| flame_core::Error::InvalidInput("Missing audio_proj_out_weight".into()))?;
+        let audio_proj_out_b = self.audio_proj_out_bias.as_ref();
+
+        // Video output
+        let shift_scale = self.scale_shift_table.unsqueeze(0)?.unsqueeze(0)?;
+        let emb_4d = state.v_embedded.unsqueeze(2)?;
+        let final_ss = shift_scale.add(&emb_4d)?.to_dtype(DType::BF16)?;
+        let v_shift = final_ss.narrow(2, 0, 1)?.squeeze_dim(2)?;
+        let v_scale = final_ss.narrow(2, 1, 1)?.squeeze_dim(2)?;
+        let v_normed = layer_norm_no_affine(hs, self.config.norm_eps)?;
+        let v_output = v_normed.mul(&v_scale.add_scalar(1.0)?.to_dtype(DType::BF16)?)?.add(&v_shift)?;
+        let v_output = linear3d(&v_output, &self.proj_out_weight, Some(&self.proj_out_bias))?;
+        let v_output = v_output.permute(&[0, 2, 1])?;
+        let v_output = v_output.reshape(&[state.batch_size, state.channels, state.num_frames, state.height, state.width])?;
+
+        // Audio output
+        let a_ss = audio_sst.unsqueeze(0)?.unsqueeze(0)?;
+        let a_emb_4d = state.a_embedded.unsqueeze(2)?;
+        let a_final_ss = a_ss.add(&a_emb_4d)?.to_dtype(DType::BF16)?;
+        let a_shift = a_final_ss.narrow(2, 0, 1)?.squeeze_dim(2)?;
+        let a_scale = a_final_ss.narrow(2, 1, 1)?.squeeze_dim(2)?;
+        let a_normed = layer_norm_no_affine(ahs, self.config.norm_eps)?;
+        let a_modulated = a_normed.mul(&a_scale.add_scalar(1.0)?.to_dtype(DType::BF16)?)?.add(&a_shift)?;
+        let a_linout = linear3d(&a_modulated, audio_proj_out_w, audio_proj_out_b)?;
+        let a_output = a_linout.reshape(&[state.batch_size, state.audio_frames, state.audio_channels, state.audio_freq])?;
+        let a_output = a_output.permute(&[0, 2, 1, 3])?;
 
         Ok((v_output, a_output))
     }
