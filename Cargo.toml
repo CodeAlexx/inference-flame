@@ -180,3 +180,19 @@ path = "src/bin/wan_infer.rs"
 [[bin]]
 name = "wan_smoke"
 path = "src/bin/wan_smoke.rs"
+
+[[bin]]
+name = "ldm_vae_encode_parity"
+path = "src/bin/ldm_vae_encode_parity.rs"
+
+[[bin]]
+name = "ltx2_vae_encode_parity"
+path = "src/bin/ltx2_vae_encode_parity.rs"
+
+[[bin]]
+name = "wan22_vae_encode_parity"
+path = "src/bin/wan22_vae_encode_parity.rs"
+
+[[bin]]
+name = "wan21_vae_encode_parity"
+path = "src/bin/wan21_vae_encode_parity.rs"

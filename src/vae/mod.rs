@@ -1,11 +1,17 @@
 pub mod ldm_decoder;
 pub use ldm_decoder::LdmVAEDecoder;
+pub mod ldm_encoder;
+pub use ldm_encoder::LdmVAEEncoder;
 pub mod ltx2_vae;
 pub use ltx2_vae::LTX2VaeDecoder;
+pub mod ltx2_encoder;
+pub use ltx2_encoder::LTX2VaeEncoder;
 pub mod klein_vae;
 pub use klein_vae::KleinVaeDecoder;
 pub mod wan21_vae;
 pub use wan21_vae::Wan21VaeDecoder;
+pub mod wan21_encoder;
+pub use wan21_encoder::Wan21VaeEncoder;
 pub mod ltx2_audio_vae;
 pub use ltx2_audio_vae::LTX2AudioVaeDecoder;
 pub mod ltx2_vocoder;
