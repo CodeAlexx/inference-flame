@@ -310,8 +310,14 @@ impl FlameSwap {
                 let raw = raw_byte_size(t);
                 staging_bytes += raw;
                 final_bytes += t.numel * 2;
-                if matches!(t.src_dtype, SourceDtype::F8E4M3 { .. }) {
-                    fp8_bytes += t.numel; // transient raw region for dequant
+                match t.src_dtype {
+                    SourceDtype::F8E4M3 { .. } => {
+                        fp8_bytes += t.numel; // transient raw region for dequant
+                    }
+                    SourceDtype::F32 => {
+                        fp8_bytes += t.numel * 4; // transient raw region for f32→bf16
+                    }
+                    _ => {}
                 }
             }
             blocks[*idx] = BlockMeta {
@@ -352,7 +358,12 @@ impl FlameSwap {
                     let (this_raw_off, this_raw_bytes) = match t.src_dtype {
                         SourceDtype::BF16 => (final_off, bf16_bytes),
                         SourceDtype::F16 => (final_off, bf16_bytes), // same 2 bytes, in-place convert after H2D
-                        SourceDtype::F32 => (final_off, t.numel * 4),
+                        SourceDtype::F32 => {
+                        // F32 needs separate raw landing zone, then GPU convert to BF16
+                        let off = raw_off;
+                        raw_off += t.numel * 4; // 4 bytes per F32 element
+                        (off, t.numel * 4)
+                    }
                         SourceDtype::F8E4M3 { .. } => {
                             let off = raw_off;
                             raw_off += t.numel; // 1 byte per FP8 element
@@ -595,6 +606,22 @@ impl FlameSwap {
                 };
                 if ret != 0 {
                     return Err(format!("flame_fp16_to_bf16 failed for {} ({})", t_meta.name, ret).into());
+                }
+            }
+            if gl.src_dtype == SourceDtype::F32 {
+                // F32 → BF16 conversion (4 bytes → 2 bytes, NOT in-place)
+                let raw_ptr = (gpu_base + gl.raw_offset as u64) as *const c_void;
+                let final_ptr = (gpu_base + gl.final_offset as u64) as *mut c_void;
+                let ret = unsafe {
+                    ffi::flame_f32_to_bf16(
+                        raw_ptr,
+                        final_ptr,
+                        gl.final_numel,
+                        transfer_raw,
+                    )
+                };
+                if ret != 0 {
+                    return Err(format!("flame_f32_to_bf16 failed for {} ({})", t_meta.name, ret).into());
                 }
             }
             if let SourceDtype::F8E4M3 { scale } = gl.src_dtype {

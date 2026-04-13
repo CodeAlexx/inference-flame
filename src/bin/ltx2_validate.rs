@@ -93,12 +93,48 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         )?;
 
         // Forward (no RoPE, no prompt_timestep — matches reference dump)
+        // For block 0, trace NaN source by checking scale_shift_table
+        if i == 0 {
+            fn check_nan(name: &str, t: &Tensor) {
+                if let Ok(data) = t.to_vec() {
+                    let nan_count = data.iter().filter(|v| v.is_nan()).count();
+                    let inf_count = data.iter().filter(|v| v.is_infinite()).count();
+                    let mean: f32 = data.iter().filter(|v| v.is_finite()).sum::<f32>() / data.len().max(1) as f32;
+                    println!("  [TRACE] {name}: shape={:?} nan={nan_count} inf={inf_count} mean={mean:.6}",
+                        t.shape().dims());
+                }
+            }
+            check_nan("input_x", &x);
+            check_nan("context", &context);
+            check_nan("timestep", &timestep);
+            check_nan("scale_shift_table", &block.scale_shift_table);
+            if let Some(w) = &block.norm1_weight {
+                check_nan("norm1_weight", w);
+            }
+        }
+
         x = block.forward_video_only(
             &x, &context, &timestep,
             None,  // no rotary emb
             None,  // no encoder mask
             None,  // no prompt_timestep
         )?;
+
+        // NaN check
+        {
+            let data = x.to_vec()?;
+            let nan_count = data.iter().filter(|v| v.is_nan()).count();
+            if nan_count > 0 {
+                println!("  Block {i}: {nan_count}/{} values are NaN!", data.len());
+                // Check input wasn't NaN
+                let in_data = ref_input.to_vec()?;
+                let in_nan = in_data.iter().filter(|v| v.is_nan()).count();
+                println!("  Input had {in_nan} NaN values");
+                // Check scale_shift_table
+                println!("  x shape: {:?}, context shape: {:?}, timestep shape: {:?}",
+                    x.shape().dims(), context.shape().dims(), timestep.shape().dims());
+            }
+        }
 
         // Compare output
         let output_err = max_abs_diff(&x, &ref_output)?;
@@ -118,8 +154,8 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 let denom = ref_data[j].abs().max(1e-6);
                 rel_errs.push(ae / denom);
             }
-            abs_errs.sort_by(|a, b| b.partial_cmp(a).unwrap());
-            rel_errs.sort_by(|a, b| b.partial_cmp(a).unwrap());
+            abs_errs.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+            rel_errs.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
 
             println!("  Block {i} diagnostics ({n} elements):");
             println!("    Rust first 5: {:?}", &rust_data[..5]);
