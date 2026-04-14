@@ -18,3 +18,5 @@ pub mod ltx2_vocoder;
 pub use ltx2_vocoder::LTX2Vocoder;
 pub mod hunyuan_vae;
 pub use hunyuan_vae::HunyuanVaeDecoder;
+pub mod qwenimage_encoder;
+pub use qwenimage_encoder::QwenImageVaeEncoder;

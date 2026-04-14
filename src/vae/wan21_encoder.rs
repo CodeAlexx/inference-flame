@@ -79,6 +79,9 @@ fn get_bf16(weights: &Weights, key: &str) -> Result<Tensor> {
 struct CausalConv3d {
     conv: Conv3d,
     time_pad: usize,
+    /// When true, pad temporal dim with zeros (QwenImage).
+    /// When false, repeat first frame (Wan 2.1 original).
+    zero_pad: bool,
 }
 
 impl CausalConv3d {
@@ -106,14 +109,23 @@ impl CausalConv3d {
         )?;
         conv.weight = get(weights, &format!("{prefix}.weight"))?.to_dtype(DType::F32)?;
         conv.bias_tensor = Some(get(weights, &format!("{prefix}.bias"))?.to_dtype(DType::F32)?);
-        Ok(Self { conv, time_pad })
+        Ok(Self { conv, time_pad, zero_pad: false })
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let x_padded = if self.time_pad > 0 {
-            let first_frame = x.narrow(2, 0, 1)?;
-            let repeated = first_frame.repeat_axis_device(2, self.time_pad)?;
-            Tensor::cat(&[&repeated, x], 2)?
+            if self.zero_pad {
+                // QwenImage: zero-pad temporal dimension
+                let dims = x.shape().dims().to_vec();
+                let pad_shape = flame_core::Shape::from_dims(&[dims[0], dims[1], self.time_pad, dims[3], dims[4]]);
+                let zeros = Tensor::zeros_dtype(pad_shape, x.dtype(), x.device().clone())?;
+                Tensor::cat(&[&zeros, x], 2)?
+            } else {
+                // Wan 2.1: repeat first frame
+                let first_frame = x.narrow(2, 0, 1)?;
+                let repeated = first_frame.repeat_axis_device(2, self.time_pad)?;
+                Tensor::cat(&[&repeated, x], 2)?
+            }
         } else {
             x.clone()
         };
@@ -515,7 +527,40 @@ impl Wan21VaeEncoder {
         Self::from_weights(&weights, device)
     }
 
-    fn from_weights(
+    /// Build from weights with zero-padded causal convolutions (QwenImage).
+    pub fn from_weights_zero_pad(
+        weights: &Weights,
+        device: &Arc<cudarc::driver::CudaDevice>,
+    ) -> Result<Self> {
+        let mut enc = Self::from_weights(weights, device)?;
+        // Patch all CausalConv3d instances to use zero padding
+        enc.encoder_conv1.zero_pad = true;
+        for block in &mut enc.downsamples {
+            match block {
+                EncoderBlock::Res(r) => {
+                    r.conv1.zero_pad = true;
+                    r.conv2.zero_pad = true;
+                    if let Some(ref mut s) = r.shortcut {
+                        s.zero_pad = true;
+                    }
+                }
+                EncoderBlock::Downsample(d) => {
+                    if let DownResample::Downsample3d { time_conv, .. } = d {
+                        time_conv.zero_pad = true;
+                    }
+                }
+            }
+        }
+        enc.mid_res0.conv1.zero_pad = true;
+        enc.mid_res0.conv2.zero_pad = true;
+        enc.mid_res1.conv1.zero_pad = true;
+        enc.mid_res1.conv2.zero_pad = true;
+        enc.head_conv.zero_pad = true;
+        enc.conv1.zero_pad = true;
+        Ok(enc)
+    }
+
+    pub fn from_weights(
         weights: &Weights,
         device: &Arc<cudarc::driver::CudaDevice>,
     ) -> Result<Self> {
