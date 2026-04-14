@@ -185,6 +185,24 @@ impl SD3MMDiT {
         }
     }
 
+    /// Create with a key prefix for the safetensors file (e.g. "model.diffusion_model.").
+    /// The BlockLoader will search for prefixed keys and strip the prefix on load.
+    pub fn new_with_prefix(
+        model_path: String,
+        resident: HashMap<String, Tensor>,
+        device: Arc<cudarc::driver::CudaDevice>,
+        key_prefix: &str,
+    ) -> Self {
+        let config = SD3Config::from_weights(&resident);
+        let loader = BlockLoader::new_with_prefix(model_path, device.clone(), key_prefix);
+        Self {
+            config,
+            resident,
+            loader,
+            device,
+        }
+    }
+
     /// Load a joint block's weights from disk into GPU.
     pub fn load_block(&mut self, prefix: &str) -> Result<()> {
         self.loader.load_block(prefix)
@@ -755,11 +773,13 @@ fn transpose_2d(t: &Tensor) -> Result<Tensor> {
 /// Resident weights are small enough to keep on GPU permanently:
 /// - pos_embed, x_embedder.*, t_embedder.*, y_embedder.*, context_embedder.*
 /// - final_layer.*
+///
+/// Handles optional `model.diffusion_model.` prefix in combined checkpoints.
 pub fn load_sd3_resident(
     model_path: &str,
     device: &Arc<cudarc::driver::CudaDevice>,
 ) -> Result<HashMap<String, Tensor>> {
-    let resident_prefixes = [
+    let resident_suffixes = [
         "pos_embed",
         "x_embedder.",
         "t_embedder.",
@@ -767,12 +787,23 @@ pub fn load_sd3_resident(
         "context_embedder.",
         "final_layer.",
     ];
+    let prefix = "model.diffusion_model.";
 
-    load_file_filtered(model_path, device, |key| {
-        resident_prefixes
+    let raw = load_file_filtered(model_path, device, |key| {
+        let stripped = key.strip_prefix(prefix).unwrap_or(key);
+        resident_suffixes
             .iter()
-            .any(|p| key.starts_with(p) || key == "pos_embed")
-    })
+            .any(|p| stripped.starts_with(p) || stripped == "pos_embed")
+    })?;
+
+    // Strip prefix and cast to BF16
+    let mut weights = HashMap::with_capacity(raw.len());
+    for (key, val) in raw {
+        let k = key.strip_prefix(prefix).unwrap_or(&key).to_string();
+        let val = if val.dtype() != DType::BF16 { val.to_dtype(DType::BF16)? } else { val };
+        weights.insert(k, val);
+    }
+    Ok(weights)
 }
 
 /// Load ALL weights (resident + blocks) for models that fit in VRAM
@@ -794,4 +825,40 @@ pub fn load_sd3_all(
         weights.insert(stripped, t);
     }
     Ok(weights)
+}
+
+/// Load ALL DiT weights block-by-block to avoid peak memory from F32 intermediates.
+/// Loads resident weights first, then each block prefix one at a time, casting to BF16
+/// immediately and accumulating into a single HashMap.
+pub fn load_sd3_all_chunked(
+    model_path: &str,
+    device: &Arc<cudarc::driver::CudaDevice>,
+) -> Result<HashMap<String, Tensor>> {
+    let prefix = "model.diffusion_model.";
+
+    // 1. Load resident (non-block) weights
+    let mut all = load_sd3_resident(model_path, device)?;
+    println!("  Resident: {} keys", all.len());
+
+    // 2. Detect depth from resident config
+    let config = SD3Config::from_weights(&all);
+    let depth = config.depth;
+
+    // 3. Load each block one at a time, cast to BF16, accumulate
+    for i in 0..depth {
+        let block_prefix = format!("{prefix}joint_blocks.{i}.");
+        let block = load_file_filtered(model_path, device, |key| {
+            key.starts_with(&block_prefix)
+        })?;
+        for (key, val) in block {
+            let k = key.strip_prefix(prefix).unwrap_or(&key).to_string();
+            let val = if val.dtype() != DType::BF16 { val.to_dtype(DType::BF16)? } else { val };
+            all.insert(k, val);
+        }
+        if (i + 1) % 10 == 0 || i == depth - 1 {
+            println!("  Loaded block {}/{}", i + 1, depth);
+        }
+    }
+
+    Ok(all)
 }
