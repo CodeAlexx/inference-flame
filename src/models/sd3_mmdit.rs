@@ -60,6 +60,9 @@ pub struct SD3Config {
     pub pos_embed_max_size: usize,
     pub num_patches: usize,
     pub qk_norm_has_bias: bool,
+    /// SD3.5 Medium uses dual attention (attn + attn2 in x_block).
+    /// Detected from the adaLN output size: 9*hidden → dual, 6*hidden → single.
+    pub use_dual_attention: bool,
 }
 
 impl SD3Config {
@@ -123,6 +126,16 @@ impl SD3Config {
         // Default to true (LayerNorm with bias) — SD3 uses LN for QK norm
         let qk_norm_has_bias = true;
 
+        // Dual attention: detect from adaLN output size.
+        // 9*hidden → SD3.5 Medium (dual attention), 6*hidden → SD3/SD3.5 Large (single).
+        let ada_key = "joint_blocks.0.x_block.adaLN_modulation.1.weight";
+        let use_dual_attention = if let Some(ada_w) = resident.get(ada_key) {
+            let ada_out = ada_w.shape().dims()[0];
+            ada_out / hidden_size == 9
+        } else {
+            false
+        };
+
         Self {
             depth,
             hidden_size,
@@ -138,6 +151,7 @@ impl SD3Config {
             pos_embed_max_size,
             num_patches,
             qk_norm_has_bias,
+            use_dual_attention,
         }
     }
 }
@@ -310,7 +324,7 @@ impl SD3MMDiT {
         let in_ch = self.config.in_channels;
         let out_ch = self.config.hidden_size;
 
-        let mut conv = Conv2d::new(in_ch, out_ch, p, p, 0, self.device.clone())?;
+        let mut conv = Conv2d::new_with_bias(in_ch, out_ch, p, p, 0, self.device.clone(), true)?;
         conv.copy_weight_from(w)?;
         conv.copy_bias_from(b)?;
 
@@ -373,6 +387,7 @@ impl SD3MMDiT {
         &self,
         x: &Tensor,
         prefix: &str, // e.g. "joint_blocks.0.x_block"
+        attn_name: &str, // "attn" or "attn2"
     ) -> Result<(Tensor, Tensor, Tensor)> {
         let b = x.shape().dims()[0];
         let n = x.shape().dims()[1];
@@ -382,8 +397,8 @@ impl SD3MMDiT {
         // QKV: [B, N, 3*hidden]
         let qkv = self.linear_with_bias(
             x,
-            &format!("{prefix}.attn.qkv.weight"),
-            &format!("{prefix}.attn.qkv.bias"),
+            &format!("{prefix}.{attn_name}.qkv.weight"),
+            &format!("{prefix}.{attn_name}.qkv.bias"),
         )?;
 
         // Reshape to [B, N, 3, H, D] then permute to [3, B, H, N, D]
@@ -398,8 +413,8 @@ impl SD3MMDiT {
 
         // QK norm (LayerNorm with affine, per head_dim)
         // q: [B, H, N, D] -> reshape to [B*H*N, D] for layer_norm, then back
-        let q = self.qk_norm_4d(&q, &format!("{prefix}.attn.ln_q"))?;
-        let k = self.qk_norm_4d(&k, &format!("{prefix}.attn.ln_k"))?;
+        let q = self.qk_norm_4d(&q, &format!("{prefix}.{attn_name}.ln_q"))?;
+        let k = self.qk_norm_4d(&k, &format!("{prefix}.{attn_name}.ln_k"))?;
 
         Ok((q, k, v))
     }
@@ -409,11 +424,11 @@ impl SD3MMDiT {
         let dims = x.shape().dims().to_vec();
         let (b, h, n, d) = (dims[0], dims[1], dims[2], dims[3]);
         let flat = x.reshape(&[b * h * n, d])?;
-        let normed = self.layer_norm_affine(
-            &flat,
-            &format!("{prefix}.weight"),
-            &format!("{prefix}.bias"),
-        )?;
+        let weight = self.w(&format!("{prefix}.weight"))?;
+        let dim = weight.shape().dims()[0];
+        // SD3.5 Medium QK norm has no bias; Large has bias.
+        let bias = self.w(&format!("{prefix}.bias")).ok();
+        let normed = layer_norm(&flat, &[dim], Some(weight), bias, 1e-6)?;
         normed.reshape(&[b, h, n, d])
     }
 
@@ -450,7 +465,7 @@ impl SD3MMDiT {
 
             let ctx_norm = self.layer_norm_no_affine(context)?;
             let ctx_mod = self.modulate(&ctx_norm, shift_msa, scale_msa)?;
-            let (q, k, v) = self.pre_attention_qkv(&ctx_mod, &ctx_prefix)?;
+            let (q, k, v) = self.pre_attention_qkv(&ctx_mod, &ctx_prefix, "attn")?;
             (q, k, v, None)
         } else {
             // 6 mods
@@ -464,7 +479,7 @@ impl SD3MMDiT {
 
             let ctx_norm = self.layer_norm_no_affine(context)?;
             let ctx_mod = self.modulate(&ctx_norm, shift_msa, scale_msa)?;
-            let (q, k, v) = self.pre_attention_qkv(&ctx_mod, &ctx_prefix)?;
+            let (q, k, v) = self.pre_attention_qkv(&ctx_mod, &ctx_prefix, "attn")?;
             (
                 q,
                 k,
@@ -488,7 +503,13 @@ impl SD3MMDiT {
                 &format!("{x_prefix}.adaLN_modulation.1.bias"),
             )?
         };
-        let x_chunks = x_mods.chunk(6, x_mods.shape().dims().len() - 1)?;
+
+        // Per-block dual attention detection: check adaLN output size.
+        // 9*hidden → dual (blocks 0-12 in SD3.5 Medium), 6*hidden → single.
+        let ada_out_dim = x_mods.dims()[x_mods.dims().len() - 1];
+        let block_has_dual = ada_out_dim / hidden == 9;
+        let num_mods = if block_has_dual { 9 } else { 6 };
+        let x_chunks = x_mods.chunk(num_mods, x_mods.shape().dims().len() - 1)?;
         let x_shift_msa = &x_chunks[0];
         let x_scale_msa = &x_chunks[1];
         let x_gate_msa = &x_chunks[2];
@@ -498,7 +519,22 @@ impl SD3MMDiT {
 
         let x_norm = self.layer_norm_no_affine(x)?;
         let x_mod = self.modulate(&x_norm, x_shift_msa, x_scale_msa)?;
-        let (x_q, x_k, x_v) = self.pre_attention_qkv(&x_mod, &x_prefix)?;
+        let (x_q, x_k, x_v) = self.pre_attention_qkv(&x_mod, &x_prefix, "attn")?;
+
+        // For dual attention: also prepare the second modulated input
+        let x_mod2 = if block_has_dual {
+            let x_shift_msa2 = &x_chunks[6];
+            let x_scale_msa2 = &x_chunks[7];
+            // norm is shared: norm_hidden_states2 = norm * (1 + scale2) + shift2
+            Some(self.modulate(&x_norm, x_shift_msa2, x_scale_msa2)?)
+        } else {
+            None
+        };
+        let x_gate_msa2 = if block_has_dual {
+            Some(x_chunks[8].clone())
+        } else {
+            None
+        };
 
         // ------ Joint attention: concatenate context + x along sequence dim ------
         let q = Tensor::cat(&[&ctx_q, &x_q], 2)?;
@@ -553,7 +589,25 @@ impl SD3MMDiT {
             &format!("{x_prefix}.attn.proj.bias"),
         )?;
         let x_gated = x_gate_msa.unsqueeze(1)?.mul(&x_proj)?;
-        let x_out = x.add(&x_gated)?;
+        let mut x_out = x.add(&x_gated)?;
+
+        // ------ X dual attention (attn2, SD3.5 Medium only) ------
+        // Second self-attention: x-stream only, no context concatenation.
+        // Python: attn_output2 = self.attn2(hidden_states=norm_hidden_states2)
+        //         hidden_states = hidden_states + gate_msa2 * attn_output2
+        if let (Some(x_mod2), Some(gate_msa2)) = (x_mod2, x_gate_msa2) {
+            let (q2, k2, v2) = self.pre_attention_qkv(&x_mod2, &x_prefix, "attn2")?;
+            let attn2_out = sdpa(&q2, &k2, &v2, None)?;
+            let attn2_out = attn2_out.permute(&[0, 2, 1, 3])?;
+            let attn2_out = attn2_out.reshape(&[batch, n_x, hidden])?;
+            let attn2_proj = self.linear_with_bias(
+                &attn2_out,
+                &format!("{x_prefix}.attn2.proj.weight"),
+                &format!("{x_prefix}.attn2.proj.bias"),
+            )?;
+            let attn2_gated = gate_msa2.unsqueeze(1)?.mul(&attn2_proj)?;
+            x_out = x_out.add(&attn2_gated)?;
+        }
 
         // X MLP
         let x_norm2 = self.layer_norm_no_affine(&x_out)?;
@@ -719,4 +773,25 @@ pub fn load_sd3_resident(
             .iter()
             .any(|p| key.starts_with(p) || key == "pos_embed")
     })
+}
+
+/// Load ALL weights (resident + blocks) for models that fit in VRAM
+/// (e.g. SD3.5 Medium at ~5GB). Strips `model.diffusion_model.` prefix.
+pub fn load_sd3_all(
+    model_path: &str,
+    device: &Arc<cudarc::driver::CudaDevice>,
+) -> Result<HashMap<String, Tensor>> {
+    let prefix = "model.diffusion_model.";
+    let mut weights = load_file_filtered(model_path, device, |key| {
+        key.starts_with(prefix) || key == "pos_embed"
+    })?;
+    // Strip prefix and cast to BF16
+    let keys: Vec<String> = weights.keys().cloned().collect();
+    for key in keys {
+        let stripped = key.strip_prefix(prefix).unwrap_or(&key).to_string();
+        let t = weights.remove(&key).unwrap();
+        let t = if t.dtype() != DType::BF16 { t.to_dtype(DType::BF16)? } else { t };
+        weights.insert(stripped, t);
+    }
+    Ok(weights)
 }

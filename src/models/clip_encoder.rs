@@ -34,9 +34,12 @@ pub struct ClipConfig {
     pub projection_dim: usize,
     /// CLIP-L default EOS token id (CLIPTokenizer also pads with this value).
     pub eos_token_id: i32,
+    /// CLIP-L uses quick_gelu (x * sigmoid(1.702x)), CLIP-G uses standard gelu.
+    pub use_quick_gelu: bool,
 }
 
 impl Default for ClipConfig {
+    /// CLIP-L config (768-dim, 12 layers, quick_gelu).
     fn default() -> Self {
         Self {
             vocab_size: 49408,
@@ -49,6 +52,27 @@ impl Default for ClipConfig {
             layer_norm_eps: 1e-5,
             projection_dim: 768,
             eos_token_id: 49407, // HF CLIPTextConfig default
+            use_quick_gelu: true,
+        }
+    }
+}
+
+impl ClipConfig {
+    /// CLIP-G config (1280-dim, 32 layers, standard gelu).
+    /// OpenCLIP ViT-bigG-14, used as text_encoder_2 in SD3/SD3.5.
+    pub fn clip_g() -> Self {
+        Self {
+            vocab_size: 49408,
+            hidden_size: 1280,
+            num_layers: 32,
+            intermediate_size: 5120,
+            num_heads: 20,
+            head_dim: 64, // 1280 / 20
+            max_position_embeddings: 77,
+            layer_norm_eps: 1e-5,
+            projection_dim: 1280,
+            eos_token_id: 49407,
+            use_quick_gelu: false, // CLIP-G uses standard GELU
         }
     }
 }
@@ -200,7 +224,11 @@ impl ClipEncoder {
         let fc2_b = self.w(&format!("{prefix}.mlp.fc2.bias"))?;
 
         let mlp_hidden = Self::linear(&normed2, fc1_w, Some(fc1_b))?;
-        let mlp_hidden = Self::quick_gelu(&mlp_hidden)?;
+        let mlp_hidden = if cfg.use_quick_gelu {
+            Self::quick_gelu(&mlp_hidden)?
+        } else {
+            mlp_hidden.gelu()?
+        };
         let mlp_out = Self::linear(&mlp_hidden, fc2_w, Some(fc2_b))?;
 
         hidden.add(&mlp_out)
@@ -284,6 +312,79 @@ impl ClipEncoder {
         Ok((hidden, pooled))
     }
 
+    /// Encode for SD3: returns (penultimate_hidden_state, pooled_output).
+    ///
+    /// SD3 uses `hidden_states[-2]` (output after the second-to-last transformer
+    /// layer, NOT final-layer-normed) for the sequence embedding, and
+    /// `pooler_output` (final layer output → final_layer_norm → EOS position)
+    /// for the pooled vector.
+    ///
+    /// ## HF reference (modeling_clip.py):
+    /// ```python
+    /// # hidden_states[-2] = encoder output after layer (num_layers - 2)
+    /// clip_out = clip(tokens).hidden_states[-2]       # [B, 77, hidden]
+    /// clip_pooled = clip(tokens).pooler_output         # [B, hidden]
+    /// ```
+    pub fn encode_sd3(&self, token_ids: &[i32]) -> Result<(Tensor, Tensor)> {
+        let cfg = &self.config;
+        let max_len = cfg.max_position_embeddings;
+
+        let mut padded: Vec<i32> = token_ids.to_vec();
+        if padded.len() > max_len {
+            padded.truncate(max_len);
+        } else {
+            padded.resize(max_len, cfg.eos_token_id);
+        }
+        let seq_len = max_len;
+
+        // 1. Token + position embeddings
+        let token_w = self.w("text_model.embeddings.token_embedding.weight")?;
+        let pos_w = self.w("text_model.embeddings.position_embedding.weight")?;
+
+        let ids = Tensor::from_vec(
+            padded.iter().map(|&id| id as f32).collect(),
+            Shape::from_dims(&[seq_len]),
+            self.device.clone(),
+        )?.to_dtype(DType::I32)?;
+        let token_embeds = token_w.index_select0(&ids)?;
+
+        let pos_ids = Tensor::from_vec(
+            (0..seq_len as i32).map(|i| i as f32).collect(),
+            Shape::from_dims(&[seq_len]),
+            self.device.clone(),
+        )?.to_dtype(DType::I32)?;
+        let pos_embeds = pos_w.index_select0(&pos_ids)?;
+
+        let mut hidden = token_embeds.add(&pos_embeds)?.unsqueeze(0)?;
+
+        // 2. Causal mask
+        let mask = Self::build_causal_mask(seq_len, &self.device)?;
+
+        // 3. Transformer layers — capture penultimate output
+        let penultimate_idx = cfg.num_layers - 2; // hidden_states[-2]
+        let mut penultimate_hidden = None;
+
+        for i in 0..cfg.num_layers {
+            hidden = self.layer_forward(&hidden, i, &mask)?;
+            if i == penultimate_idx {
+                penultimate_hidden = Some(hidden.clone());
+            }
+        }
+
+        // 4. Pooled output: final_layer_norm on LAST layer → EOS position
+        let final_ln_w = self.w("text_model.final_layer_norm.weight")?;
+        let final_ln_b = self.w("text_model.final_layer_norm.bias")?;
+        let normed = Self::layer_norm(&hidden, final_ln_w, final_ln_b, cfg.layer_norm_eps)?;
+
+        let eos_pos = padded
+            .iter()
+            .position(|&id| id == cfg.eos_token_id)
+            .unwrap_or(seq_len - 1);
+        let pooled = normed.narrow(1, eos_pos, 1)?.squeeze(Some(1))?;
+
+        Ok((penultimate_hidden.unwrap(), pooled))
+    }
+
     pub fn config(&self) -> &ClipConfig {
         &self.config
     }
@@ -299,5 +400,13 @@ mod tests {
         assert_eq!(cfg.hidden_size, 768);
         assert_eq!(cfg.num_layers, 12);
         assert_eq!(cfg.num_heads * cfg.head_dim, 768);
+        assert!(cfg.use_quick_gelu);
+
+        let cfg_g = ClipConfig::clip_g();
+        assert_eq!(cfg_g.hidden_size, 1280);
+        assert_eq!(cfg_g.num_layers, 32);
+        assert_eq!(cfg_g.num_heads, 20);
+        assert_eq!(cfg_g.num_heads * cfg_g.head_dim, 1280);
+        assert!(!cfg_g.use_quick_gelu);
     }
 }
