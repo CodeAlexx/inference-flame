@@ -55,8 +55,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // --- 3. Load encoder via FlameSwap ---
-    println!("\nLoading Gemma-3 via FlameSwap...");
+    // --- 3. Load encoder via BlockOffloader ---
+    println!("\nLoading Gemma-3 via BlockOffloader...");
     let t0 = Instant::now();
     let shard_refs: Vec<&str> = shards.iter().map(|s| s.as_str()).collect();
     let mut encoder = Gemma3Encoder::load(&shard_refs, &device, input_ids.len())?;

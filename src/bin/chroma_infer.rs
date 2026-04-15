@@ -1,7 +1,7 @@
-//! Chroma end-to-end inference — pure Rust, flame-core + FlameSwap.
+//! Chroma end-to-end inference — pure Rust, flame-core + BlockOffloader.
 //!
 //! Pipeline:
-//!   1. T5-XXL → hidden [1, 512, 4096]   (FlameSwap, then DROPPED)
+//!   1. T5-XXL → hidden [1, 512, 4096]   (BlockOffloader, then DROPPED)
 //!      Plus a separate uncond pass on an empty prompt for CFG.
 //!   2. Chroma DiT → CFG denoise (cond + uncond per step)
 //!   3. VAE → RGB
@@ -118,9 +118,9 @@ fn main() -> anyhow::Result<()> {
     println!();
 
     // ------------------------------------------------------------------
-    // Stage 2: Load Chroma DiT (FlameSwap)
+    // Stage 2: Load Chroma DiT (BlockOffloader)
     // ------------------------------------------------------------------
-    println!("--- Stage 2: Load Chroma DiT (FlameSwap) ---");
+    println!("--- Stage 2: Load Chroma DiT (BlockOffloader) ---");
     let t0 = Instant::now();
     let mut dit = ChromaDit::load(CHROMA_DIT_SHARDS, &device)?;
     println!("  DiT loaded in {:.1}s", t0.elapsed().as_secs_f32());

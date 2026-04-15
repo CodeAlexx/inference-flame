@@ -1,6 +1,6 @@
 //! HunyuanVideo 1.5 — Stage 2 (DiT denoise → save latents).
 //!
-//! 54 double-stream blocks via FlameSwap, flow-matching Euler scheduler.
+//! 54 double-stream blocks via BlockOffloader, flow-matching Euler scheduler.
 //! Text embeddings pre-refined in Python Stage 1.
 
 use std::collections::HashMap;

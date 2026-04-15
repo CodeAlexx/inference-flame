@@ -24,7 +24,7 @@ use std::time::Instant;
 // Per the LTX-2 README:
 //   * `fp8-cast` policy is for BF16 checkpoints (downcasts on the fly)
 //   * `fp8-scaled-mm` policy is for FP8 checkpoints (requires tensorrt_llm)
-// We don't have tensorrt_llm, and our flame-swap can stream BF16 weights
+// We don't have tensorrt_llm, and our block offloader can stream BF16 weights
 // directly (no per-block dequant needed). Loading the FP8 distilled file
 // without scale-aware dequant produces dim/gray output (verified by running
 // the official Python pipeline with `fp8_cast` on the FP8 file: same noise;
@@ -208,8 +208,8 @@ fn main() -> anyhow::Result<()> {
     let config = LTX2Config::default();
     let mut model = LTX2StreamingModel::load_globals(MODEL_PATH, &config)?;
 
-    model.init_swap()?;
-    println!("  FlameSwap ready in {:.1}s", t0.elapsed().as_secs_f32());
+    model.init_offloader()?;
+    println!("  BlockOffloader ready in {:.1}s", t0.elapsed().as_secs_f32());
 
     // ========================================
     // Stage 1: Denoise at HALF resolution
@@ -386,7 +386,7 @@ fn main() -> anyhow::Result<()> {
     drop(vae_weights);
 
     // ========================================
-    // Stage 2: Refine at FULL resolution (FlameSwap)
+    // Stage 2: Refine at FULL resolution (BlockOffloader)
     // ========================================
     let s2_sigmas = LTX2_STAGE2_DISTILLED_SIGMAS.to_vec();
     let s2_steps = s2_sigmas.len() - 1;

@@ -1,14 +1,14 @@
 //! ERNIE-Image inference — text encode → flow matching denoise → VAE decode → PNG.
 //!
-//! Usage: cargo run --release --bin ernie_image_infer [-- "prompt text"]
+//! Usage: ernie_image_infer ["prompt text" [output.png]]
 //!
 //! Pipeline:
 //!   1. Mistral-3 3B text encode → dump from VRAM
-//!   2. Load ERNIE-Image DiT via FlameSwap (36 blocks)
-//!   3. Flow matching Euler denoise (shift=3.0)
-//!   4. VAE decode → PNG
+//!   2. Load ERNIE-Image DiT (all blocks resident on GPU)
+//!   3. Flow matching Euler denoise (shift=3.0, sequential CFG)
+//!   4. Drop DiT → VAE decode → PNG
 
-use inference_flame::models::ernie_image::{ErnieImageConfig, ErnieImageSwapped};
+use inference_flame::models::ernie_image::{ErnieImageConfig, ErnieImageModel};
 use inference_flame::models::mistral3b_encoder::Mistral3bEncoder;
 use inference_flame::vae::klein_vae::KleinVaeDecoder;
 use inference_flame::sampling::ernie_sampling::{ernie_schedule, ernie_euler_step, sigma_to_timestep};
@@ -20,8 +20,8 @@ const TEXT_ENCODER: &str = "/home/alex/models/ERNIE-Image/text_encoder/model.saf
 const TOKENIZER: &str = "/home/alex/models/ERNIE-Image/tokenizer/tokenizer.json";
 const VAE_PATH: &str = "/home/alex/models/ERNIE-Image/vae/diffusion_pytorch_model.safetensors";
 
-const WIDTH: usize = 512;
-const HEIGHT: usize = 512;
+const WIDTH: usize = 1024;
+const HEIGHT: usize = 1024;
 const STEPS: usize = 28;
 const GUIDANCE: f32 = 4.0;
 const SEED: u64 = 42;
@@ -36,7 +36,7 @@ fn main() {
 
 fn run() -> anyhow::Result<()> {
     let prompt = std::env::args().nth(1).unwrap_or_else(|| "a beautiful sunset over the ocean".to_string());
-    let output = std::env::args().nth(2).unwrap_or_else(|| "/home/alex/serenity/output/ernie_image_test.png".to_string());
+    let output = std::env::args().nth(2).unwrap_or_else(|| "/home/alex/serenity/output/ernie_cat_1024.png".to_string());
 
     let device = global_cuda_device();
     let _no_grad = flame_core::autograd::AutogradContext::no_grad();
@@ -44,13 +44,13 @@ fn run() -> anyhow::Result<()> {
     let latent_h = HEIGHT / 16;
     let latent_w = WIDTH / 16;
 
-    println!("=== ERNIE-Image Inference ===");
+    println!("=== ERNIE-Image 1024x1024 (resident + sequential CFG) ===");
     println!("  prompt: {prompt:?}");
     println!("  size: {WIDTH}x{HEIGHT}, latent: {latent_w}x{latent_h}");
     println!("  steps: {STEPS}, guidance: {GUIDANCE}, seed: {SEED}");
 
     // ---------------------------------------------------------------
-    // Stage 1: Text Encoding (Mistral-3 3B)
+    // Stage 1: Text Encoding (Mistral-3 3B) — then drop encoder
     // ---------------------------------------------------------------
     println!("\n[1/4] Text encoding (Mistral-3 3B)...");
     let t0 = Instant::now();
@@ -69,13 +69,14 @@ fn run() -> anyhow::Result<()> {
         let embeds = encoder.encode(&token_ids, 256)?;
         println!("  encoded: shape={:?}", embeds.shape().dims());
         embeds
+        // encoder dropped here — ~7GB freed
     };
     println!("  text encoding done in {:.1}s", t0.elapsed().as_secs_f32());
 
     // ---------------------------------------------------------------
-    // Stage 2: Load Transformer (FlameSwap)
+    // Stage 2: Load Transformer (all resident on GPU — ~15GB)
     // ---------------------------------------------------------------
-    println!("\n[2/4] Loading ERNIE-Image DiT (FlameSwap)...");
+    println!("\n[2/4] Loading ERNIE-Image DiT (all blocks resident)...");
     let t1 = Instant::now();
 
     let shard_paths = {
@@ -89,21 +90,27 @@ fn run() -> anyhow::Result<()> {
         paths.sort();
         paths
     };
-    let path_refs: Vec<&str> = shard_paths.iter().map(|s| s.as_str()).collect();
+
+    let mut all_weights = std::collections::HashMap::new();
+    for path in &shard_paths {
+        let partial = flame_core::serialization::load_file(path, &device)?;
+        for (k, v) in partial {
+            all_weights.insert(k, v);
+        }
+    }
 
     let config = ErnieImageConfig::default();
-    let mut model = ErnieImageSwapped::load(&path_refs, config.clone(), &device)?;
-    println!("  DiT loaded in {:.1}s", t1.elapsed().as_secs_f32());
+    let model = ErnieImageModel::load(all_weights, config.clone())?;
+    println!("  DiT loaded in {:.1}s ({} blocks on GPU)", t1.elapsed().as_secs_f32(), config.num_layers);
 
     // ---------------------------------------------------------------
-    // Stage 3: Denoise
+    // Stage 3: Denoise — SEQUENTIAL CFG (one pass at a time)
     // ---------------------------------------------------------------
-    println!("\n[3/4] Denoising ({STEPS} steps, shift=3.0)...");
+    println!("\n[3/4] Denoising ({STEPS} steps, sequential CFG)...");
     let t2 = Instant::now();
 
     let sigmas = ernie_schedule(STEPS);
 
-    // Generate initial noise [1, 128, latent_h, latent_w]
     let noise = {
         use rand::SeedableRng;
         let mut rng = rand::rngs::StdRng::seed_from_u64(SEED);
@@ -120,7 +127,6 @@ fn run() -> anyhow::Result<()> {
 
     let mut latent = noise;
 
-    // Text embeds: [1, seq_len, 3072]
     let text_3d = if text_embeds.rank() == 2 {
         text_embeds.unsqueeze(0)?
     } else {
@@ -128,7 +134,6 @@ fn run() -> anyhow::Result<()> {
     };
     let text_lens = vec![text_len.min(256)];
 
-    // Unconditional embeds for CFG
     let uncond_embeds = Tensor::zeros_dtype(
         text_3d.shape().clone(), DType::BF16, device.clone(),
     )?;
@@ -140,6 +145,7 @@ fn run() -> anyhow::Result<()> {
         let t = sigma_to_timestep(sigma);
         let t_tensor = Tensor::from_vec(vec![t], Shape::from_dims(&[1]), device.clone())?;
 
+        // Sequential CFG: run cond pass, then uncond pass — never both at once
         let pred = if GUIDANCE > 1.0 {
             let pred_cond = model.forward(&latent, &t_tensor, &text_3d, &text_lens)?;
             let pred_uncond = model.forward(&latent, &t_tensor, &uncond_embeds, &uncond_lens)?;
@@ -149,23 +155,25 @@ fn run() -> anyhow::Result<()> {
         };
         latent = ernie_euler_step(&latent, &pred, sigma, sigma_next)?;
 
-        if step % 10 == 0 || step == STEPS - 1 {
-            println!("  step {}/{STEPS} sigma={sigma:.4} t={t:.1}", step + 1);
+        if step % 5 == 0 || step == STEPS - 1 {
+            println!("  step {}/{STEPS} sigma={sigma:.4} t={t:.1} ({:.1}s)",
+                step + 1, t2.elapsed().as_secs_f32());
         }
     }
-    println!("  denoising done in {:.1}s", t2.elapsed().as_secs_f32());
+    println!("  denoising done in {:.1}s ({:.1}s/step)",
+        t2.elapsed().as_secs_f32(),
+        t2.elapsed().as_secs_f32() / STEPS as f32);
 
-    // Debug: check latent stats
     {
         let v = latent.to_vec_f32()?;
         let mean: f32 = v.iter().sum::<f32>() / v.len() as f32;
         let std: f32 = (v.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / v.len() as f32).sqrt();
         let nan = v.iter().filter(|x| x.is_nan()).count();
-        println!("  latent stats: mean={mean:.4} std={std:.4} nan={nan} shape={:?}", latent.shape().dims());
+        println!("  latent stats: mean={mean:.4} std={std:.4} nan={nan}");
     }
 
     // ---------------------------------------------------------------
-    // Stage 4: VAE Decode
+    // Stage 4: Drop DiT → VAE Decode
     // ---------------------------------------------------------------
     println!("\n[4/4] VAE decode...");
     let t3 = Instant::now();
@@ -178,7 +186,6 @@ fn run() -> anyhow::Result<()> {
     drop(vae_weights);
 
     let decoded = vae.decode(&latent)?;
-    println!("  decoded: shape={:?}", decoded.shape().dims());
     println!("  VAE done in {:.1}s", t3.elapsed().as_secs_f32());
 
     // Save PNG

@@ -1,9 +1,9 @@
-//! FLUX 1 Dev end-to-end inference — pure Rust, flame-core + FlameSwap.
+//! FLUX 1 Dev end-to-end inference — pure Rust, flame-core + BlockOffloader.
 //!
 //! Pipeline:
 //!   1. CLIP-L   → pooled [1, 768]
-//!   2. T5-XXL   → hidden [1, 512, 4096]   (FlameSwap, then DROPPED)
-//!   3. FLUX 1   → 20-step Euler denoise via flux1_sampling (FlameSwap)
+//!   2. T5-XXL   → hidden [1, 512, 4096]   (BlockOffloader, then DROPPED)
+//!   3. FLUX 1   → 20-step Euler denoise via flux1_sampling (BlockOffloader)
 //!   4. VAE      → RGB
 //!   5. PNG      → /home/alex/EriDiffusion/inference-flame/output/flux1_rust.png
 //!
@@ -107,7 +107,7 @@ fn main() -> anyhow::Result<()> {
     println!();
 
     // ------------------------------------------------------------------
-    // Stage 2: T5-XXL encode — FlameSwap — then drop
+    // Stage 2: T5-XXL encode — BlockOffloader — then drop
     // ------------------------------------------------------------------
     println!("--- Stage 2: T5-XXL encode ---");
     let t0 = Instant::now();
@@ -121,16 +121,16 @@ fn main() -> anyhow::Result<()> {
         println!("  T5 hidden: {:?}", hidden.shape().dims());
         println!("  T5 encode done in {:.1}s", t0.elapsed().as_secs_f32());
 
-        // Scope drop ensures FlameSwap-backed weights are freed before DiT load.
+        // Scope drop ensures BlockOffloader-backed weights are freed before DiT load.
         hidden
     };
     println!("  T5 weights evicted");
     println!();
 
     // ------------------------------------------------------------------
-    // Stage 3: Load FLUX 1 DiT (FlameSwap)
+    // Stage 3: Load FLUX 1 DiT (BlockOffloader)
     // ------------------------------------------------------------------
-    println!("--- Stage 3: Load FLUX 1 DiT (FlameSwap) ---");
+    println!("--- Stage 3: Load FLUX 1 DiT (BlockOffloader) ---");
     let t0 = Instant::now();
     let mut dit = Flux1DiT::load(DIT_PATH, &device)?;
     println!("  DiT loaded in {:.1}s", t0.elapsed().as_secs_f32());
@@ -223,7 +223,7 @@ fn main() -> anyhow::Result<()> {
     println!("  Output: {:?}", denoised.shape().dims());
     println!();
 
-    // Free DiT before VAE load (DiT FlameSwap holds ~24GB worth of weights).
+    // Free DiT before VAE load (DiT BlockOffloader holds ~24GB worth of weights).
     drop(dit);
     println!("  DiT evicted");
 

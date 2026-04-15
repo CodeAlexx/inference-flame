@@ -1,7 +1,7 @@
 //! Wan2.2-T2V-A14B — Stage 2 (dual-expert DiT denoise → save latents).
 //!
 //! Loads cached text embeddings from Stage 1, loads TWO DiT models via
-//! FlameSwap (high_noise + low_noise), runs a flow-matching Euler denoise
+//! BlockOffloader (high_noise + low_noise), runs a flow-matching Euler denoise
 //! loop with sigma-shifted timesteps, and saves the final latent for Stage 3
 //! VAE decode.
 //!
@@ -13,7 +13,7 @@
 //!
 //! ## Pipeline split (OOM-safe)
 //!   Stage 1 (Python): UMT5-XXL text encoder only
-//!   Stage 2 (Rust):   Dual DiT via FlameSwap (one active at a time)
+//!   Stage 2 (Rust):   Dual DiT via BlockOffloader (one active at a time)
 //!   Stage 3 (Python): Wan2.1 VAE decode → MP4
 //!
 //! ## Scheduler — Euler with flow-matching sigma shift
@@ -161,7 +161,7 @@ fn main() -> anyhow::Result<()> {
     println!();
 
     // ------------------------------------------------------------------
-    // Load DiT models (one at a time via FlameSwap)
+    // Load DiT models (one at a time via BlockOffloader)
     // ------------------------------------------------------------------
     // Strategy: load the model needed for the first timestep. When we cross
     // the boundary, drop and reload the other model.

@@ -1,7 +1,7 @@
 //! Qwen-Image-Edit — Stage 2 (Rust DiT denoise → save latents).
 //!
 //! Loads cached embeddings + image_latents from `qwenimage_edit_encode.py`,
-//! loads the QwenImage-Edit DiT (FlameSwap), runs the true-CFG Euler loop with
+//! loads the QwenImage-Edit DiT (BlockOffloader), runs the true-CFG Euler loop with
 //! the diffusers Edit-specific concatenation trick, and saves the final latents
 //! for Stage 3 to decode.
 //!
@@ -25,7 +25,7 @@
 //!
 //! ## Pipeline split (OOM-safe: one model resident at a time)
 //!   Stage 1 (Python): Qwen2.5-VL text encoder + AutoencoderKLQwenImage VAE encode
-//!   Stage 2 (Rust):   QwenImage-Edit DiT only (FlameSwap)
+//!   Stage 2 (Rust):   QwenImage-Edit DiT only (BlockOffloader)
 //!   Stage 3 (Python): AutoencoderKLQwenImage decode (reuse `qwenimage_decode.py`)
 //!
 //! ## True CFG with norm rescale (same as T2I)
@@ -153,9 +153,9 @@ fn main() -> anyhow::Result<()> {
     println!();
 
     // ------------------------------------------------------------------
-    // Stage B: Load Qwen-Image-Edit DiT (FlameSwap)
+    // Stage B: Load Qwen-Image-Edit DiT (BlockOffloader)
     // ------------------------------------------------------------------
-    println!("--- Loading Qwen-Image-Edit DiT (FlameSwap, 9 shards) ---");
+    println!("--- Loading Qwen-Image-Edit DiT (BlockOffloader, 9 shards) ---");
     let t0 = Instant::now();
     let mut dit = QwenImageDit::load(&dit_shards, &device)?;
     println!("  DiT loaded in {:.1}s", t0.elapsed().as_secs_f32());

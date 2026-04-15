@@ -2,7 +2,7 @@
 //!
 //! Pipeline:
 //! 1. Load cached Gemma text embeddings (4096-dim, pre-processed)
-//! 2. Load LTX-2 transformer via FlameSwap
+//! 2. Load LTX-2 transformer via BlockOffloader
 //! 3. Create noise + sigma schedule (dev model)
 //! 4. Denoise with CFG: two forward passes per step (uncond + cond)
 //! 5. Save denoised latents → decode with Python VAE
@@ -69,13 +69,13 @@ fn main() -> anyhow::Result<()> {
     let config = LTX2Config::default();
     let mut model = LTX2StreamingModel::load_globals(MODEL_PATH, &config)?;
     println!("  Global params loaded in {:.1}s", t0.elapsed().as_secs_f32());
-    // Try FP8 resident first (fast, no I/O), fall back to FlameSwap
+    // Try FP8 resident first (fast, no I/O), fall back to BlockOffloader
     match model.load_fp8_resident() {
         Ok(()) => println!("  FP8 resident loaded in {:.1}s", t0.elapsed().as_secs_f32()),
         Err(e) => {
-            println!("  FP8 resident failed ({e}), falling back to FlameSwap");
-            model.init_swap()?;
-            println!("  FlameSwap initialized in {:.1}s", t0.elapsed().as_secs_f32());
+            println!("  FP8 resident failed ({e}), falling back to BlockOffloader");
+            model.init_offloader()?;
+            println!("  BlockOffloader initialized in {:.1}s", t0.elapsed().as_secs_f32());
         }
     }
 

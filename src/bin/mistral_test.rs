@@ -1,6 +1,6 @@
 //! Standalone test for Mistral Small 3.1 24B text encoder.
 //!
-//! Loads the FLUX 2 text encoder via FlameSwap, tokenizes a test prompt,
+//! Loads the FLUX 2 text encoder via BlockOffloader, tokenizes a test prompt,
 //! runs forward pass, and prints embedding statistics.
 //!
 //! ⚠️ This does NOT connect to any inference pipeline.
@@ -53,7 +53,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  first 10 ids: {:?}", &token_ids[..10.min(token_ids.len())]);
 
     // --- Step 3: Load encoder ---
-    println!("\nLoading Mistral via FlameSwap...");
+    println!("\nLoading Mistral via BlockOffloader...");
     let t0 = Instant::now();
     let shard_refs: Vec<&str> = shards.iter().map(|s| s.as_str()).collect();
     let mut encoder = MistralEncoder::load(&shard_refs, &device)?;

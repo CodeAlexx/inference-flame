@@ -34,10 +34,29 @@
 use flame_core::attention::sdpa as flame_sdpa;
 use flame_core::serialization::load_file_filtered;
 use flame_core::{CudaDevice, DType, Result, Shape, Tensor};
-use flame_swap::FlameSwap;
+use flame_diffusion::block_offload::BlockFacilitator;
+use flame_diffusion::BlockOffloader;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+
+// ---------------------------------------------------------------------------
+// BlockFacilitator for Gemma-3:
+//   language_model.model.layers.{i}.* → block i
+// ---------------------------------------------------------------------------
+
+struct Gemma3Facilitator {
+    num_layers: usize,
+}
+
+impl BlockFacilitator for Gemma3Facilitator {
+    fn block_count(&self) -> usize { self.num_layers }
+    fn classify_key(&self, key: &str) -> Option<usize> {
+        let stripped = key.strip_prefix("language_model.model.")?;
+        let rest = stripped.strip_prefix("layers.")?;
+        rest.split('.').next()?.parse().ok()
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -99,18 +118,18 @@ impl Gemma3Config {
 }
 
 // ---------------------------------------------------------------------------
-// Gemma3 Encoder (with FlameSwap for block-level offloading)
+// Gemma3 Encoder (with BlockOffloader for block-level offloading)
 // ---------------------------------------------------------------------------
 
-/// Gemma-3 12B text encoder with FlameSwap for layer-by-layer GPU offloading.
+/// Gemma-3 12B text encoder with BlockOffloader for layer-by-layer GPU offloading.
 ///
 /// Shared weights (embeddings, final norm) are kept on GPU.
-/// Transformer layers are swapped in/out via FlameSwap.
+/// Transformer layers are swapped in/out via BlockOffloader.
 pub struct Gemma3Encoder {
     /// Shared weights on GPU: embed_tokens, final norm.
     shared: HashMap<String, Tensor>,
-    /// FlameSwap for the 48 transformer layers.
-    swap: FlameSwap,
+    /// BlockOffloader for the 48 transformer layers.
+    offloader: BlockOffloader,
     config: Gemma3Config,
     device: Arc<CudaDevice>,
     /// Pre-computed global RoPE (cos, sin) for max sequence length.
@@ -123,7 +142,7 @@ pub struct Gemma3Encoder {
 }
 
 impl Gemma3Encoder {
-    /// Load Gemma-3 from safetensors files using FlameSwap.
+    /// Load Gemma-3 from safetensors files using BlockOffloader.
     ///
     /// `safetensors_paths`: paths to the sharded safetensors files.
     /// `max_seq_len`: maximum sequence length for RoPE precomputation.
@@ -134,23 +153,18 @@ impl Gemma3Encoder {
     ) -> Result<Self> {
         let config = Gemma3Config::default();
 
-        // Strip "language_model.model." prefix from weight keys for cleaner access.
-        // FlameSwap block detection: "layers.N.xxx" → block N.
+        // BlockOffloader classifies blocks by "language_model.model.layers.N.*" → block N.
         let prefix = "language_model.model.";
 
-        let swap = FlameSwap::load(
+        let facilitator = Gemma3Facilitator { num_layers: config.num_layers };
+        let offloader = BlockOffloader::load(
             safetensors_paths,
-            device,
-            |name| {
-                // Only process keys under our prefix
-                let stripped = name.strip_prefix(prefix)?;
-                let rest = stripped.strip_prefix("layers.")?;
-                rest.split('.').next()?.parse().ok()
-            },
-        ).map_err(|e| flame_core::Error::InvalidInput(format!("FlameSwap load: {e}")))?;
+            &facilitator,
+            device.clone(),
+        ).map_err(|e| flame_core::Error::InvalidInput(format!("BlockOffloader load: {e}")))?;
 
         // Load shared (non-block) weights onto GPU.
-        // These are embed_tokens and final norm — NOT in FlameSwap blocks.
+        // These are embed_tokens and final norm — NOT in BlockOffloader blocks.
         // Scan each safetensors file for keys matching our shared weight patterns.
         let shared_keys_needed = [
             ("embed_tokens.weight", format!("{prefix}embed_tokens.weight")),
@@ -201,14 +215,14 @@ impl Gemma3Encoder {
             device,
         )?;
 
-        log::info!("[Gemma3] Loaded: {} blocks via FlameSwap, {} shared weights",
-            swap.num_blocks(), shared.len());
+        log::info!("[Gemma3] Loaded: {} blocks via BlockOffloader, {} shared weights",
+            offloader.block_count(), shared.len());
         log::info!("[Gemma3] RoPE: global cos {:?}, local cos {:?}",
             rope_global_cos.shape(), rope_local_cos.shape());
 
         Ok(Self {
             shared,
-            swap,
+            offloader,
             config,
             device: device.clone(),
             rope_global_cos,
@@ -350,7 +364,7 @@ impl Gemma3Encoder {
     // Single transformer layer forward
     // -----------------------------------------------------------------------
 
-    /// Execute one Gemma3 decoder layer using weights from FlameSwap.
+    /// Execute one Gemma3 decoder layer using weights from BlockOffloader.
     ///
     /// ## PyTorch reference (Gemma3DecoderLayer.forward):
     /// ```python
@@ -583,30 +597,30 @@ impl Gemma3Encoder {
         let mut all_hidden_states = Vec::with_capacity(cfg.num_layers + 1);
         all_hidden_states.push(hidden.clone()); // embedding output (index 0)
 
-        // 4. Forward through 48 layers with FlameSwap
-        self.swap.prefetch(0)
+        // 4. Forward through 48 layers with BlockOffloader
+        self.offloader.prefetch_block(0)
             .map_err(|e| flame_core::Error::InvalidInput(format!("prefetch: {e}")))?;
 
         for i in 0..cfg.num_layers {
             // Wait for current block's weights
-            let raw_weights = self.swap.await_block(i)
+            let raw_weights = self.offloader.await_block(i)
                 .map_err(|e| flame_core::Error::InvalidInput(format!("await_block: {e}")))?;
 
-            // Prefetch next block (AFTER await, FlameSwap requires sequential prefetch→await)
+            // Prefetch next block (AFTER await, BlockOffloader requires sequential prefetch→await)
             if i + 1 < cfg.num_layers {
-                self.swap.prefetch(i + 1)
+                self.offloader.prefetch_block(i + 1)
                     .map_err(|e| flame_core::Error::InvalidInput(format!("prefetch: {e}")))?;
             }
 
-            // FlameSwap returns keys with full safetensors names, e.g.
+            // BlockOffloader returns keys with full safetensors names, e.g.
             // "language_model.model.layers.5.self_attn.q_proj.weight"
             // Strip prefix to get "layers.5.self_attn.q_proj.weight"
-            let weights: HashMap<String, Tensor> = raw_weights.into_iter()
+            let weights: HashMap<String, Tensor> = raw_weights.iter()
                 .map(|(k, v)| {
                     let stripped = k.strip_prefix("language_model.model.")
-                        .unwrap_or(&k)
+                        .unwrap_or(k)
                         .to_string();
-                    (stripped, v)
+                    (stripped, v.clone())
                 })
                 .collect();
 

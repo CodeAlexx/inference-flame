@@ -18,7 +18,7 @@
 //!
 //! ## Pipeline (sequential, one component resident at a time)
 //! 1. Load UMT5-XXL → encode prompt + negative → drop encoder.
-//! 2. Load DiT shards via FlameSwap → run Euler loop (50 steps × 2 CFG).
+//! 2. Load DiT shards via BlockOffloader → run Euler loop (50 steps × 2 CFG).
 //! 3. Load VAE → decode latent → write MP4 via `mux::save_mp4_video_only`.
 //!
 //! ## Algorithmic sources

@@ -1,4 +1,4 @@
-//! Mistral Small 3.1 24B text encoder for FLUX 2 — pure flame-core with FlameSwap.
+//! Mistral Small 3.1 24B text encoder for FLUX 2 — pure flame-core with BlockOffloader.
 //!
 //! Loads Mistral-Small-3.1-24B from BF16 safetensors and extracts hidden states
 //! at layers [10, 20, 30] (1-indexed), stacking them along the hidden dimension
@@ -14,7 +14,7 @@
 //!   - hidden_size=5120, 40 layers, head_dim=128, 32 Q heads, 8 KV heads
 //!   - rope_theta=1e9, rms_norm_eps=1e-5
 //!   - Weight prefix: "language_model.model." (stripped on load)
-//!   - 24B params → FlameSwap required (won't fit in 24GB VRAM)
+//!   - 24B params → BlockOffloader required (won't fit in 24GB VRAM)
 //!
 //! ## Weight key format (from FLUX.2-dev text_encoder safetensors):
 //!   language_model.model.embed_tokens.weight          [131072, 5120]
@@ -34,10 +34,29 @@
 use flame_core::attention::sdpa as flame_sdpa;
 use flame_core::serialization::load_file_filtered;
 use flame_core::{CudaDevice, DType, Result, Shape, Tensor};
-use flame_swap::FlameSwap;
+use flame_diffusion::block_offload::BlockFacilitator;
+use flame_diffusion::BlockOffloader;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+
+// ---------------------------------------------------------------------------
+// BlockFacilitator for Mistral:
+//   language_model.model.layers.{i}.* → block i
+// ---------------------------------------------------------------------------
+
+struct MistralFacilitator {
+    num_layers: usize,
+}
+
+impl BlockFacilitator for MistralFacilitator {
+    fn block_count(&self) -> usize { self.num_layers }
+    fn classify_key(&self, key: &str) -> Option<usize> {
+        let stripped = key.strip_prefix(KEY_PREFIX)?;
+        let rest = stripped.strip_prefix("layers.")?;
+        rest.split('.').next()?.parse().ok()
+    }
+}
 
 /// FLUX 2 extraction layers (0-indexed layer indices).
 /// Musubi reference: OUTPUT_LAYERS_MISTRAL = [10, 20, 30] (1-indexed hidden_states).
@@ -93,21 +112,21 @@ impl Default for MistralConfig {
 // Encoder
 // ---------------------------------------------------------------------------
 
-/// Mistral Small 3.1 24B encoder with FlameSwap for layer-by-layer GPU offloading.
+/// Mistral Small 3.1 24B encoder with BlockOffloader for layer-by-layer GPU offloading.
 ///
 /// Shared weights (embed_tokens, final norm) kept on GPU.
-/// 40 transformer layers swapped in/out via FlameSwap.
+/// 40 transformer layers swapped in/out via BlockOffloader.
 pub struct MistralEncoder {
     /// Shared weights on GPU: embed_tokens, final norm.
     shared: HashMap<String, Tensor>,
-    /// FlameSwap for the 40 transformer layers.
-    swap: FlameSwap,
+    /// BlockOffloader for the 40 transformer layers.
+    offloader: BlockOffloader,
     config: MistralConfig,
     device: Arc<CudaDevice>,
 }
 
 impl MistralEncoder {
-    /// Load Mistral from sharded BF16 safetensors using FlameSwap.
+    /// Load Mistral from sharded BF16 safetensors using BlockOffloader.
     ///
     /// `safetensors_paths`: paths to the text_encoder shards.
     pub fn load(
@@ -116,17 +135,14 @@ impl MistralEncoder {
     ) -> Result<Self> {
         let config = MistralConfig::default();
 
-        // FlameSwap: classify keys into blocks by layer index.
+        // BlockOffloader: classify keys into blocks by layer index.
         // Keys like "language_model.model.layers.5.self_attn.q_proj.weight" → block 5.
-        let swap = FlameSwap::load(
+        let facilitator = MistralFacilitator { num_layers: config.num_layers };
+        let offloader = BlockOffloader::load(
             safetensors_paths,
-            device,
-            |name| {
-                let stripped = name.strip_prefix(KEY_PREFIX)?;
-                let rest = stripped.strip_prefix("layers.")?;
-                rest.split('.').next()?.parse().ok()
-            },
-        ).map_err(|e| flame_core::Error::InvalidInput(format!("FlameSwap load: {e}")))?;
+            &facilitator,
+            device.clone(),
+        ).map_err(|e| flame_core::Error::InvalidInput(format!("BlockOffloader load: {e}")))?;
 
         // Load shared (non-block) weights: embed_tokens and final norm.
         let shared_targets = [
@@ -157,10 +173,10 @@ impl MistralEncoder {
             }
         }
 
-        log::info!("[Mistral] Loaded: {} blocks via FlameSwap, {} shared weights",
-            swap.num_blocks(), shared.len());
+        log::info!("[Mistral] Loaded: {} blocks via BlockOffloader, {} shared weights",
+            offloader.block_count(), shared.len());
 
-        Ok(Self { shared, swap, config, device: device.clone() })
+        Ok(Self { shared, offloader, config, device: device.clone() })
     }
 
     // -----------------------------------------------------------------------
@@ -266,7 +282,7 @@ impl MistralEncoder {
     // Single transformer layer
     // -----------------------------------------------------------------------
 
-    /// Execute one Mistral decoder layer using weights from FlameSwap.
+    /// Execute one Mistral decoder layer using weights from BlockOffloader.
     ///
     /// ## PyTorch reference (standard Mistral decoder layer):
     /// ```python
@@ -398,26 +414,26 @@ impl MistralEncoder {
         )?;
         let attn_mask = Self::build_causal_mask(seq_len, real_len, &self.device)?;
 
-        // 3. Forward through 40 layers with FlameSwap, collecting extract layers
+        // 3. Forward through 40 layers with BlockOffloader, collecting extract layers
         let mut collected: Vec<(usize, Tensor)> = Vec::new();
 
-        self.swap.prefetch(0)
+        self.offloader.prefetch_block(0)
             .map_err(|e| flame_core::Error::InvalidInput(format!("prefetch: {e}")))?;
 
         for i in 0..cfg.num_layers {
             if i + 1 < cfg.num_layers {
-                self.swap.prefetch(i + 1)
+                self.offloader.prefetch_block(i + 1)
                     .map_err(|e| flame_core::Error::InvalidInput(format!("prefetch: {e}")))?;
             }
 
-            let raw_weights = self.swap.await_block(i)
+            let raw_weights = self.offloader.await_block(i)
                 .map_err(|e| flame_core::Error::InvalidInput(format!("await_block: {e}")))?;
 
-            // Strip "language_model.model." prefix from FlameSwap keys
-            let weights: HashMap<String, Tensor> = raw_weights.into_iter()
+            // Strip "language_model.model." prefix from BlockOffloader keys
+            let weights: HashMap<String, Tensor> = raw_weights.iter()
                 .map(|(k, v)| {
-                    let stripped = k.strip_prefix(KEY_PREFIX).unwrap_or(&k).to_string();
-                    (stripped, v)
+                    let stripped = k.strip_prefix(KEY_PREFIX).unwrap_or(k).to_string();
+                    (stripped, v.clone())
                 })
                 .collect();
 

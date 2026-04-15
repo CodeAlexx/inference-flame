@@ -291,13 +291,13 @@ fn run_transformer_pipeline(
         (video_context, audio_context)
     };
 
-    // --- Transformer (22B, FlameSwap streamed) ---
+    // --- Transformer (22B, BlockOffloader streamed) ---
     println!("\n--- Load Transformer ---");
     let t0 = Instant::now();
     let config = LTX2Config::default();
     let mut model = LTX2StreamingModel::load_globals(MODEL_PATH, &config)?;
-    model.init_swap()?;
-    println!("  FlameSwap ready in {:.1}s", t0.elapsed().as_secs_f32());
+    model.init_offloader()?;
+    println!("  BlockOffloader ready in {:.1}s", t0.elapsed().as_secs_f32());
 
     // --- Stage 1: half resolution, 8 distilled steps ---
     println!("\n--- Stage 1 ({} steps) ---", LTX2_DISTILLED_SIGMAS.len() - 1);
@@ -414,7 +414,7 @@ fn run_transformer_pipeline(
     println!("  Stage 2 done in {:.1}s", t0.elapsed().as_secs_f32());
 
     // Drop the transformer BEFORE returning so the caller can load VAEs
-    // without OOM — the 22B FlameSwap model holds substantial GPU memory.
+    // without OOM — the 22B BlockOffloader model holds substantial GPU memory.
     drop(model);
     let _ = device.synchronize();
 

@@ -1,4 +1,4 @@
-//! HunyuanVideo 1.5 DiT — pure Rust, flame-core + FlameSwap.
+//! HunyuanVideo 1.5 DiT — pure Rust, flame-core + BlockOffloader.
 //!
 //! Port of `HunyuanVideo_1_5_DiffusionTransformer` from the HunyuanVideo-1.5 repo.
 //!
@@ -23,10 +23,27 @@
 
 use flame_core::serialization::load_file_filtered;
 use flame_core::{CudaDevice, DType, Result, Shape, Tensor};
-use flame_swap::FlameSwap;
+use flame_diffusion::block_offload::BlockFacilitator;
+use flame_diffusion::BlockOffloader;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+
+// ---------------------------------------------------------------------------
+// BlockFacilitator for HunyuanVideo: `double_blocks.{i}.*` → block i
+// ---------------------------------------------------------------------------
+
+struct Hunyuan15Facilitator {
+    num_blocks: usize,
+}
+
+impl BlockFacilitator for Hunyuan15Facilitator {
+    fn block_count(&self) -> usize { self.num_blocks }
+    fn classify_key(&self, key: &str) -> Option<usize> {
+        let rest = key.strip_prefix("double_blocks.")?;
+        rest.split('.').next()?.parse().ok()
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Config
@@ -73,7 +90,7 @@ impl Default for Hunyuan15Config {
 
 pub struct Hunyuan15Dit {
     shared: HashMap<String, Tensor>,
-    swap: FlameSwap,
+    offloader: BlockOffloader,
     config: Hunyuan15Config,
     device: Arc<CudaDevice>,
 }
@@ -85,18 +102,13 @@ impl Hunyuan15Dit {
     ) -> Result<Self> {
         let config = Hunyuan15Config::default();
 
-        let swap = FlameSwap::load(
+        let facilitator = Hunyuan15Facilitator { num_blocks: config.num_double_blocks };
+        let offloader = BlockOffloader::load(
             &[checkpoint_path],
-            device,
-            |name| {
-                if let Some(rest) = name.strip_prefix("double_blocks.") {
-                    let idx: usize = rest.split('.').next()?.parse().ok()?;
-                    return Some(idx);
-                }
-                None
-            },
+            &facilitator,
+            device.clone(),
         )
-        .map_err(|e| flame_core::Error::InvalidInput(format!("FlameSwap HunyuanVideo: {e}")))?;
+        .map_err(|e| flame_core::Error::InvalidInput(format!("BlockOffloader HunyuanVideo: {e}")))?;
 
         // Shared weights
         let shared_prefixes = [
@@ -114,11 +126,11 @@ impl Hunyuan15Dit {
         }).collect();
 
         log::info!(
-            "[HunyuanVideo] Loaded: {} blocks via FlameSwap, {} shared weights",
-            swap.num_blocks(), shared.len()
+            "[HunyuanVideo] Loaded: {} blocks via BlockOffloader, {} shared weights",
+            offloader.block_count(), shared.len()
         );
 
-        Ok(Self { shared, swap, config, device: device.clone() })
+        Ok(Self { shared, offloader, config, device: device.clone() })
     }
 
     pub fn config(&self) -> &Hunyuan15Config { &self.config }
@@ -339,16 +351,16 @@ impl Hunyuan15Dit {
 
         // ── Double-stream blocks ──
         let total_blocks = cfg.num_double_blocks;
-        self.swap.prefetch(0)
+        self.offloader.prefetch_block(0)
             .map_err(|e| flame_core::Error::InvalidInput(format!("prefetch: {e}")))?;
 
         let mut txt_stream = txt;
 
         for i in 0..total_blocks {
-            let raw = self.swap.await_block(i)
+            let raw = self.offloader.await_block(i)
                 .map_err(|e| flame_core::Error::InvalidInput(format!("await: {e}")))?;
             if i + 1 < total_blocks {
-                self.swap.prefetch(i + 1)
+                self.offloader.prefetch_block(i + 1)
                     .map_err(|e| flame_core::Error::InvalidInput(format!("prefetch: {e}")))?;
             }
 

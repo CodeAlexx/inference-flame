@@ -1,4 +1,4 @@
-//! Chroma DiT — pure Rust, flame-core + FlameSwap.
+//! Chroma DiT — pure Rust, flame-core + BlockOffloader.
 //!
 //! Chroma is a FLUX.1-schnell derivative (8.9B params, Apache 2.0, by lodestones).
 //! Same architecture as FLUX (19 double + 38 single, dim 3072, 24 heads, head_dim
@@ -62,10 +62,37 @@
 
 use flame_core::serialization::load_file_filtered;
 use flame_core::{CudaDevice, DType, Result, Shape, Tensor};
-use flame_swap::FlameSwap;
+use flame_diffusion::block_offload::BlockFacilitator;
+use flame_diffusion::BlockOffloader;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+
+// ---------------------------------------------------------------------------
+// BlockFacilitator for Chroma:
+//   transformer_blocks.{i}        → block i
+//   single_transformer_blocks.{i} → block (num_double + i)
+// ---------------------------------------------------------------------------
+
+struct ChromaFacilitator {
+    num_double: usize,
+    total_blocks: usize,
+}
+
+impl BlockFacilitator for ChromaFacilitator {
+    fn block_count(&self) -> usize { self.total_blocks }
+    fn classify_key(&self, key: &str) -> Option<usize> {
+        if let Some(rest) = key.strip_prefix("transformer_blocks.") {
+            let idx: usize = rest.split('.').next()?.parse().ok()?;
+            return Some(idx);
+        }
+        if let Some(rest) = key.strip_prefix("single_transformer_blocks.") {
+            let idx: usize = rest.split('.').next()?.parse().ok()?;
+            return Some(self.num_double + idx);
+        }
+        None
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Config
@@ -125,12 +152,12 @@ impl ChromaConfig {
 /// Chroma DiT transformer.
 ///
 /// Double blocks (`transformer_blocks.{i}`) and single blocks
-/// (`single_transformer_blocks.{i}`) are managed by FlameSwap.
+/// (`single_transformer_blocks.{i}`) are managed by BlockOffloader.
 /// Shared weights (x_embedder, context_embedder, proj_out, distilled_guidance_layer)
 /// stay GPU-resident.
 pub struct ChromaDit {
     shared: HashMap<String, Tensor>,
-    swap: FlameSwap,
+    offloader: BlockOffloader,
     config: ChromaConfig,
     device: Arc<CudaDevice>,
 
@@ -148,26 +175,18 @@ impl ChromaDit {
     ) -> Result<Self> {
         let config = ChromaConfig::default();
         let num_double = config.num_double_blocks;
+        let total_blocks = num_double + config.num_single_blocks;
 
-        // FlameSwap classifies blocks by name:
+        // BlockOffloader classifies blocks by name:
         //   transformer_blocks.{i}        → block i
         //   single_transformer_blocks.{i} → block (num_double + i)
-        let swap = FlameSwap::load(
+        let facilitator = ChromaFacilitator { num_double, total_blocks };
+        let offloader = BlockOffloader::load(
             checkpoint_paths,
-            device,
-            |name| {
-                if let Some(rest) = name.strip_prefix("transformer_blocks.") {
-                    let idx: usize = rest.split('.').next()?.parse().ok()?;
-                    return Some(idx);
-                }
-                if let Some(rest) = name.strip_prefix("single_transformer_blocks.") {
-                    let idx: usize = rest.split('.').next()?.parse().ok()?;
-                    return Some(num_double + idx);
-                }
-                None
-            },
+            &facilitator,
+            device.clone(),
         )
-        .map_err(|e| flame_core::Error::InvalidInput(format!("FlameSwap Chroma: {e}")))?;
+        .map_err(|e| flame_core::Error::InvalidInput(format!("BlockOffloader Chroma: {e}")))?;
 
         // Shared weights (everything that's NOT inside a block).
         let shared_prefixes = [
@@ -187,8 +206,8 @@ impl ChromaDit {
         }
 
         log::info!(
-            "[Chroma] Loaded: {} blocks via FlameSwap, {} shared weights",
-            swap.num_blocks(),
+            "[Chroma] Loaded: {} blocks via BlockOffloader, {} shared weights",
+            offloader.block_count(),
             shared_weights.len()
         );
 
@@ -208,7 +227,7 @@ impl ChromaDit {
 
         Ok(Self {
             shared: shared_weights,
-            swap,
+            offloader,
             config,
             device: device.clone(),
             mod_proj_buf,
@@ -579,14 +598,14 @@ impl ChromaDit {
 
         // --- Double blocks ---
         let total_blocks = cfg.num_double_blocks + cfg.num_single_blocks;
-        self.swap.prefetch(0)
+        self.offloader.prefetch_block(0)
             .map_err(|e| flame_core::Error::InvalidInput(format!("prefetch: {e}")))?;
 
         for i in 0..cfg.num_double_blocks {
-            let raw = self.swap.await_block(i)
+            let raw = self.offloader.await_block(i)
                 .map_err(|e| flame_core::Error::InvalidInput(format!("await: {e}")))?;
             if i + 1 < total_blocks {
-                self.swap.prefetch(i + 1)
+                self.offloader.prefetch_block(i + 1)
                     .map_err(|e| flame_core::Error::InvalidInput(format!("prefetch: {e}")))?;
             }
 
@@ -611,10 +630,10 @@ impl ChromaDit {
 
         for i in 0..cfg.num_single_blocks {
             let block_idx = cfg.num_double_blocks + i;
-            let raw = self.swap.await_block(block_idx)
+            let raw = self.offloader.await_block(block_idx)
                 .map_err(|e| flame_core::Error::InvalidInput(format!("await: {e}")))?;
             if block_idx + 1 < total_blocks {
-                self.swap.prefetch(block_idx + 1)
+                self.offloader.prefetch_block(block_idx + 1)
                     .map_err(|e| flame_core::Error::InvalidInput(format!("prefetch: {e}")))?;
             }
 

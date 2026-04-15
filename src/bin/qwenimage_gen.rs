@@ -1,13 +1,13 @@
 //! Qwen-Image-2512 — Stage 2 (DiT denoise → save latents).
 //!
 //! Loads the cached cond+uncond embeddings saved by `scripts/qwenimage_encode.py`,
-//! loads the Qwen DiT (FlameSwap), runs the true-CFG Euler loop, and saves the
+//! loads the Qwen DiT (BlockOffloader), runs the true-CFG Euler loop, and saves the
 //! final packed latent to a safetensors file. Does NOT decode. Stage 3
 //! (`scripts/qwenimage_decode.py`) handles VAE decode + PNG.
 //!
 //! ## Pipeline split (OOM-safe: one model resident at a time)
 //!   Stage 1 (Python): Qwen2.5-VL text encoder only
-//!   Stage 2 (Rust):   Qwen-Image DiT only (FlameSwap)
+//!   Stage 2 (Rust):   Qwen-Image DiT only (BlockOffloader)
 //!   Stage 3 (Python): AutoencoderKLQwenImage only
 //!
 //! ## Scheduler — FlowMatchEulerDiscreteScheduler with dynamic exponential shift
@@ -125,9 +125,9 @@ fn main() -> anyhow::Result<()> {
     println!();
 
     // ------------------------------------------------------------------
-    // Stage B: load Qwen-Image DiT (FlameSwap)
+    // Stage B: load Qwen-Image DiT (BlockOffloader)
     // ------------------------------------------------------------------
-    println!("--- Loading Qwen-Image DiT (FlameSwap, 9 shards) ---");
+    println!("--- Loading Qwen-Image DiT (BlockOffloader, 9 shards) ---");
     let t0 = Instant::now();
     let mut dit = QwenImageDit::load(&dit_shards, &device)?;
     println!("  DiT loaded in {:.1}s", t0.elapsed().as_secs_f32());

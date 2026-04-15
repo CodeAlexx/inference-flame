@@ -13,7 +13,7 @@
 //!   - hidden_size=3072 (not 5120), 26 layers (not 40), intermediate=9216 (not 32768)
 //!   - YaRN RoPE (factor=16, original_max_pos=16384) instead of standard RoPE
 //!   - Returns hidden_states[-2] (single tensor) instead of stacking 3 layers
-//!   - No FlameSwap needed — 7.2GB fits in 24GB VRAM
+//!   - No BlockOffloader needed — 7.2GB fits in 24GB VRAM
 //!   - Skips vision_tower.* and multi_modal_projector.* keys during loading
 //!
 //! Weight prefix: `language_model.model.` (stripped on load).

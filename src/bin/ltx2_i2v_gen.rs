@@ -93,9 +93,9 @@ fn main() -> anyhow::Result<()> {
     match model.load_fp8_resident() {
         Ok(()) => println!("  FP8 resident loaded in {:.1}s", t0.elapsed().as_secs_f32()),
         Err(e) => {
-            println!("  FP8 resident failed ({e}), falling back to FlameSwap");
-            model.init_swap()?;
-            println!("  FlameSwap initialized in {:.1}s", t0.elapsed().as_secs_f32());
+            println!("  FP8 resident failed ({e}), falling back to BlockOffloader");
+            model.init_offloader()?;
+            println!("  BlockOffloader initialized in {:.1}s", t0.elapsed().as_secs_f32());
         }
     }
 

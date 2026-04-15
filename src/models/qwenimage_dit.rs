@@ -1,4 +1,4 @@
-//! Qwen-Image DiT — pure Rust, flame-core + FlameSwap.
+//! Qwen-Image DiT — pure Rust, flame-core + BlockOffloader.
 //!
 //! Port of `QwenImageTransformer2DModel` from diffusers
 //! (`src/diffusers/models/transformers/transformer_qwenimage.py`).
@@ -67,10 +67,27 @@
 
 use flame_core::serialization::load_file_filtered;
 use flame_core::{CudaDevice, DType, Result, Shape, Tensor};
-use flame_swap::FlameSwap;
+use flame_diffusion::block_offload::BlockFacilitator;
+use flame_diffusion::BlockOffloader;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+
+// ---------------------------------------------------------------------------
+// BlockFacilitator for Qwen-Image: `transformer_blocks.{i}.*` → block i
+// ---------------------------------------------------------------------------
+
+struct QwenImageFacilitator {
+    num_blocks: usize,
+}
+
+impl BlockFacilitator for QwenImageFacilitator {
+    fn block_count(&self) -> usize { self.num_blocks }
+    fn classify_key(&self, key: &str) -> Option<usize> {
+        let rest = key.strip_prefix("transformer_blocks.")?;
+        rest.split('.').next()?.parse().ok()
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Config
@@ -119,7 +136,7 @@ impl Default for QwenImageConfig {
 
 pub struct QwenImageDit {
     shared: HashMap<String, Tensor>,
-    swap: FlameSwap,
+    offloader: BlockOffloader,
     config: QwenImageConfig,
     device: Arc<CudaDevice>,
 }
@@ -132,19 +149,14 @@ impl QwenImageDit {
     ) -> Result<Self> {
         let config = QwenImageConfig::default();
 
-        // FlameSwap classifies blocks by the `transformer_blocks.{i}` prefix.
-        let swap = FlameSwap::load(
+        // BlockOffloader classifies blocks by the `transformer_blocks.{i}` prefix.
+        let facilitator = QwenImageFacilitator { num_blocks: config.num_layers };
+        let offloader = BlockOffloader::load(
             checkpoint_paths,
-            device,
-            |name| {
-                if let Some(rest) = name.strip_prefix("transformer_blocks.") {
-                    let idx: usize = rest.split('.').next()?.parse().ok()?;
-                    return Some(idx);
-                }
-                None
-            },
+            &facilitator,
+            device.clone(),
         )
-        .map_err(|e| flame_core::Error::InvalidInput(format!("FlameSwap QwenImage: {e}")))?;
+        .map_err(|e| flame_core::Error::InvalidInput(format!("BlockOffloader QwenImage: {e}")))?;
 
         // Shared weights: everything that's not in a transformer block.
         let shared_prefixes = [
@@ -166,14 +178,14 @@ impl QwenImageDit {
         }
 
         log::info!(
-            "[QwenImage] Loaded: {} blocks via FlameSwap, {} shared weights",
-            swap.num_blocks(),
+            "[QwenImage] Loaded: {} blocks via BlockOffloader, {} shared weights",
+            offloader.block_count(),
             shared_weights.len()
         );
 
         Ok(Self {
             shared: shared_weights,
-            swap,
+            offloader,
             config,
             device: device.clone(),
         })
@@ -575,14 +587,14 @@ impl QwenImageDit {
 
         // ── Transformer blocks ──
         let total_blocks = cfg.num_layers;
-        self.swap.prefetch(0)
+        self.offloader.prefetch_block(0)
             .map_err(|e| flame_core::Error::InvalidInput(format!("prefetch: {e}")))?;
 
         for i in 0..total_blocks {
-            let raw = self.swap.await_block(i)
+            let raw = self.offloader.await_block(i)
                 .map_err(|e| flame_core::Error::InvalidInput(format!("await: {e}")))?;
             if i + 1 < total_blocks {
-                self.swap.prefetch(i + 1)
+                self.offloader.prefetch_block(i + 1)
                     .map_err(|e| flame_core::Error::InvalidInput(format!("prefetch: {e}")))?;
             }
 
@@ -703,14 +715,14 @@ impl QwenImageDit {
 
         // ── Transformer blocks (same as T2I forward) ──
         let total_blocks = cfg.num_layers;
-        self.swap.prefetch(0)
+        self.offloader.prefetch_block(0)
             .map_err(|e| flame_core::Error::InvalidInput(format!("prefetch: {e}")))?;
 
         for i in 0..total_blocks {
-            let raw = self.swap.await_block(i)
+            let raw = self.offloader.await_block(i)
                 .map_err(|e| flame_core::Error::InvalidInput(format!("await: {e}")))?;
             if i + 1 < total_blocks {
-                self.swap.prefetch(i + 1)
+                self.offloader.prefetch_block(i + 1)
                     .map_err(|e| flame_core::Error::InvalidInput(format!("prefetch: {e}")))?;
             }
 

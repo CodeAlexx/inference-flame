@@ -1,4 +1,4 @@
-//! Kandinsky-5 DiffusionTransformer3D — pure Rust, flame-core + FlameSwap.
+//! Kandinsky-5 DiffusionTransformer3D — pure Rust, flame-core + BlockOffloader.
 //!
 //! Port of `kandinsky/models/dit.py` + `kandinsky/models/nn.py` from the
 //! Kandinsky-5 repo to Rust for the inference-flame project.
@@ -22,8 +22,8 @@
 //! 4. Run 32 decoder blocks (self-attn + cross-attn to text + FFN)
 //! 5. Unflatten visual, OutLayer (modulate + Linear + unpatch)
 //!
-//! ## FlameSwap layout
-//! Only the 32 visual decoder blocks are swapped. The 2 text encoder blocks (small)
+//! ## BlockOffloader layout
+//! Only the 32 visual decoder blocks are offloaded. The 2 text encoder blocks (small)
 //! and all embedding/output weights stay GPU-resident in `shared`.
 //!
 //! ## Weight key format
@@ -58,10 +58,27 @@
 
 use flame_core::serialization::load_file_filtered;
 use flame_core::{CudaDevice, DType, Result, Shape, Tensor};
-use flame_swap::FlameSwap;
+use flame_diffusion::block_offload::BlockFacilitator;
+use flame_diffusion::BlockOffloader;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+
+// ---------------------------------------------------------------------------
+// BlockFacilitator for Kandinsky-5: `visual_transformer_blocks.{i}.*` → block i
+// ---------------------------------------------------------------------------
+
+struct Kandinsky5Facilitator {
+    num_visual_blocks: usize,
+}
+
+impl BlockFacilitator for Kandinsky5Facilitator {
+    fn block_count(&self) -> usize { self.num_visual_blocks }
+    fn classify_key(&self, key: &str) -> Option<usize> {
+        let rest = key.strip_prefix("visual_transformer_blocks.")?;
+        rest.split('.').next()?.parse().ok()
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Config
@@ -129,11 +146,11 @@ impl Default for Kandinsky5Config {
 /// Kandinsky-5 DiffusionTransformer3D.
 ///
 /// Visual decoder blocks (`visual_transformer_blocks.{i}`) are managed by
-/// FlameSwap for GPU memory efficiency. Text encoder blocks (only 2) and all
+/// BlockOffloader for GPU memory efficiency. Text encoder blocks (only 2) and all
 /// embedding/output weights stay GPU-resident in `shared`.
 pub struct Kandinsky5DiT {
     shared: HashMap<String, Tensor>,
-    swap: FlameSwap,
+    offloader: BlockOffloader,
     config: Kandinsky5Config,
     device: Arc<CudaDevice>,
 }
@@ -146,19 +163,14 @@ impl Kandinsky5DiT {
     ) -> Result<Self> {
         let config = Kandinsky5Config::default();
 
-        // FlameSwap manages the 32 visual decoder blocks.
-        let swap = FlameSwap::load(
+        // BlockOffloader manages the 32 visual decoder blocks.
+        let facilitator = Kandinsky5Facilitator { num_visual_blocks: config.num_visual_blocks };
+        let offloader = BlockOffloader::load(
             checkpoint_paths,
-            device,
-            |name| {
-                if let Some(rest) = name.strip_prefix("visual_transformer_blocks.") {
-                    let idx: usize = rest.split('.').next()?.parse().ok()?;
-                    return Some(idx);
-                }
-                None
-            },
+            &facilitator,
+            device.clone(),
         )
-        .map_err(|e| flame_core::Error::InvalidInput(format!("FlameSwap Kandinsky5: {e}")))?;
+        .map_err(|e| flame_core::Error::InvalidInput(format!("BlockOffloader Kandinsky5: {e}")))?;
 
         // Shared weights: everything NOT inside visual_transformer_blocks.
         let shared_prefixes = [
@@ -187,8 +199,8 @@ impl Kandinsky5DiT {
         }
 
         log::info!(
-            "[Kandinsky5] Loaded: {} visual blocks via FlameSwap, {} shared weights",
-            swap.num_blocks(),
+            "[Kandinsky5] Loaded: {} visual blocks via BlockOffloader, {} shared weights",
+            offloader.block_count(),
             shared.len()
         );
         log::info!(
@@ -199,7 +211,7 @@ impl Kandinsky5DiT {
 
         Ok(Self {
             shared,
-            swap,
+            offloader,
             config,
             device: device.clone(),
         })
@@ -1079,20 +1091,20 @@ impl Kandinsky5DiT {
         let n_patches = d_out * h_out * w_out;
         let mut visual_flat = visual_embed.reshape(&[1, n_patches, cfg.model_dim])?;
 
-        // ── 4. Visual decoder blocks (FlameSwap) ──
+        // ── 4. Visual decoder blocks (BlockOffloader) ──
         let total_blocks = cfg.num_visual_blocks;
-        self.swap
-            .prefetch(0)
+        self.offloader
+            .prefetch_block(0)
             .map_err(|e| flame_core::Error::InvalidInput(format!("prefetch: {e}")))?;
 
         for i in 0..total_blocks {
             let raw = self
-                .swap
+                .offloader
                 .await_block(i)
                 .map_err(|e| flame_core::Error::InvalidInput(format!("await: {e}")))?;
             if i + 1 < total_blocks {
-                self.swap
-                    .prefetch(i + 1)
+                self.offloader
+                    .prefetch_block(i + 1)
                     .map_err(|e| flame_core::Error::InvalidInput(format!("prefetch: {e}")))?;
             }
 

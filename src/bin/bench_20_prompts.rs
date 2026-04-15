@@ -37,7 +37,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Loaded {} prompts\n", prompts.len());
 
     // --- 3. Load encoder ---
-    println!("Loading Gemma-3 via FlameSwap...");
+    println!("Loading Gemma-3 via BlockOffloader...");
     let t_load = Instant::now();
     let shard_refs: Vec<&str> = shards.iter().map(|s| s.as_str()).collect();
     // Use max seq len from token files (all are 256)

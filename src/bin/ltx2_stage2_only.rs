@@ -109,7 +109,7 @@ fn main() -> anyhow::Result<()> {
     let t0 = Instant::now();
     let config = LTX2Config::default();
     let mut model = LTX2StreamingModel::load_globals(MODEL_PATH, &config)?;
-    model.init_swap()?;
+    model.init_offloader()?;
     println!("  Loaded in {:.1}s", t0.elapsed().as_secs_f32());
 
     // --- Stage 2 noise injection ---

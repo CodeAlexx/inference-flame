@@ -1,4 +1,4 @@
-//! FLUX 1 Dev/Schnell DiT transformer — pure flame-core with FlameSwap.
+//! FLUX 1 Dev/Schnell DiT transformer — pure flame-core with BlockOffloader.
 //!
 //! 12B parameter model: 19 double blocks + 38 single blocks.
 //!
@@ -36,10 +36,37 @@
 
 use flame_core::serialization::load_file_filtered;
 use flame_core::{CudaDevice, DType, Result, Shape, Tensor};
-use flame_swap::FlameSwap;
+use flame_diffusion::block_offload::BlockFacilitator;
+use flame_diffusion::BlockOffloader;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+
+// ---------------------------------------------------------------------------
+// BlockFacilitator for FLUX 1:
+//   double_blocks.{i} → block i
+//   single_blocks.{i} → block (num_double + i)
+// ---------------------------------------------------------------------------
+
+struct Flux1Facilitator {
+    num_double: usize,
+    total_blocks: usize,
+}
+
+impl BlockFacilitator for Flux1Facilitator {
+    fn block_count(&self) -> usize { self.total_blocks }
+    fn classify_key(&self, key: &str) -> Option<usize> {
+        if let Some(rest) = key.strip_prefix("double_blocks.") {
+            let idx: usize = rest.split('.').next()?.parse().ok()?;
+            return Some(idx);
+        }
+        if let Some(rest) = key.strip_prefix("single_blocks.") {
+            let idx: usize = rest.split('.').next()?.parse().ok()?;
+            return Some(self.num_double + idx);
+        }
+        None
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Config
@@ -92,17 +119,17 @@ impl Flux1Config {
 }
 
 // ---------------------------------------------------------------------------
-// FLUX 1 DiT with FlameSwap
+// FLUX 1 DiT with BlockOffloader
 // ---------------------------------------------------------------------------
 
 /// FLUX 1 Dev/Schnell DiT transformer.
 ///
-/// Double blocks (0..18) and single blocks (0..37) are managed by two
-/// separate FlameSwap instances (or combined into one with offset indexing).
+/// Double blocks (0..18) and single blocks (0..37) are managed by
+/// BlockOffloader with offset indexing.
 /// Shared weights (projections, embeddings, final_layer) stay on GPU.
 pub struct Flux1DiT {
     shared: HashMap<String, Tensor>,
-    swap: FlameSwap,
+    offloader: BlockOffloader,
     config: Flux1Config,
     device: Arc<CudaDevice>,
 }
@@ -116,25 +143,17 @@ impl Flux1DiT {
         // H3 fix: default config will be patched after we see shared weight keys.
         let mut config = Flux1Config::dev();
 
-        // FlameSwap: classify blocks.
+        // BlockOffloader: classify blocks.
         // double_blocks.N → block N
         // single_blocks.N → block (num_double + N)
         let num_double = config.num_double_blocks;
-        let swap = FlameSwap::load(
+        let total_blocks = num_double + config.num_single_blocks;
+        let facilitator = Flux1Facilitator { num_double, total_blocks };
+        let offloader = BlockOffloader::load(
             &[checkpoint_path],
-            device,
-            |name| {
-                if let Some(rest) = name.strip_prefix("double_blocks.") {
-                    let idx: usize = rest.split('.').next()?.parse().ok()?;
-                    return Some(idx);
-                }
-                if let Some(rest) = name.strip_prefix("single_blocks.") {
-                    let idx: usize = rest.split('.').next()?.parse().ok()?;
-                    return Some(num_double + idx);
-                }
-                None
-            },
-        ).map_err(|e| flame_core::Error::InvalidInput(format!("FlameSwap Flux1: {e}")))?;
+            &facilitator,
+            device.clone(),
+        ).map_err(|e| flame_core::Error::InvalidInput(format!("BlockOffloader Flux1: {e}")))?;
 
         // Load shared (non-block) weights
         let shared_prefixes = [
@@ -155,8 +174,8 @@ impl Flux1DiT {
         config.has_guidance = shared_weights.contains_key("guidance_in.in_layer.weight");
         log::info!("[Flux1] has_guidance (autodetected) = {}", config.has_guidance);
 
-        log::info!("[Flux1] Loaded: {} blocks via FlameSwap, {} shared weights",
-            swap.num_blocks(), shared_weights.len());
+        log::info!("[Flux1] Loaded: {} blocks via BlockOffloader, {} shared weights",
+            offloader.block_count(), shared_weights.len());
 
         // Log shared weight keys
         for key in shared_weights.keys() {
@@ -165,7 +184,7 @@ impl Flux1DiT {
 
         Ok(Self {
             shared: shared_weights,
-            swap,
+            offloader,
             config,
             device: device.clone(),
         })
@@ -495,7 +514,7 @@ impl Flux1DiT {
         let mut total_compute_ms: u128 = 0;
         let mut total_prefetch_ms: u128 = 0;
         let t_pf0 = std::time::Instant::now();
-        self.swap.prefetch(0)
+        self.offloader.prefetch_block(0)
             .map_err(|e| flame_core::Error::InvalidInput(format!("prefetch: {e}")))?;
         if profile {
             total_prefetch_ms += t_pf0.elapsed().as_millis();
@@ -503,14 +522,14 @@ impl Flux1DiT {
 
         for i in 0..cfg.num_double_blocks {
             let t_aw = std::time::Instant::now();
-            let raw = self.swap.await_block(i)
+            let raw = self.offloader.await_block(i)
                 .map_err(|e| flame_core::Error::InvalidInput(format!("await: {e}")))?;
             let aw_ms = t_aw.elapsed().as_millis();
             total_await_ms += aw_ms;
 
             let t_pf = std::time::Instant::now();
             if i + 1 < total_blocks {
-                self.swap.prefetch(i + 1)
+                self.offloader.prefetch_block(i + 1)
                     .map_err(|e| flame_core::Error::InvalidInput(format!("prefetch: {e}")))?;
             }
             let pf_ms = t_pf.elapsed().as_millis();
@@ -522,7 +541,7 @@ impl Flux1DiT {
             )?;
             // Sync ONLY when profiling so the per-block timer is accurate.
             // Outside profiling we want consecutive blocks to dispatch and
-            // overlap with FlameSwap H2D streaming, not serialize on a sync.
+            // overlap with BlockOffloader H2D streaming, not serialize on a sync.
             if profile {
                 let _ = self.device.synchronize();
             }
@@ -547,14 +566,14 @@ impl Flux1DiT {
             let block_idx = cfg.num_double_blocks + i;
 
             let t_aw = std::time::Instant::now();
-            let raw = self.swap.await_block(block_idx)
+            let raw = self.offloader.await_block(block_idx)
                 .map_err(|e| flame_core::Error::InvalidInput(format!("await: {e}")))?;
             let aw_ms = t_aw.elapsed().as_millis();
             total_await_ms += aw_ms;
 
             let t_pf = std::time::Instant::now();
             if block_idx + 1 < total_blocks {
-                self.swap.prefetch(block_idx + 1)
+                self.offloader.prefetch_block(block_idx + 1)
                     .map_err(|e| flame_core::Error::InvalidInput(format!("prefetch: {e}")))?;
             }
             let pf_ms = t_pf.elapsed().as_millis();

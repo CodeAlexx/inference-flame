@@ -1,4 +1,4 @@
-//! Wan2.2 DiT — pure Rust, flame-core + FlameSwap.
+//! Wan2.2 DiT — pure Rust, flame-core + BlockOffloader.
 //!
 //! Port of `WanModel` from `wan/modules/model.py` in the Wan2.2 repo.
 //!
@@ -44,10 +44,27 @@
 
 use flame_core::serialization::load_file_filtered;
 use flame_core::{CudaDevice, DType, Result, Shape, Tensor};
-use flame_swap::FlameSwap;
+use flame_diffusion::block_offload::BlockFacilitator;
+use flame_diffusion::BlockOffloader;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+
+// ---------------------------------------------------------------------------
+// BlockFacilitator for Wan2.2: `blocks.{i}.*` → block i
+// ---------------------------------------------------------------------------
+
+struct Wan22Facilitator {
+    num_blocks: usize,
+}
+
+impl BlockFacilitator for Wan22Facilitator {
+    fn block_count(&self) -> usize { self.num_blocks }
+    fn classify_key(&self, key: &str) -> Option<usize> {
+        let rest = key.strip_prefix("blocks.")?;
+        rest.split('.').next()?.parse().ok()
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Config
@@ -96,7 +113,7 @@ impl Default for Wan22Config {
 
 pub struct Wan22Dit {
     shared: HashMap<String, Tensor>,
-    swap: Option<FlameSwap>,
+    offloader: Option<BlockOffloader>,
     config: Wan22Config,
     device: Arc<CudaDevice>,
     /// Precomputed complex RoPE frequencies [1024, head_dim/2] as complex pairs.
@@ -125,20 +142,14 @@ impl Wan22Dit {
         config: Wan22Config,
         device: &Arc<CudaDevice>,
     ) -> Result<Self> {
-        // FlameSwap classifies blocks by the `blocks.{i}` prefix.
-        // FlameSwap::load already accepts multiple shards.
-        let swap = FlameSwap::load(
+        // BlockOffloader classifies blocks by the `blocks.{i}` prefix.
+        let facilitator = Wan22Facilitator { num_blocks: config.num_layers };
+        let offloader = BlockOffloader::load(
             checkpoint_paths,
-            device,
-            |name| {
-                if let Some(rest) = name.strip_prefix("blocks.") {
-                    let idx: usize = rest.split('.').next()?.parse().ok()?;
-                    return Some(idx);
-                }
-                None
-            },
+            &facilitator,
+            device.clone(),
         )
-        .map_err(|e| flame_core::Error::InvalidInput(format!("FlameSwap Wan22: {e}")))?;
+        .map_err(|e| flame_core::Error::InvalidInput(format!("BlockOffloader Wan22: {e}")))?;
 
         // Shared weights: everything not in a block.
         let shared_prefixes = [
@@ -167,8 +178,8 @@ impl Wan22Dit {
         }).collect();
 
         log::info!(
-            "[Wan22] Loaded: {} blocks via FlameSwap, {} shared weights",
-            swap.num_blocks(),
+            "[Wan22] Loaded: {} blocks via BlockOffloader, {} shared weights",
+            offloader.block_count(),
             shared.len()
         );
 
@@ -200,7 +211,7 @@ impl Wan22Dit {
 
         Ok(Self {
             shared,
-            swap: Some(swap),
+            offloader: Some(offloader),
             config,
             device: device.clone(),
             rope_freqs_cos: rope_cos,
@@ -209,8 +220,8 @@ impl Wan22Dit {
         })
     }
 
-    /// Load shared weights only — no FlameSwap, no block weights on GPU.
-    /// For training paths that use BlockOffloader for block management.
+    /// Load shared weights only — no offloader, no block weights on GPU.
+    /// For training paths that use their own BlockOffloader for block management.
     pub fn load_shared_only(
         checkpoint_paths: &[&str],
         config: Wan22Config,
@@ -230,7 +241,7 @@ impl Wan22Dit {
                 shared.insert(k, v_bf16);
             }
         }
-        log::info!("[Wan22] Loaded shared-only: {} weights, no FlameSwap", shared.len());
+        log::info!("[Wan22] Loaded shared-only: {} weights, no offloader", shared.len());
 
         let d = config.head_dim;
         let d6 = d / 6;
@@ -257,7 +268,7 @@ impl Wan22Dit {
 
         Ok(Self {
             shared,
-            swap: None,
+            offloader: None,
             config,
             device: device.clone(),
             rope_freqs_cos: rope_cos,
@@ -541,22 +552,22 @@ impl Wan22Dit {
 
         // ── Transformer blocks ──
         let total_blocks = cfg.num_layers;
-        self.swap.as_mut().expect("forward requires FlameSwap")
-            .prefetch(0)
+        self.offloader.as_mut().expect("forward requires BlockOffloader")
+            .prefetch_block(0)
             .map_err(|e| flame_core::Error::InvalidInput(format!("prefetch: {e}")))?;
 
         let seq_lens_val = n_patches;
 
         for i in 0..total_blocks {
-            let raw = self.swap.as_mut().unwrap().await_block(i)
+            let weights = self.offloader.as_mut().unwrap().await_block(i)
                 .map_err(|e| flame_core::Error::InvalidInput(format!("await: {e}")))?;
             if i + 1 < total_blocks {
-                self.swap.as_mut().unwrap().prefetch(i + 1)
+                self.offloader.as_mut().unwrap().prefetch_block(i + 1)
                     .map_err(|e| flame_core::Error::InvalidInput(format!("prefetch: {e}")))?;
             }
 
             img = self.block_forward(
-                &img, &e0, &e, &txt, seq_lens_val, grid_sizes, &raw, i,
+                &img, &e0, &e, &txt, seq_lens_val, grid_sizes, &weights, i,
             )?;
 
             if i % 10 == 0 || i == total_blocks - 1 {
@@ -1034,16 +1045,16 @@ impl Wan22Dit {
         self.block_forward_with_prefix(x, e0, e, context, seq_len_actual, grid_sizes, weights, block_idx, prefix_base)
     }
 
-    /// FlameSwap accessors for VACE and 5B resident init.
-    /// Panics if called when swap is None (shared-only mode).
+    /// BlockOffloader accessors for VACE and 5B resident init.
+    /// Panics if called when offloader is None (shared-only mode).
     pub fn swap_prefetch(&mut self, idx: usize) -> Result<()> {
-        self.swap.as_mut().expect("swap_prefetch: no FlameSwap (shared-only mode)")
-            .prefetch(idx)
+        self.offloader.as_mut().expect("swap_prefetch: no BlockOffloader (shared-only mode)")
+            .prefetch_block(idx)
             .map_err(|e| flame_core::Error::InvalidInput(format!("prefetch: {e}")))
     }
 
-    pub fn swap_await(&mut self, idx: usize) -> Result<HashMap<String, Tensor>> {
-        self.swap.as_mut().expect("swap_await: no FlameSwap (shared-only mode)")
+    pub fn swap_await(&mut self, idx: usize) -> Result<Arc<HashMap<String, Tensor>>> {
+        self.offloader.as_mut().expect("swap_await: no BlockOffloader (shared-only mode)")
             .await_block(idx)
             .map_err(|e| flame_core::Error::InvalidInput(format!("await: {e}")))
     }

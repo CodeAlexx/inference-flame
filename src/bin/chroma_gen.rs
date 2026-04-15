@@ -1,7 +1,7 @@
 //! Chroma — Stage 2: DiT denoise + VAE decode + PNG.
 //!
 //! Loads pre-cached T5 embeddings (produced by `chroma_encode`), the Chroma
-//! DiT (FlameSwap), and the VAE. Runs the CFG denoise loop and saves a PNG.
+//! DiT (BlockOffloader), and the VAE. Runs the CFG denoise loop and saves a PNG.
 //! T5 is NEVER loaded in this binary so we never have T5 + DiT in VRAM at the
 //! same time.
 //!
@@ -115,9 +115,9 @@ fn main() -> anyhow::Result<()> {
     println!();
 
     // ------------------------------------------------------------------
-    // Stage B: Load Chroma DiT (FlameSwap)
+    // Stage B: Load Chroma DiT (BlockOffloader)
     // ------------------------------------------------------------------
-    println!("--- Loading Chroma DiT (FlameSwap) ---");
+    println!("--- Loading Chroma DiT (BlockOffloader) ---");
     let t0 = Instant::now();
     let mut dit = ChromaDit::load(&dit_shards, &device)?;
     println!("  DiT loaded in {:.1}s", t0.elapsed().as_secs_f32());
@@ -235,7 +235,7 @@ fn main() -> anyhow::Result<()> {
     );
     println!();
 
-    // Drop DiT before VAE load (DiT FlameSwap holds ~17 GB worth of weights).
+    // Drop DiT before VAE load (DiT BlockOffloader holds ~17 GB worth of weights).
     drop(dit);
     drop(t5_batched);
     println!("  DiT + cached embeddings evicted");

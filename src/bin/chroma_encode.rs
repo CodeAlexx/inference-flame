@@ -90,7 +90,7 @@ fn main() -> anyhow::Result<()> {
     println!("  uncond hidden: {:?} in {:.1}s",
         uncond_hidden.shape().dims(), t0.elapsed().as_secs_f32());
 
-    // Drop T5 explicitly so the FlameSwap-backed weights free before save.
+    // Drop T5 explicitly so the BlockOffloader-backed weights free before save.
     drop(t5);
     println!("  T5 weights evicted");
     println!();

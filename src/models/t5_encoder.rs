@@ -26,7 +26,6 @@
 use flame_core::attention::sdpa_with_bias as flame_sdpa_with_bias;
 use flame_core::serialization::load_file_filtered;
 use flame_core::{CudaDevice, DType, Result, Shape, Tensor};
-use flame_swap::FlameSwap;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -67,17 +66,14 @@ impl Default for T5Config {
 }
 
 // ---------------------------------------------------------------------------
-// T5 Encoder with FlameSwap
+// T5 Encoder (resident)
 // ---------------------------------------------------------------------------
 
 /// T5-XXL encoder. Loads all 220 weights resident on GPU as BF16 (~9.7GB).
 ///
-/// **Note:** FlameSwap was originally planned for the 24 transformer layers,
-/// but `flame-swap`'s safetensors parser only handles `BF16/F32/F8_E4M3` and
-/// silently skips `F16` tensors (`swap.rs:630 _ => continue`). The shipping
-/// `t5xxl_fp16.safetensors` is FP16, so swap loaded 0 blocks. T5-XXL fits on
-/// a 24GB card (~9.7GB BF16) before the DiT loads, and we drop it before the
-/// DiT swap is constructed in `flux1_infer`, so resident loading is safe.
+/// T5-XXL fits on a 24GB card (~9.7GB BF16) before the DiT loads, and we
+/// drop it before the DiT BlockOffloader is constructed, so resident loading
+/// is safe. No block offloading needed.
 pub struct T5Encoder {
     weights: HashMap<String, Tensor>,
     config: T5Config,

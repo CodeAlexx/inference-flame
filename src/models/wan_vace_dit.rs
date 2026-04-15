@@ -1,4 +1,4 @@
-//! Wan2.1-VACE-14B DiT — pure Rust, flame-core + FlameSwap.
+//! Wan2.1-VACE-14B DiT — pure Rust, flame-core + BlockOffloader.
 //!
 //! Port of `VaceWanModel` from VACE repo (`vace/models/wan/modules/model.py`).
 //!
@@ -28,10 +28,27 @@
 
 use flame_core::serialization::load_file_filtered;
 use flame_core::{CudaDevice, DType, Result, Shape, Tensor};
-use flame_swap::FlameSwap;
+use flame_diffusion::block_offload::BlockFacilitator;
+use flame_diffusion::BlockOffloader;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+
+// ---------------------------------------------------------------------------
+// BlockFacilitator for VACE blocks: `vace_blocks.{i}.*` → block i
+// ---------------------------------------------------------------------------
+
+struct VaceFacilitator {
+    num_blocks: usize,
+}
+
+impl BlockFacilitator for VaceFacilitator {
+    fn block_count(&self) -> usize { self.num_blocks }
+    fn classify_key(&self, key: &str) -> Option<usize> {
+        let rest = key.strip_prefix("vace_blocks.")?;
+        rest.split('.').next()?.parse().ok()
+    }
+}
 
 use crate::models::wan22_dit::{Wan22Config, Wan22Dit};
 
@@ -41,8 +58,8 @@ const VACE_LAYERS: [usize; 8] = [0, 2, 4, 6, 8, 10, 12, 14];
 pub struct WanVaceDit {
     /// The base Wan DiT (handles blocks, shared weights, RoPE, patchify/unpatchify)
     base: Wan22Dit,
-    /// FlameSwap for the 8 VACE conditioning blocks
-    vace_swap: FlameSwap,
+    /// BlockOffloader for the 8 VACE conditioning blocks
+    vace_offloader: BlockOffloader,
     /// VACE-specific shared weights
     vace_shared: HashMap<String, Tensor>,
     device: Arc<CudaDevice>,
@@ -56,19 +73,14 @@ impl WanVaceDit {
         // Load base DiT (handles blocks.{0-39} + shared weights)
         let base = Wan22Dit::load(checkpoint_path, device)?;
 
-        // Load VACE blocks via separate FlameSwap
-        let vace_swap = FlameSwap::load(
+        // Load VACE blocks via separate BlockOffloader
+        let vace_facilitator = VaceFacilitator { num_blocks: 8 };
+        let vace_offloader = BlockOffloader::load(
             &[checkpoint_path],
-            device,
-            |name| {
-                if let Some(rest) = name.strip_prefix("vace_blocks.") {
-                    let idx: usize = rest.split('.').next()?.parse().ok()?;
-                    return Some(idx);
-                }
-                None
-            },
+            &vace_facilitator,
+            device.clone(),
         )
-        .map_err(|e| flame_core::Error::InvalidInput(format!("FlameSwap VACE: {e}")))?;
+        .map_err(|e| flame_core::Error::InvalidInput(format!("BlockOffloader VACE: {e}")))?;
 
         // VACE shared weights
         let vace_prefixes = ["vace_patch_embedding."];
@@ -84,13 +96,13 @@ impl WanVaceDit {
 
         log::info!(
             "[VACE] Loaded: {} VACE blocks, {} VACE shared weights",
-            vace_swap.num_blocks(),
+            vace_offloader.block_count(),
             vace_shared.len()
         );
 
         Ok(Self {
             base,
-            vace_swap,
+            vace_offloader,
             vace_shared,
             device: device.clone(),
         })
@@ -170,19 +182,19 @@ impl WanVaceDit {
         // ── Run VACE blocks → produce hints ──
         // VACE block 0: c = before_proj(vace_emb) + img, then run block, save skip
         // VACE block i>0: c = last from stack, run block, save skip
-        let num_vace = self.vace_swap.num_blocks(); // 8
+        let num_vace = self.vace_offloader.block_count(); // 8
         let mut hints: Vec<Tensor> = Vec::with_capacity(num_vace);
 
-        self.vace_swap.prefetch(0)
+        self.vace_offloader.prefetch_block(0)
             .map_err(|e| flame_core::Error::InvalidInput(format!("vace prefetch: {e}")))?;
 
         let mut c = vace_emb; // will be overwritten in block 0
 
         for vi in 0..num_vace {
-            let vace_weights = self.vace_swap.await_block(vi)
+            let vace_weights = self.vace_offloader.await_block(vi)
                 .map_err(|e| flame_core::Error::InvalidInput(format!("vace await: {e}")))?;
             if vi + 1 < num_vace {
-                self.vace_swap.prefetch(vi + 1)
+                self.vace_offloader.prefetch_block(vi + 1)
                     .map_err(|e| flame_core::Error::InvalidInput(format!("vace prefetch: {e}")))?;
             }
 

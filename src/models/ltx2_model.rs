@@ -184,7 +184,7 @@ fn linear3d(x: &Tensor, weight: &Tensor, bias: Option<&Tensor>) -> Result<Tensor
 /// `fused_linear3d_native` which absorbs the transpose into the cuBLASLt GEMM
 /// itself, so weights stay in the native PyTorch `[Cout, Cin]` layout.
 ///
-/// This MUST stay a no-op: with FlameSwap v2 the swapper returns non-owning
+/// This MUST stay a no-op: with BlockOffloader the offloader returns non-owning
 /// views into pre-allocated GPU staging buffers, and calling `.transpose()`
 /// on each weight per block per step was burning ~6 seconds per block.
 fn pre_transpose_weight(w: &Tensor) -> Result<Tensor> {
@@ -2499,13 +2499,13 @@ pub struct LTX2StreamingModel {
     // instead of re-parsing the 43GB checkpoint for every denoise step.
     block_cache: Vec<Option<HashMap<String, Tensor>>>,
 
-    /// Async block swapper (FlameSwap). When initialized via `init_swap()`,
+    /// Async block offloader (BlockOffloader). When initialized via `init_offloader()`,
     /// replaces block_cache and load_block_from_disk with async pinned transfers.
-    pub swap: Option<flame_swap::FlameSwap>,
-    /// Detected key prefix for stripping from FlameSwap output keys.
+    pub offloader: Option<flame_diffusion::BlockOffloader>,
+    /// Detected key prefix for stripping from BlockOffloader output keys.
     pub key_prefix: String,
     /// Pre-cached F32 tensors per block (scale_shift_table etc.)
-    /// Loaded once at init_swap to avoid BF16 precision loss.
+    /// Loaded once at init_offloader to avoid BF16 precision loss.
     pub f32_cache: Vec<HashMap<String, Tensor>>,
     /// FP8-resident blocks: all weights on GPU, dequant per-block during forward.
     fp8_blocks: Vec<super::fp8_resident::ResidentBlock>,
@@ -2567,14 +2567,14 @@ impl LTX2StreamingModel {
             |key| {
                 // Only load diffusion model keys (skip VAE, vocoder, audio VAE)
                 if !key.starts_with(&prefix) {
-                    // Also load text_embedding_projection (video only)
-                    if key.starts_with("text_embedding_projection.video") {
+                    // Also load text_embedding_projection (video + audio)
+                    if key.starts_with("text_embedding_projection.") {
                         return true;
                     }
                     return false;
                 }
                 let k = key.strip_prefix(&prefix).unwrap_or(key);
-                // Skip per-block weights (loaded later by FP8 resident or FlameSwap)
+                // Skip per-block weights (loaded later by FP8 resident or BlockOffloader)
                 if k.starts_with("transformer_blocks.") { return false; }
                 // Load both video and audio globals (incl. video_embeddings_connector,
                 // audio_embeddings_connector, and text_embedding_projection.* aggregate_embed
@@ -2748,7 +2748,7 @@ impl LTX2StreamingModel {
             av_cross_attn_video_a2v_gate: av_v_gate,
             av_cross_attn_audio_v2a_gate: av_a_gate,
             block_cache: Vec::new(),
-            swap: None,
+            offloader: None,
             key_prefix: prefix,
             f32_cache: Vec::new(),
             fp8_blocks: Vec::new(),
@@ -2915,38 +2915,48 @@ impl LTX2StreamingModel {
     }
 
     /// Drop FP8 resident weights to free GPU memory.
-    /// Call before switching to FlameSwap for a higher-resolution stage.
+    /// Call before switching to BlockOffloader for a higher-resolution stage.
     pub fn drop_fp8_resident(&mut self) {
         self.fp8_blocks.clear();
         log::info!("[LTX2] FP8 resident weights dropped");
     }
 
-    /// Initialize FlameSwap for async double-buffered block streaming.
+    /// Initialize BlockOffloader for async double-buffered block streaming.
     /// Call after `load_globals()`. Replaces sync `load_block_from_disk`.
-    pub fn init_swap(&mut self) -> Result<()> {
+    pub fn init_offloader(&mut self) -> Result<()> {
         let device = flame_core::global_cuda_device();
         let t0 = std::time::Instant::now();
         let prefix = self.key_prefix.clone();
         let num_layers = self.config.num_layers;
 
-        log::info!("[LTX2] Initializing FlameSwap for {} blocks (prefix='{}')", num_layers, prefix);
+        log::info!("[LTX2] Initializing BlockOffloader for {} blocks (prefix='{}')", num_layers, prefix);
 
-        let swap = flame_swap::FlameSwap::load(
-            &[&self.checkpoint_path],
-            &device,
-            |name| {
-                let stripped = name.strip_prefix(&prefix).unwrap_or(name);
+        // LTX2 facilitator: classify `{prefix}transformer_blocks.{i}.*` → block i,
+        // but skip scale_shift_table (F32, loaded separately).
+        struct Ltx2Facilitator {
+            prefix: String,
+            num_layers: usize,
+        }
+        impl flame_diffusion::block_offload::BlockFacilitator for Ltx2Facilitator {
+            fn block_count(&self) -> usize { self.num_layers }
+            fn classify_key(&self, name: &str) -> Option<usize> {
+                let stripped = name.strip_prefix(&self.prefix).unwrap_or(name);
                 if !stripped.starts_with("transformer_blocks.") { return None; }
-                // Load ALL block weights including audio, A2V, V2A
-                // Skip scale_shift_table (F32) — loaded separately to preserve precision
                 if stripped.contains("scale_shift_table") { return None; }
                 let rest = stripped.strip_prefix("transformer_blocks.")?;
                 rest.split('.').next()?.parse().ok()
-            },
-        ).map_err(|e| flame_core::Error::Io(format!("FlameSwap load failed: {e}")))?;
+            }
+        }
 
-        log::info!("[LTX2] FlameSwap ready: {} blocks, ~{:.2}GB pinned, {:.1}s",
-            swap.num_blocks(), swap.pinned_bytes() as f64 / 1e9, t0.elapsed().as_secs_f32());
+        let facilitator = Ltx2Facilitator { prefix: prefix.clone(), num_layers };
+        let offloader = flame_diffusion::BlockOffloader::load(
+            &[&self.checkpoint_path],
+            &facilitator,
+            device.clone(),
+        ).map_err(|e| flame_core::Error::Io(format!("BlockOffloader load failed: {e}")))?;
+
+        log::info!("[LTX2] BlockOffloader ready: {} blocks, ~{:.2}GB pinned, {:.1}s",
+            offloader.block_count(), offloader.pinned_bytes() as f64 / 1e9, t0.elapsed().as_secs_f32());
 
         // Pre-cache F32 tensors (scale_shift_table etc.) — one-time load, ~1.7MB total
         log::info!("[LTX2] Caching F32 block tensors...");
@@ -2968,7 +2978,7 @@ impl LTX2StreamingModel {
         log::info!("[LTX2] F32 cache: {} blocks, {:.1}s total init",
             f32_cache.len(), t0.elapsed().as_secs_f32());
 
-        self.swap = Some(swap);
+        self.offloader = Some(offloader);
         self.f32_cache = f32_cache;
         Ok(())
     }
@@ -3553,27 +3563,27 @@ impl LTX2StreamingModel {
                         i + 1, num_layers, t_dequant, t_load - t_dequant, t_total - t_load, t_total);
                 }
             }
-        } else if self.swap.is_some() {
-            // Async path: FlameSwap prefetch/await
-            let swap = self.swap.as_mut().unwrap();
+        } else if self.offloader.is_some() {
+            // Async path: BlockOffloader prefetch/await
+            let offloader = self.offloader.as_mut().unwrap();
             let key_prefix = &self.key_prefix;
-            log::info!("[LTX2] Block streaming via FlameSwap ({} blocks)", num_layers);
+            log::info!("[LTX2] Block streaming via BlockOffloader ({} blocks)", num_layers);
 
-            swap.prefetch(0)
+            offloader.prefetch_block(0)
                 .map_err(|e| flame_core::Error::Io(format!("prefetch: {e}")))?;
             for i in 0..num_layers {
                 let t_block = std::time::Instant::now();
-                let raw_weights = swap.await_block(i)
+                let raw_weights = offloader.await_block(i)
                     .map_err(|e| flame_core::Error::Io(format!("await_block: {e}")))?;
                 if i + 1 < num_layers {
-                    swap.prefetch(i + 1)
+                    offloader.prefetch_block(i + 1)
                         .map_err(|e| flame_core::Error::Io(format!("prefetch: {e}")))?;
                 }
                 // Strip key prefix
-                let mut block_weights: HashMap<String, Tensor> = raw_weights.into_iter()
+                let mut block_weights: HashMap<String, Tensor> = raw_weights.iter()
                     .map(|(k, v)| {
-                        let stripped = k.strip_prefix(key_prefix).unwrap_or(&k).to_string();
-                        (stripped, v)
+                        let stripped = k.strip_prefix(key_prefix).unwrap_or(k).to_string();
+                        (stripped, v.clone())
                     })
                     .collect();
                 // Merge F32 tensors from cache
@@ -3585,7 +3595,7 @@ impl LTX2StreamingModel {
                     cache.len()
                 } else { 0 };
                 if i == 0 {
-                    eprintln!("[DEBUG] Block 0: {} swap + {} f32 = {} total. Has SST: {}",
+                    eprintln!("[DEBUG] Block 0: {} offloader + {} f32 = {} total. Has SST: {}",
                         block_weights.len() - n_f32, n_f32, block_weights.len(),
                         block_weights.contains_key("transformer_blocks.0.scale_shift_table"));
                 }
@@ -3919,7 +3929,7 @@ impl LTX2StreamingModel {
             log::warn!("[LTX2 AV] video prompt_timestep loaded but audio_prompt_adaln_single missing — audio CA will be unmodulated");
         }
 
-        // 8. Stream blocks (FP8 resident or FlameSwap)
+        // 8. Stream blocks (FP8 resident or BlockOffloader)
         let num_layers = self.config.num_layers;
         let config_clone = self.config.clone();
 
@@ -3996,30 +4006,30 @@ impl LTX2StreamingModel {
                         i + 1, num_layers, t_block.elapsed().as_millis());
                 }
             }
-        } else if self.swap.is_some() {
-            // FlameSwap path
-            let swap = self.swap.as_mut().unwrap();
+        } else if self.offloader.is_some() {
+            // BlockOffloader path
+            let offloader = self.offloader.as_mut().unwrap();
             let key_prefix = &self.key_prefix;
-            log::info!("[LTX2] AV FlameSwap forward ({} blocks)", num_layers);
+            log::info!("[LTX2] AV BlockOffloader forward ({} blocks)", num_layers);
 
-            swap.prefetch(0)
+            offloader.prefetch_block(0)
                 .map_err(|e| flame_core::Error::Io(format!("prefetch: {e}")))?;
             let prof = std::env::var("LTX2_BLOCK_PROF").is_ok();
             for i in 0..num_layers {
                 let t_block = std::time::Instant::now();
-                let raw_weights = swap.await_block(i)
+                let raw_weights = offloader.await_block(i)
                     .map_err(|e| flame_core::Error::Io(format!("await_block: {e}")))?;
                 if prof { let _ = device.synchronize(); }
                 let t_after_await = t_block.elapsed().as_millis();
 
                 if i + 1 < num_layers {
-                    swap.prefetch(i + 1)
+                    offloader.prefetch_block(i + 1)
                         .map_err(|e| flame_core::Error::Io(format!("prefetch: {e}")))?;
                 }
-                let mut block_weights: HashMap<String, Tensor> = raw_weights.into_iter()
+                let mut block_weights: HashMap<String, Tensor> = raw_weights.iter()
                     .map(|(k, v)| {
-                        let stripped = k.strip_prefix(key_prefix).unwrap_or(&k).to_string();
-                        (stripped, v)
+                        let stripped = k.strip_prefix(key_prefix).unwrap_or(k).to_string();
+                        (stripped, v.clone())
                     })
                     .collect();
                 // Merge F32 tensors from cache
@@ -4149,7 +4159,7 @@ impl LTX2StreamingModel {
             }
         } else {
             return Err(flame_core::Error::InvalidInput(
-                "forward_audio_video requires FP8 resident or FlameSwap".into()));
+                "forward_audio_video requires FP8 resident or BlockOffloader".into()));
         }
 
         // 9. Video output

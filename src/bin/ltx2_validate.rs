@@ -1,7 +1,7 @@
 //! Block-by-block validation of Rust LTX-2 against PyTorch reference dumps.
 //!
 //! Loads reference inputs from /home/alex/ltx2-refs/, runs each block via
-//! FlameSwap, and compares outputs against reference.
+//! BlockOffloader, and compares outputs against reference.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -35,23 +35,31 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     println!("  x: {:?}, context: {:?}, timestep: {:?}",
         initial.shape().dims(), context.shape().dims(), timestep.shape().dims());
 
-    // Initialize FlameSwap
-    println!("\nInitializing FlameSwap...");
+    // Initialize BlockOffloader
+    println!("\nInitializing BlockOffloader...");
     let t0 = Instant::now();
-    let mut swap = flame_swap::FlameSwap::load(
-        &[CHECKPOINT],
-        &device,
-        |name| {
+
+    struct Ltx2ValidateFacilitator;
+    impl flame_diffusion::block_offload::BlockFacilitator for Ltx2ValidateFacilitator {
+        fn block_count(&self) -> usize { NUM_BLOCKS }
+        fn classify_key(&self, name: &str) -> Option<usize> {
             let stripped = name.strip_prefix(KEY_PREFIX).unwrap_or(name);
             if !stripped.starts_with("transformer_blocks.") { return None; }
             if stripped.contains("audio") && !stripped.contains("audio_to_video") { return None; }
             if stripped.contains("video_to_audio") { return None; }
             let rest = stripped.strip_prefix("transformer_blocks.")?;
             rest.split('.').next()?.parse().ok()
-        },
+        }
+    }
+
+    let facilitator = Ltx2ValidateFacilitator;
+    let mut offloader = flame_diffusion::BlockOffloader::load(
+        &[CHECKPOINT],
+        &facilitator,
+        device.clone(),
     )?;
     println!("  {} blocks, {:.2}GB pinned, {:.1}s",
-        swap.num_blocks(), swap.pinned_bytes() as f64 / 1e9, t0.elapsed().as_secs_f32());
+        offloader.block_count(), offloader.pinned_bytes() as f64 / 1e9, t0.elapsed().as_secs_f32());
 
     let ltx_config = LTX2Config::default();
     let mut x = initial;
@@ -59,7 +67,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let mut all_pass = true;
 
     // Prefetch first block
-    swap.prefetch(0)?;
+    offloader.prefetch_block(0)?;
 
     for i in 0..NUM_BLOCKS {
         // Load reference
@@ -69,21 +77,21 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         // Compare input
         let input_err = max_abs_diff(&x, &ref_input)?;
 
-        // Get block weights from FlameSwap
-        let raw_weights = swap.await_block(i)
+        // Get block weights from BlockOffloader
+        let raw_weights = offloader.await_block(i)
             .map_err(|e| format!("await_block: {e}"))?;
 
         // Prefetch next
         if i + 1 < NUM_BLOCKS {
-            swap.prefetch(i + 1)
+            offloader.prefetch_block(i + 1)
                 .map_err(|e| format!("prefetch: {e}"))?;
         }
 
         // Strip key prefix
-        let block_weights: HashMap<String, Tensor> = raw_weights.into_iter()
+        let block_weights: HashMap<String, Tensor> = raw_weights.iter()
             .map(|(k, v)| {
-                let stripped = k.strip_prefix(KEY_PREFIX).unwrap_or(&k).to_string();
-                (stripped, v)
+                let stripped = k.strip_prefix(KEY_PREFIX).unwrap_or(k).to_string();
+                (stripped, v.clone())
             })
             .collect();
 

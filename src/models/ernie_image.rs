@@ -23,6 +23,7 @@
 //! ```
 
 use flame_core::{DType, Result, Shape, Tensor};
+use cudarc::driver::LaunchAsync;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -144,34 +145,178 @@ pub fn compute_rope_embeddings(
     doubled.unsqueeze(0)?.to_dtype(DType::F32)
 }
 
-/// Apply non-interleaved RoPE (half-split rotate: `[-x2, x1]`).
-/// `x`: `[B, S, H, D]`, `freqs`: `[1, S, 1, D]` (angles).
-pub fn apply_rotary_emb(x: &Tensor, freqs: &Tensor) -> Result<Tensor> {
-    let rot_dim = freqs.shape().dims()[3];
-    let x_dim = x.shape().dims()[3];
+/// Precompute doubled cos/sin tables for ERNIE's RoPE convention.
+///
+/// ERNIE uses interleaved doubling: raw freqs `[θ0, θ1, ..., θ63]` become
+/// `[θ0, θ0, θ1, θ1, ..., θ63, θ63]`. Returns `(cos, sin)` as `[1, S, 1, D]` BF16.
+pub fn precompute_rope_cos_sin(
+    height_patches: usize,
+    width_patches: usize,
+    text_len: usize,
+    config: &ErnieImageConfig,
+    device: &Arc<cudarc::driver::CudaDevice>,
+) -> Result<(Tensor, Tensor)> {
+    let n_img = height_patches * width_patches;
+    let total = n_img + text_len;
+    let [ax0, ax1, ax2] = config.rope_axes_dim;
+    let half = config.head_dim / 2;
+    let d = config.head_dim;
 
-    let (x_rot, x_pass) = if rot_dim < x_dim {
-        (x.narrow(3, 0, rot_dim)?, Some(x.narrow(3, rot_dim, x_dim - rot_dim)?))
-    } else {
-        (x.clone(), None)
-    };
+    let mut ids_ax0 = Vec::with_capacity(total);
+    let mut ids_ax1 = Vec::with_capacity(total);
+    let mut ids_ax2 = Vec::with_capacity(total);
 
-    let cos = freqs.cos()?.to_dtype(x.dtype())?;
-    let sin = freqs.sin()?.to_dtype(x.dtype())?;
-
-    // Non-interleaved rotate_half: [-x2, x1]
-    let half = rot_dim / 2;
-    let x1 = x_rot.narrow(3, 0, half)?;
-    let x2 = x_rot.narrow(3, half, half)?;
-    let x_rotated = Tensor::cat(&[&x2.neg()?, &x1], 3)?;
-
-    let out_rot = x_rot.mul(&cos)?.add(&x_rotated.mul(&sin)?)?;
-
-    if let Some(pass) = x_pass {
-        Tensor::cat(&[&out_rot, &pass], 3)
-    } else {
-        Ok(out_rot)
+    for r in 0..height_patches {
+        for c in 0..width_patches {
+            ids_ax0.push(text_len as f32);
+            ids_ax1.push(r as f32);
+            ids_ax2.push(c as f32);
+        }
     }
+    for t in 0..text_len {
+        ids_ax0.push(t as f32);
+        ids_ax1.push(0.0);
+        ids_ax2.push(0.0);
+    }
+
+    let freq0 = rope_freqs(&ids_ax0, ax0, config.rope_theta, device)?;
+    let freq1 = rope_freqs(&ids_ax1, ax1, config.rope_theta, device)?;
+    let freq2 = rope_freqs(&ids_ax2, ax2, config.rope_theta, device)?;
+    let freqs = Tensor::cat(&[&freq0, &freq1, &freq2], 1)?; // [S, half]
+
+    // Double: [θ0, θ0, θ1, θ1, ...] via stack+reshape (CPU side, small tensor)
+    let freqs_data = freqs.to_vec_f32()?; // S * half floats
+    let mut doubled = vec![0.0f32; total * d];
+    for s_idx in 0..total {
+        for k in 0..half {
+            let angle = freqs_data[s_idx * half + k];
+            doubled[s_idx * d + k * 2] = angle;
+            doubled[s_idx * d + k * 2 + 1] = angle;
+        }
+    }
+
+    // Compute cos/sin on CPU, upload as F32, cast to BF16
+    let mut cos_data = Vec::with_capacity(total * d);
+    let mut sin_data = Vec::with_capacity(total * d);
+    for v in &doubled {
+        cos_data.push(v.cos());
+        sin_data.push(v.sin());
+    }
+
+    let cos = Tensor::from_vec(cos_data, Shape::from_dims(&[1, total, 1, d]), device.clone())?
+        .to_dtype(DType::BF16)?;
+    let sin = Tensor::from_vec(sin_data, Shape::from_dims(&[1, total, 1, d]), device.clone())?
+        .to_dtype(DType::BF16)?;
+
+    Ok((cos, sin))
+}
+
+/// Apply ERNIE's RoPE using precomputed doubled cos/sin.
+///
+/// `x`: `[B, H, S, D]` BF16 (already permuted for SDPA).
+/// `cos_doubled`: `[1, S, 1, D]` BF16 (interleaved doubled cos).
+/// `sin_doubled`: `[1, S, 1, D]` BF16 (interleaved doubled sin).
+///
+/// Implements rotate_half: `x * cos + [-x[..., half:], x[..., :half]] * sin`
+/// as a single fused CUDA kernel — no narrow, neg, or cat.
+pub fn apply_rotary_emb_fused(x: &Tensor, cos_doubled: &Tensor, sin_doubled: &Tensor) -> Result<Tensor> {
+    let dims = x.shape().dims();
+    let (b, h, s, d) = (dims[0], dims[1], dims[2], dims[3]);
+    let half = d / 2;
+    let bh = b * h;
+
+    // Kernel: for each element d, pair it with d+half (or d-half),
+    // apply the rotation using cos_doubled[d] and sin_doubled[d].
+    static KERNEL: &str = r#"
+#include <cuda_bf16.h>
+extern "C" __global__
+void ernie_rope_fused(
+    const __nv_bfloat16* __restrict__ X,
+    const __nv_bfloat16* __restrict__ COS,
+    const __nv_bfloat16* __restrict__ SIN,
+    __nv_bfloat16* __restrict__ Y,
+    long bh, long seq, long dim)
+{
+    long idx = blockIdx.x * blockDim.x + threadIdx.x;
+    long total = bh * seq * dim;
+    long half = dim / 2;
+
+    while (idx < total) {
+        long tmp = idx;
+        long d = tmp % dim; tmp /= dim;
+        long s = tmp % seq; tmp /= seq;
+        long b = tmp;
+
+        long base = (b * seq + s) * dim;
+        long cos_base = s * dim;
+
+        float x_d = __bfloat162float(X[base + d]);
+        float c = __bfloat162float(COS[cos_base + d]);
+        float sn = __bfloat162float(SIN[cos_base + d]);
+
+        float partner;
+        if (d < half) {
+            partner = -__bfloat162float(X[base + d + half]);
+        } else {
+            partner = __bfloat162float(X[base + d - half]);
+        }
+
+        Y[base + d] = __float2bfloat16(x_d * c + partner * sn);
+
+        idx += gridDim.x * blockDim.x;
+    }
+}
+"#;
+
+    use cudarc::driver::DevicePtr;
+
+    // Flatten x to [BH, S, D]
+    let x_flat = x.reshape(&[bh, s, d])?;
+    // cos/sin: [1, S, 1, D] → [S, D]
+    let cos_flat = cos_doubled.reshape(&[s, d])?;
+    let sin_flat = sin_doubled.reshape(&[s, d])?;
+
+    let dev = x.device();
+    let mut out = Tensor::empty_dtype(Shape::from_dims(&[b, h, s, d]), DType::BF16, dev.clone())?;
+
+    // JIT compile the kernel if not already loaded
+    if dev.get_func("ernie_rope_fused", "ernie_rope_fused").is_none() {
+        let include_dir = std::env::var("CUDA_INCLUDE_DIR")
+            .or_else(|_| std::env::var("CUDA_HOME").map(|h| format!("{h}/include")))
+            .unwrap_or_else(|_| "/usr/local/cuda/include".into());
+        let mut opts = cudarc::nvrtc::CompileOptions::default();
+        opts.include_paths.push(include_dir.into());
+        let ptx = cudarc::nvrtc::compile_ptx_with_opts(KERNEL, opts)
+            .map_err(|e| flame_core::Error::Cuda(format!("nvrtc ernie_rope: {e:?}")))?;
+        dev.load_ptx(ptx, "ernie_rope_fused", &["ernie_rope_fused"])
+            .map_err(|e| flame_core::Error::Cuda(format!("load_ptx: {e:?}")))?;
+    }
+
+    let f = dev.get_func("ernie_rope_fused", "ernie_rope_fused")
+        .ok_or_else(|| flame_core::Error::Cuda("ernie_rope_fused missing".into()))?;
+
+    let x_ptr = x_flat.as_device_ptr_bf16("rope:x")? as u64;
+    let c_ptr = cos_flat.as_device_ptr_bf16("rope:cos")? as u64;
+    let s_ptr = sin_flat.as_device_ptr_bf16("rope:sin")? as u64;
+    let y_ptr = out.as_mut_device_ptr_bf16("rope:out")? as u64;
+
+    let total_elems = (bh * s * d) as u32;
+    let threads = 256u32;
+    let blocks = (total_elems + threads - 1) / threads;
+
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (blocks, 1, 1),
+        block_dim: (threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        f.launch(cfg,
+            (x_ptr, c_ptr, s_ptr, y_ptr,
+             bh as i64, s as i64, d as i64),
+        ).map_err(|e| flame_core::Error::Cuda(format!("ernie_rope launch: {e:?}")))?;
+    }
+
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -213,66 +358,72 @@ pub struct ErnieImageModel {
 pub struct ErnieImageBlock {
     // Self-attention
     pub sa_norm_weight: Tensor,  // RMSNorm [hidden]
-    pub attn_q_weight: Tensor,   // [hidden, hidden]
-    pub attn_k_weight: Tensor,
-    pub attn_v_weight: Tensor,
-    pub attn_out_weight: Tensor,
+    pub attn_q_wt: Tensor,      // PRE-TRANSPOSED [hidden, hidden]
+    pub attn_k_wt: Tensor,
+    pub attn_v_wt: Tensor,
+    pub attn_out_wt: Tensor,
     pub norm_q_weight: Tensor,   // RMSNorm [head_dim]
     pub norm_k_weight: Tensor,
 
-    // FFN (SwiGLU)
+    // FFN (SwiGLU) — PRE-TRANSPOSED
     pub mlp_norm_weight: Tensor, // RMSNorm [hidden]
-    pub gate_proj_weight: Tensor, // [ffn_hidden, hidden]
-    pub up_proj_weight: Tensor,   // [ffn_hidden, hidden]
-    pub down_proj_weight: Tensor, // [hidden, ffn_hidden]
+    pub gate_proj_wt: Tensor,    // [hidden, ffn_hidden] (transposed from [ffn, hidden])
+    pub up_proj_wt: Tensor,
+    pub down_proj_wt: Tensor,
 }
 
 impl ErnieImageModel {
-    pub fn load(weights: &HashMap<String, Tensor>, config: ErnieImageConfig) -> Result<Self> {
+    pub fn load(weights: HashMap<String, Tensor>, config: ErnieImageConfig) -> Result<Self> {
         let device = flame_core::global_cuda_device();
 
-        let get = |key: &str| -> Result<Tensor> {
-            weights.get(key).cloned()
+        // Consume weights one at a time — avoids 2x memory peak during transpose.
+        let mut w = weights;
+
+        fn take(w: &mut HashMap<String, Tensor>, key: &str) -> Result<Tensor> {
+            w.remove(key)
                 .ok_or_else(|| flame_core::Error::InvalidInput(format!("missing: {key}")))
-        };
+        }
+        fn take_t(w: &mut HashMap<String, Tensor>, key: &str) -> Result<Tensor> {
+            take(w, key)?.transpose()
+        }
 
         let text_proj_weight = if config.text_in_dim != config.hidden_size {
-            Some(get("text_proj.weight")?)
+            Some(take_t(&mut w, "text_proj.weight")?)
         } else { None };
 
         let mut blocks = Vec::with_capacity(config.num_layers);
         for i in 0..config.num_layers {
             let p = format!("layers.{i}");
             blocks.push(ErnieImageBlock {
-                sa_norm_weight: get(&format!("{p}.adaLN_sa_ln.weight"))?,
-                attn_q_weight: get(&format!("{p}.self_attention.to_q.weight"))?,
-                attn_k_weight: get(&format!("{p}.self_attention.to_k.weight"))?,
-                attn_v_weight: get(&format!("{p}.self_attention.to_v.weight"))?,
-                attn_out_weight: get(&format!("{p}.self_attention.to_out.0.weight"))?,
-                norm_q_weight: get(&format!("{p}.self_attention.norm_q.weight"))?,
-                norm_k_weight: get(&format!("{p}.self_attention.norm_k.weight"))?,
-                mlp_norm_weight: get(&format!("{p}.adaLN_mlp_ln.weight"))?,
-                gate_proj_weight: get(&format!("{p}.mlp.gate_proj.weight"))?,
-                up_proj_weight: get(&format!("{p}.mlp.up_proj.weight"))?,
-                down_proj_weight: get(&format!("{p}.mlp.linear_fc2.weight"))?,
+                sa_norm_weight: take(&mut w, &format!("{p}.adaLN_sa_ln.weight"))?,
+                attn_q_wt: take_t(&mut w, &format!("{p}.self_attention.to_q.weight"))?,
+                attn_k_wt: take_t(&mut w, &format!("{p}.self_attention.to_k.weight"))?,
+                attn_v_wt: take_t(&mut w, &format!("{p}.self_attention.to_v.weight"))?,
+                attn_out_wt: take_t(&mut w, &format!("{p}.self_attention.to_out.0.weight"))?,
+                norm_q_weight: take(&mut w, &format!("{p}.self_attention.norm_q.weight"))?,
+                norm_k_weight: take(&mut w, &format!("{p}.self_attention.norm_k.weight"))?,
+                mlp_norm_weight: take(&mut w, &format!("{p}.adaLN_mlp_ln.weight"))?,
+                gate_proj_wt: take_t(&mut w, &format!("{p}.mlp.gate_proj.weight"))?,
+                up_proj_wt: take_t(&mut w, &format!("{p}.mlp.up_proj.weight"))?,
+                down_proj_wt: take_t(&mut w, &format!("{p}.mlp.linear_fc2.weight"))?,
             });
         }
 
         Ok(Self {
-            patch_proj_weight: get("x_embedder.proj.weight")?,
-            patch_proj_bias: get("x_embedder.proj.bias")?,
+            patch_proj_weight: take(&mut w, "x_embedder.proj.weight")?,
+            patch_proj_bias: take(&mut w, "x_embedder.proj.bias")?,
             text_proj_weight,
-            time_embedding_linear1_weight: get("time_embedding.linear_1.weight")?,
-            time_embedding_linear1_bias: get("time_embedding.linear_1.bias")?,
-            time_embedding_linear2_weight: get("time_embedding.linear_2.weight")?,
-            time_embedding_linear2_bias: get("time_embedding.linear_2.bias")?,
-            adaln_mod_weight: get("adaLN_modulation.1.weight")?,
-            adaln_mod_bias: get("adaLN_modulation.1.bias")?,
+            time_embedding_linear1_weight: take_t(&mut w, "time_embedding.linear_1.weight")?,
+            time_embedding_linear1_bias: take(&mut w, "time_embedding.linear_1.bias")?,
+            time_embedding_linear2_weight: take_t(&mut w, "time_embedding.linear_2.weight")?,
+            time_embedding_linear2_bias: take(&mut w, "time_embedding.linear_2.bias")?,
+            adaln_mod_weight: take_t(&mut w, "adaLN_modulation.1.weight")?,
+            adaln_mod_bias: take(&mut w, "adaLN_modulation.1.bias")?,
             blocks,
-            final_norm_linear_weight: get("final_norm.linear.weight")?,
-            final_norm_linear_bias: get("final_norm.linear.bias")?,
-            final_linear_weight: get("final_linear.weight")?,
-            final_linear_bias: get("final_linear.bias")?,
+            final_norm_linear_weight: take_t(&mut w, "final_norm.linear.weight")?,
+            final_norm_linear_bias: take(&mut w, "final_norm.linear.bias")?,
+            final_linear_weight: take_t(&mut w, "final_linear.weight")?,
+            final_linear_bias: take(&mut w, "final_linear.bias")?,
             config,
             device,
         })
@@ -305,9 +456,8 @@ impl ErnieImageModel {
         let img_tokens = self.patch_embed(image)?; // [B, N_img, hidden]
 
         // 2. Text projection
-        let txt_tokens = if let Some(ref w) = self.text_proj_weight {
-            let wt = w.transpose()?;
-            text_embeds.matmul(&wt)?
+        let txt_tokens = if let Some(ref wt) = self.text_proj_weight {
+            text_embeds.matmul(wt)?
         } else {
             text_embeds.clone()
         };
@@ -316,8 +466,8 @@ impl ErnieImageModel {
         let x = Tensor::cat(&[&img_tokens, &txt_tokens], 1)?;
         let s_total = n_img + t_max;
 
-        // 4. RoPE
-        let rope_emb = compute_rope_embeddings(hp, wp, t_max, cfg, &self.device)?;
+        // 4. RoPE — precompute cos/sin once, reuse for all blocks
+        let (rope_cos, rope_sin) = precompute_rope_cos_sin(hp, wp, t_max, cfg, &self.device)?;
 
         // 5. Attention mask: True for valid tokens
         let mut mask_data = vec![0u8; b * s_total];
@@ -339,10 +489,9 @@ impl ErnieImageModel {
         let t_emb = self.time_embed(timestep)?; // [B, hidden]
         let c = t_emb.clone();
 
-        // 7. Shared AdaLN modulation: SiLU → Linear → 6 chunks
+        // 7. Shared AdaLN modulation: SiLU → Linear → 6 chunks (weight pre-transposed)
         let mod_out = c.silu()?;
-        let mod_wt = self.adaln_mod_weight.transpose()?;
-        let mod_out = mod_out.matmul(&mod_wt)?.add(&self.adaln_mod_bias)?;
+        let mod_out = mod_out.matmul(&self.adaln_mod_weight)?.add(&self.adaln_mod_bias)?;
         let chunks = mod_out.chunk(6, 1)?; // each [B, hidden]
         // Expand to [B, S, hidden] for broadcast
         let expand = |t: &Tensor| -> Result<Tensor> {
@@ -359,16 +508,15 @@ impl ErnieImageModel {
         let mut x = x;
         for block in &self.blocks {
             x = self.block_forward(
-                &x, &rope_emb,
+                &x, &rope_cos, &rope_sin,
                 &shift_msa, &scale_msa, &gate_msa,
                 &shift_mlp, &scale_mlp, &gate_mlp,
                 block,
             )?;
         }
 
-        // 9. Final norm: LayerNorm(x) * (1 + scale) + shift
-        let final_mod_wt = self.final_norm_linear_weight.transpose()?;
-        let final_mod = c.matmul(&final_mod_wt)?.add(&self.final_norm_linear_bias)?;
+        // 9. Final norm: LayerNorm(x) * (1 + scale) + shift (weight pre-transposed)
+        let final_mod = c.matmul(&self.final_norm_linear_weight)?.add(&self.final_norm_linear_bias)?;
         let final_chunks = final_mod.chunk(2, 1)?;
         let f_scale = final_chunks[0].unsqueeze(1)?;
         let f_shift = final_chunks[1].unsqueeze(1)?;
@@ -376,9 +524,8 @@ impl ErnieImageModel {
         let x_norm = flame_core::layer_norm::layer_norm(&x, &[cfg.hidden_size], None, None, cfg.eps)?;
         let x_out = x_norm.mul(&f_scale.add_scalar(1.0)?)?.add(&f_shift)?;
 
-        // 10. Final linear: [B, S, hidden] → [B, S, P*P*out_ch]
-        let fl_wt = self.final_linear_weight.transpose()?;
-        let patches = x_out.matmul(&fl_wt)?.add(&self.final_linear_bias)?;
+        // 10. Final linear: [B, S, hidden] → [B, S, P*P*out_ch] (weight pre-transposed)
+        let patches = x_out.matmul(&self.final_linear_weight)?.add(&self.final_linear_bias)?;
 
         // 11. Extract image tokens and unpatchify
         let img_patches = patches.narrow(1, 0, n_img)?; // [B, N_img, P*P*out_ch]
@@ -396,18 +543,15 @@ impl ErnieImageModel {
             // [B, C, H, W] → [B, H*W, C] → matmul → [B, H*W, hidden]
             let x = image.reshape(&[b, c, h * w])?.permute(&[0, 2, 1])?;
             let w_flat = self.patch_proj_weight.reshape(&[self.config.hidden_size, c])?;
-            let wt = w_flat.transpose()?;
-            x.matmul(&wt)?.add(&self.patch_proj_bias)
+            // patch_proj is small (128×4096), transpose once per forward is fine
+            x.matmul(&w_flat.transpose()?)?.add(&self.patch_proj_bias)
         } else {
-            // General Conv2d patch embedding
-            // [B, C, H, W] → reshape to patches → linear
             let x = image.reshape(&[b, c, hp, p, wp, p])?;
-            let x = x.permute(&[0, 2, 4, 1, 3, 5])?; // [B, Hp, Wp, C, P, P]
+            let x = x.permute(&[0, 2, 4, 1, 3, 5])?;
             let patch_dim = c * p * p;
             let x = x.reshape(&[b, hp * wp, patch_dim])?;
             let w_flat = self.patch_proj_weight.reshape(&[self.config.hidden_size, patch_dim])?;
-            let wt = w_flat.transpose()?;
-            x.matmul(&wt)?.add(&self.patch_proj_bias)
+            x.matmul(&w_flat.transpose()?)?.add(&self.patch_proj_bias)
         }
     }
 
@@ -428,18 +572,16 @@ impl ErnieImageModel {
         let cos_part = args.cos()?;
         let emb = Tensor::cat(&[&sin_part, &cos_part], 1)?.to_dtype(DType::BF16)?;
 
-        // MLP: Linear → SiLU → Linear
-        let w1t = self.time_embedding_linear1_weight.transpose()?;
-        let h = emb.matmul(&w1t)?.add(&self.time_embedding_linear1_bias)?;
+        // MLP: Linear → SiLU → Linear (weights pre-transposed at load)
+        let h = emb.matmul(&self.time_embedding_linear1_weight)?.add(&self.time_embedding_linear1_bias)?;
         let h = h.silu()?;
-        let w2t = self.time_embedding_linear2_weight.transpose()?;
-        h.matmul(&w2t)?.add(&self.time_embedding_linear2_bias)
+        h.matmul(&self.time_embedding_linear2_weight)?.add(&self.time_embedding_linear2_bias)
     }
 
     fn block_forward(
         &self,
         x: &Tensor,
-        rope_emb: &Tensor,
+        rope_cos: &Tensor, rope_sin: &Tensor,
         shift_msa: &Tensor, scale_msa: &Tensor, gate_msa: &Tensor,
         shift_mlp: &Tensor, scale_mlp: &Tensor, gate_mlp: &Tensor,
         block: &ErnieImageBlock,
@@ -451,7 +593,7 @@ impl ErnieImageModel {
         let normed = flame_core::norm::rms_norm(x, &[cfg.hidden_size], Some(&block.sa_norm_weight), cfg.eps)?;
         let modulated = normed.mul(&scale_msa.add_scalar(1.0)?)?.add(shift_msa)?;
 
-        let attn_out = self.attention(&modulated, rope_emb, block)?;
+        let attn_out = self.attention(&modulated, rope_cos, rope_sin, block)?;
         let x = residual.add(&gate_msa.mul(&attn_out)?)?;
 
         // FFN with AdaLN
@@ -463,18 +605,15 @@ impl ErnieImageModel {
         residual.add(&gate_mlp.mul(&ffn_out)?)
     }
 
-    fn attention(&self, x: &Tensor, rope_emb: &Tensor, block: &ErnieImageBlock) -> Result<Tensor> {
+    fn attention(&self, x: &Tensor, rope_cos: &Tensor, rope_sin: &Tensor, block: &ErnieImageBlock) -> Result<Tensor> {
         let cfg = &self.config;
         let dims = x.shape().dims();
         let (b, s, _) = (dims[0], dims[1], dims[2]);
 
-        // Q/K/V — no bias
-        let qt = block.attn_q_weight.transpose()?;
-        let kt = block.attn_k_weight.transpose()?;
-        let vt = block.attn_v_weight.transpose()?;
-        let q = x.matmul(&qt)?;
-        let k = x.matmul(&kt)?;
-        let v = x.matmul(&vt)?;
+        // Q/K/V — no bias, weights pre-transposed
+        let q = x.matmul(&block.attn_q_wt)?;
+        let k = x.matmul(&block.attn_k_wt)?;
+        let v = x.matmul(&block.attn_v_wt)?;
 
         // Reshape to [B, S, H, D]
         let q = q.reshape(&[b, s, cfg.num_heads, cfg.head_dim])?;
@@ -485,33 +624,29 @@ impl ErnieImageModel {
         let q = per_head_rms_norm(&q, &block.norm_q_weight, cfg.num_heads, cfg.head_dim, cfg.eps)?;
         let k = per_head_rms_norm(&k, &block.norm_k_weight, cfg.num_heads, cfg.head_dim, cfg.eps)?;
 
-        // RoPE
-        let q = apply_rotary_emb(&q, rope_emb)?;
-        let k = apply_rotary_emb(&k, rope_emb)?;
-
-        // SDPA: [B, H, S, D]
+        // Permute to [B, H, S, D] FIRST, then apply fused RoPE (no extra permutes)
         let q = q.permute(&[0, 2, 1, 3])?;
         let k = k.permute(&[0, 2, 1, 3])?;
         let v = v.permute(&[0, 2, 1, 3])?;
 
+        // Fused RoPE on [B, H, S, D] — single kernel, no intermediates
+        let q = apply_rotary_emb_fused(&q, rope_cos, rope_sin)?;
+        let k = apply_rotary_emb_fused(&k, rope_cos, rope_sin)?;
+
+        // SDPA — already [B, H, S, D]
         let attn_out = flame_core::attention::sdpa(&q, &k, &v, None)?;
         let attn_out = attn_out.permute(&[0, 2, 1, 3])?.reshape(&[b, s, cfg.hidden_size])?;
 
-        // Output projection — no bias
-        let ot = block.attn_out_weight.transpose()?;
-        attn_out.matmul(&ot)
+        // Output projection
+        attn_out.matmul(&block.attn_out_wt)
     }
 
     fn ffn(&self, x: &Tensor, block: &ErnieImageBlock) -> Result<Tensor> {
-        // SwiGLU: down(up(x) * gelu(gate(x)))
-        let gt = block.gate_proj_weight.transpose()?;
-        let ut = block.up_proj_weight.transpose()?;
-        let dt = block.down_proj_weight.transpose()?;
-
-        let gate = x.matmul(&gt)?.gelu()?;
-        let up = x.matmul(&ut)?;
+        // SwiGLU: down(up(x) * gelu(gate(x))) — weights pre-transposed
+        let gate = x.matmul(&block.gate_proj_wt)?.gelu()?;
+        let up = x.matmul(&block.up_proj_wt)?;
         let activated = up.mul(&gate)?;
-        activated.matmul(&dt)
+        activated.matmul(&block.down_proj_wt)
     }
 
     fn unpatchify(&self, patches: &Tensor, hp: usize, wp: usize) -> Result<Tensor> {
@@ -528,29 +663,34 @@ impl ErnieImageModel {
 }
 
 // ---------------------------------------------------------------------------
-// FlameSwap-backed model for 24GB inference
+// BlockOffloader-backed model for 24GB inference
 // ---------------------------------------------------------------------------
 
-/// ERNIE-Image with FlameSwap block offloading. Shared weights on GPU,
-/// block weights loaded one-at-a-time from CPU via FlameSwap.
+/// ERNIE-Image with BlockOffloader. Shared weights on GPU,
+/// block weights in pinned CPU memory, copied to GPU on demand.
 pub struct ErnieImageSwapped {
     pub config: ErnieImageConfig,
     shared: HashMap<String, Tensor>,
-    swap: flame_swap::FlameSwap,
+    offloader: flame_diffusion::BlockOffloader,
     device: Arc<cudarc::driver::CudaDevice>,
 }
 
+/// BlockFacilitator for ERNIE-Image: `layers.{i}.*` keys.
+struct ErnieFacilitator(usize);
+impl flame_diffusion::block_offload::BlockFacilitator for ErnieFacilitator {
+    fn block_count(&self) -> usize { self.0 }
+    fn classify_key(&self, name: &str) -> Option<usize> {
+        name.strip_prefix("layers.")?.split('.').next()?.parse().ok()
+    }
+}
+
 impl ErnieImageSwapped {
-    /// Load from safetensors shard(s). Block weights go to FlameSwap,
-    /// shared weights stay on GPU.
+    /// Load from safetensors shard(s). Block weights go to pinned CPU
+    /// via BlockOffloader, shared weights stay on GPU.
     pub fn load(paths: &[&str], config: ErnieImageConfig, device: &Arc<cudarc::driver::CudaDevice>) -> Result<Self> {
-        let swap = flame_swap::FlameSwap::load(paths, device, |name| {
-            if let Some(rest) = name.strip_prefix("layers.") {
-                rest.split('.').next()?.parse::<usize>().ok()
-            } else {
-                None
-            }
-        }).map_err(|e| flame_core::Error::InvalidInput(format!("FlameSwap ERNIE: {e}")))?;
+        let facilitator = ErnieFacilitator(config.num_layers);
+        let offloader = flame_diffusion::BlockOffloader::load(paths, &facilitator, device.clone())
+            .map_err(|e| flame_core::Error::InvalidInput(format!("BlockOffloader ERNIE: {e}")))?;
 
         let shared_prefixes = [
             "x_embedder.", "text_proj.", "time_embedding.", "time_proj.",
@@ -569,11 +709,13 @@ impl ErnieImageSwapped {
         }
 
         log::info!(
-            "[ERNIE-Image] Loaded: {} blocks via FlameSwap, {} shared weights",
-            config.num_layers, shared.len(),
+            "[ERNIE-Image] Loaded: {} blocks ({:.1} MB pinned), {} shared weights on GPU",
+            config.num_layers,
+            offloader.pinned_bytes() as f64 / (1024.0 * 1024.0),
+            shared.len(),
         );
 
-        Ok(Self { config, shared, swap, device: device.clone() })
+        Ok(Self { config, shared, offloader, device: device.clone() })
     }
 
     fn get(&self, key: &str) -> Result<&Tensor> {
@@ -581,7 +723,7 @@ impl ErnieImageSwapped {
             .ok_or_else(|| flame_core::Error::InvalidInput(format!("missing shared: {key}")))
     }
 
-    /// Forward pass with FlameSwap block iteration.
+    /// Forward pass with BlockOffloader block iteration.
     pub fn forward(
         &mut self,
         image: &Tensor,
@@ -618,8 +760,8 @@ impl ErnieImageSwapped {
         // 3. Concatenate
         let mut x = Tensor::cat(&[&img_tokens, &txt_tokens], 1)?;
 
-        // 4. RoPE
-        let rope_emb = compute_rope_embeddings(hp, wp, t_max, cfg, &self.device)?;
+        // 4. RoPE — precompute cos/sin once
+        let (rope_cos, rope_sin) = precompute_rope_cos_sin(hp, wp, t_max, cfg, &self.device)?;
 
         // 5. Time embedding + AdaLN modulation
         let te_w1 = self.get("time_embedding.linear_1.weight")?;
@@ -658,20 +800,20 @@ impl ErnieImageSwapped {
         let scale_mlp = expand(&chunks[4])?;
         let gate_mlp = expand(&chunks[5])?;
 
-        // 6. Block loop with FlameSwap
-        self.swap.prefetch(0)
-            .map_err(|e| flame_core::Error::InvalidInput(format!("prefetch: {e}")))?;
+        // 6. Block loop with BlockOffloader (prefetch/await overlap)
+        self.offloader.prefetch_block(0)
+            .map_err(|e| flame_core::Error::InvalidInput(format!("prefetch 0: {e}")))?;
 
         for i in 0..cfg.num_layers {
-            let raw = self.swap.await_block(i)
-                .map_err(|e| flame_core::Error::InvalidInput(format!("await: {e}")))?;
+            let raw = self.offloader.await_block(i)
+                .map_err(|e| flame_core::Error::InvalidInput(format!("await {i}: {e}")))?;
             if i + 1 < cfg.num_layers {
-                self.swap.prefetch(i + 1)
-                    .map_err(|e| flame_core::Error::InvalidInput(format!("prefetch: {e}")))?;
+                self.offloader.prefetch_block(i + 1)
+                    .map_err(|e| flame_core::Error::InvalidInput(format!("prefetch {}: {e}", i + 1)))?;
             }
 
             x = block_forward_from_map(
-                &x, &rope_emb,
+                &x, &rope_cos, &rope_sin,
                 &shift_msa, &scale_msa, &gate_msa,
                 &shift_mlp, &scale_mlp, &gate_mlp,
                 &raw, cfg, &self.device,
@@ -707,10 +849,10 @@ impl ErnieImageSwapped {
     }
 }
 
-/// Run one block's forward using a weight HashMap (from FlameSwap).
+/// Run one block's forward using a weight HashMap (from BlockOffloader).
 fn block_forward_from_map(
     x: &Tensor,
-    rope_emb: &Tensor,
+    rope_cos: &Tensor, rope_sin: &Tensor,
     shift_msa: &Tensor, scale_msa: &Tensor, gate_msa: &Tensor,
     shift_mlp: &Tensor, scale_mlp: &Tensor, gate_mlp: &Tensor,
     weights: &HashMap<String, Tensor>,
@@ -718,9 +860,6 @@ fn block_forward_from_map(
     _device: &Arc<cudarc::driver::CudaDevice>,
 ) -> Result<Tensor> {
     let get = |suffix: &str| -> Result<&Tensor> {
-        // FlameSwap keys have the full `layers.{i}.` prefix
-        // Find the key that ends with the suffix
-        weights.values().next(); // just to use weights
         for (k, v) in weights {
             if k.ends_with(suffix) {
                 return Ok(v);
@@ -738,9 +877,9 @@ fn block_forward_from_map(
     let dims = modulated.shape().dims();
     let (b, s, _) = (dims[0], dims[1], dims[2]);
 
-    let q = modulated.matmul(&get("self_attention.to_q.weight")?.transpose()?)?;
-    let k = modulated.matmul(&get("self_attention.to_k.weight")?.transpose()?)?;
-    let v = modulated.matmul(&get("self_attention.to_v.weight")?.transpose()?)?;
+    let q = modulated.matmul(get("self_attention.to_q.weight")?)?;
+    let k = modulated.matmul(get("self_attention.to_k.weight")?)?;
+    let v = modulated.matmul(get("self_attention.to_v.weight")?)?;
 
     let q = q.reshape(&[b, s, cfg.num_heads, cfg.head_dim])?;
     let k = k.reshape(&[b, s, cfg.num_heads, cfg.head_dim])?;
@@ -749,16 +888,17 @@ fn block_forward_from_map(
     let q = per_head_rms_norm(&q, get("self_attention.norm_q.weight")?, cfg.num_heads, cfg.head_dim, cfg.eps)?;
     let k = per_head_rms_norm(&k, get("self_attention.norm_k.weight")?, cfg.num_heads, cfg.head_dim, cfg.eps)?;
 
-    let q = apply_rotary_emb(&q, rope_emb)?;
-    let k = apply_rotary_emb(&k, rope_emb)?;
-
+    // Permute to [B, H, S, D] THEN fused RoPE (no extra permutes)
     let q = q.permute(&[0, 2, 1, 3])?;
     let k = k.permute(&[0, 2, 1, 3])?;
     let v = v.permute(&[0, 2, 1, 3])?;
 
+    let q = apply_rotary_emb_fused(&q, rope_cos, rope_sin)?;
+    let k = apply_rotary_emb_fused(&k, rope_cos, rope_sin)?;
+
     let attn_out = flame_core::attention::sdpa(&q, &k, &v, None)?;
     let attn_out = attn_out.permute(&[0, 2, 1, 3])?.reshape(&[b, s, cfg.hidden_size])?;
-    let attn_out = attn_out.matmul(&get("self_attention.to_out.0.weight")?.transpose()?)?;
+    let attn_out = attn_out.matmul(get("self_attention.to_out.0.weight")?)?;
 
     let x = residual.add(&gate_msa.mul(&attn_out)?)?;
 
@@ -768,9 +908,9 @@ fn block_forward_from_map(
     let normed = flame_core::norm::rms_norm(&x, &[cfg.hidden_size], Some(mlp_norm_w), cfg.eps)?;
     let modulated = normed.mul(&scale_mlp.add_scalar(1.0)?)?.add(shift_mlp)?;
 
-    let gate = modulated.matmul(&get("mlp.gate_proj.weight")?.transpose()?)?.gelu()?;
-    let up = modulated.matmul(&get("mlp.up_proj.weight")?.transpose()?)?;
-    let ffn_out = up.mul(&gate)?.matmul(&get("mlp.linear_fc2.weight")?.transpose()?)?;
+    let gate = modulated.matmul(get("mlp.gate_proj.weight")?)?.gelu()?;
+    let up = modulated.matmul(get("mlp.up_proj.weight")?)?;
+    let ffn_out = up.mul(&gate)?.matmul(get("mlp.linear_fc2.weight")?)?;
 
     residual.add(&gate_mlp.mul(&ffn_out)?)
 }

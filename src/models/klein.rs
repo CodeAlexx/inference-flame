@@ -18,6 +18,7 @@ use flame_core::cuda_ops_bf16;
 use flame_core::serialization;
 use flame_core::{DType, Result, Shape, Tensor};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // Config
@@ -82,14 +83,13 @@ impl KleinConfig {
 
 /// Compute `x @ weight.T` for x with shape [B, N, C] and weight [out_C, C].
 /// No bias (Klein has NO biases anywhere).
-/// Linear projection using pre-transposed weights.
-/// weight_t is already [in_features, out_features] (transposed at load time).
+/// Linear projection using pre-transposed weights [in_features, out_features].
+/// Used by resident (non-swap) forward paths.
 fn linear3d(x: &Tensor, weight_t: &Tensor) -> Result<Tensor> {
     let shape = x.shape().dims().to_vec();
     if shape.len() == 2 {
         return x.matmul(weight_t);
     }
-    // [B, N, C] -> flatten to [B*N, C], matmul, reshape back
     let b = shape[0];
     let n = shape[1];
     let c = shape[2];
@@ -97,6 +97,19 @@ fn linear3d(x: &Tensor, weight_t: &Tensor) -> Result<Tensor> {
     let out_2d = x_2d.matmul(weight_t)?;
     let out_dim = out_2d.shape().dims()[1];
     out_2d.reshape(&[b, n, out_dim])
+}
+
+/// Linear projection using NON-transposed weights [out_features, in_features]
+/// (PyTorch nn.Linear layout). Uses cuBLASLt TRANSA=T internally — the weight
+/// is read directly from the BlockOffloader slot view with zero transpose allocation.
+fn linear3d_nt(x: &Tensor, weight: &Tensor) -> Result<Tensor> {
+    let shape = x.shape().dims().to_vec();
+    if shape.len() == 3 {
+        return flame_core::ops::fused_inference::fused_linear3d_native(x, weight, None);
+    }
+    // 2D fallback (rare): transpose + matmul
+    let wt = flame_core::bf16_elementwise::transpose2d_bf16(weight)?;
+    x.matmul(&wt)
 }
 
 /// x @ weight where weight is ALREADY transposed [in, out].
@@ -260,15 +273,15 @@ fn apply_rope(
 /// `gate_up_w`: [2*mlp_hidden, inner_dim] fused weight.
 /// `down_w`: [inner_dim, mlp_hidden] down projection weight.
 /// `x`: [B, N, inner_dim].
-fn swiglu(gate_up_w: &Tensor, down_w: &Tensor, x: &Tensor) -> Result<Tensor> {
-    let gu = linear3d(x, gate_up_w)?;
+fn swiglu(gate_up_w: &Tensor, down_w: &Tensor, x: &Tensor, native_weights: bool) -> Result<Tensor> {
+    let gu = if native_weights { linear3d_nt(x, gate_up_w)? } else { linear3d(x, gate_up_w)? };
     let last_dim = *gu.shape().dims().last().unwrap();
     let half_dim = last_dim / 2;
     let ndim = gu.shape().dims().len();
     let gate = gu.narrow(ndim - 1, 0, half_dim)?;
     let up = gu.narrow(ndim - 1, half_dim, half_dim)?;
     let activated = flame_core::bf16_ops::swiglu_fused_bf16(&gate, &up)?;
-    linear3d(&activated, down_w)
+    if native_weights { linear3d_nt(&activated, down_w) } else { linear3d(&activated, down_w) }
 }
 
 // ---------------------------------------------------------------------------
@@ -290,10 +303,16 @@ fn double_block_forward(
     pe_sin: &Tensor,
     num_heads: usize,
     head_dim: usize,
+    native_weights: bool,
 ) -> Result<(Tensor, Tensor)> {
     let prefix = format!("double_blocks.{block_idx}");
     let h = num_heads;
     let d = head_dim;
+    // Linear dispatch: native_weights uses cuBLASLt TRANSA=T (swap path),
+    // otherwise standard pre-transposed matmul (resident path).
+    let lin = |x: &Tensor, w: &Tensor| -> Result<Tensor> {
+        if native_weights { linear3d_nt(x, w) } else { linear3d(x, w) }
+    };
     // Unpack modulation parameters
     let (img_shift1, img_scale1, img_gate1) = (&img_mods[0], &img_mods[1], &img_mods[2]);
     let (img_shift2, img_scale2, img_gate2) = (&img_mods[3], &img_mods[4], &img_mods[5]);
@@ -305,8 +324,8 @@ fn double_block_forward(
     let txt_normed = modulate_pre(txt, txt_shift1, txt_scale1)?;
 
     // QKV projections
-    let img_qkv = linear3d(&img_normed, &weights[&format!("{prefix}.img_attn.qkv.weight")])?;
-    let txt_qkv = linear3d(&txt_normed, &weights[&format!("{prefix}.txt_attn.qkv.weight")])?;
+    let img_qkv = lin(&img_normed, &weights[&format!("{prefix}.img_attn.qkv.weight")])?;
+    let txt_qkv = lin(&txt_normed, &weights[&format!("{prefix}.txt_attn.qkv.weight")])?;
 
     let b = img_qkv.shape().dims()[0];
     let n_img = img_qkv.shape().dims()[1];
@@ -370,8 +389,8 @@ fn double_block_forward(
         .reshape(&[b, n_txt, h * d])?;
 
     // Output projection (NO bias)
-    let img_out = linear3d(&img_out, &weights[&format!("{prefix}.img_attn.proj.weight")])?;
-    let txt_out = linear3d(&txt_out, &weights[&format!("{prefix}.txt_attn.proj.weight")])?;
+    let img_out = lin(&img_out, &weights[&format!("{prefix}.img_attn.proj.weight")])?;
+    let txt_out = lin(&txt_out, &weights[&format!("{prefix}.txt_attn.proj.weight")])?;
 
     // Gate + residual (fused)
     let img = flame_core::bf16_ops::gate_residual_fused_bf16(&img, img_gate1, &img_out)?;
@@ -385,11 +404,13 @@ fn double_block_forward(
         &weights[&format!("{prefix}.img_mlp.0.weight")],
         &weights[&format!("{prefix}.img_mlp.2.weight")],
         &img_mlp_in,
+        native_weights,
     )?;
     let txt_mlp_out = swiglu(
         &weights[&format!("{prefix}.txt_mlp.0.weight")],
         &weights[&format!("{prefix}.txt_mlp.2.weight")],
         &txt_mlp_in,
+        native_weights,
     )?;
 
     // Gate + residual (fused)
@@ -418,17 +439,21 @@ fn single_block_forward(
     head_dim: usize,
     inner_dim: usize,
     mlp_hidden: usize,
+    native_weights: bool,
 ) -> Result<Tensor> {
     let prefix = format!("single_blocks.{block_idx}");
     let h = num_heads;
     let d = head_dim;
+    let lin = |x: &Tensor, w: &Tensor| -> Result<Tensor> {
+        if native_weights { linear3d_nt(x, w) } else { linear3d(x, w) }
+    };
 
     let (shift, scale, gate) = (&mods[0], &mods[1], &mods[2]);
 
     let x_normed = modulate_pre(x, shift, scale)?;
 
     // Fused QKV + SwiGLU gate+up
-    let qkv_mlp = linear3d(&x_normed, &weights[&format!("{prefix}.linear1.weight")])?;
+    let qkv_mlp = lin(&x_normed, &weights[&format!("{prefix}.linear1.weight")])?;
 
     // Split: first 3*inner_dim = QKV, rest = gate+up
     let qkv_dim = 3 * inner_dim;
@@ -472,7 +497,7 @@ fn single_block_forward(
 
     // Fused output: cat [attn, mlp] -> linear2
     let fused = Tensor::cat(&[&attn_out, &mlp_out], 2)?;
-    let out = linear3d(&fused, &weights[&format!("{prefix}.linear2.weight")])?;
+    let out = lin(&fused, &weights[&format!("{prefix}.linear2.weight")])?;
 
     // Gate + residual (fused)
     flame_core::bf16_ops::gate_residual_fused_bf16(x, gate, &out)
@@ -681,6 +706,7 @@ impl KleinTransformer {
                 &pe_sin,
                 cfg.num_heads,
                 cfg.head_dim,
+                false,
             )?;
             img = new_img;
             txt = new_txt;
@@ -703,6 +729,7 @@ impl KleinTransformer {
                 cfg.head_dim,
                 cfg.inner_dim,
                 cfg.mlp_hidden,
+                false,
             )?;
         }
 
@@ -1011,6 +1038,7 @@ impl KleinOffloaded {
                 &img_mods_arr, &txt_mods_arr,
                 &pe_cos, &pe_sin,
                 cfg.num_heads, cfg.head_dim,
+                false,
             )?;
             img = new_img;
             txt = new_txt;
@@ -1029,6 +1057,7 @@ impl KleinOffloaded {
                 &pe_cos, &pe_sin,
                 cfg.num_heads, cfg.head_dim,
                 cfg.inner_dim, cfg.mlp_hidden,
+                false,
             )?;
         }
 
@@ -1050,23 +1079,23 @@ impl KleinOffloaded {
 
     pub fn config(&self) -> &KleinConfig { &self.config }
 
-    /// Forward pass that pulls block weights through a FlameSwap instead of
+    /// Forward pass that pulls block weights through a BlockOffloader instead of
     /// the in-process CPU staging dictionary.
     ///
-    /// `swap` must have been initialised with the SAME safetensors file and
+    /// `offloader` must have been initialised with the SAME safetensors file and
     /// the standard Klein block_fn:
-    ///   - `double_blocks.{i}` → swap idx `i`
-    ///   - `single_blocks.{i}` → swap idx `num_double + i`
+    ///   - `double_blocks.{i}` → block idx `i`
+    ///   - `single_blocks.{i}` → block idx `num_double + i`
     ///
-    /// `swap` is left in a clean state on success.
-    pub fn forward_with_swap(
+    /// `offloader` is left in a clean state on success.
+    pub fn forward_with_offloader(
         &self,
         img: &Tensor,
         txt: &Tensor,
         timesteps: &Tensor,
         img_ids: &Tensor,
         txt_ids: &Tensor,
-        swap: &mut flame_swap::FlameSwap,
+        offloader: &mut flame_diffusion::BlockOffloader,
     ) -> Result<Tensor> {
         let w = &self.shared;
         let cfg = &self.config;
@@ -1096,57 +1125,50 @@ impl KleinOffloaded {
         )?;
 
         let total_blocks = cfg.num_double + cfg.num_single;
-        if swap.num_blocks() != total_blocks {
+        if offloader.block_count() != total_blocks {
             return Err(flame_core::Error::InvalidInput(format!(
-                "FlameSwap has {} blocks, expected {} (={} double + {} single)",
-                swap.num_blocks(), total_blocks, cfg.num_double, cfg.num_single,
+                "BlockOffloader has {} blocks, expected {} (={} double + {} single)",
+                offloader.block_count(), total_blocks, cfg.num_double, cfg.num_single,
             )));
         }
 
-        // Helper: take the raw views FlameSwap returned, copy each 2D `.weight`
-        // tensor through transpose2d_bf16 (which produces an owned BF16 tensor
-        // backed by its own GPU storage) and pass 1D `.scale` weights through
-        // unchanged.  After this, the original views can be dropped — the
-        // swap slot's data has been read by the transpose kernel and the
-        // next prefetch will gate behind it via done_event.
-        let materialize = |raw: HashMap<String, Tensor>| -> Result<HashMap<String, Tensor>> {
-            let mut out = HashMap::with_capacity(raw.len());
-            for (k, t) in raw {
-                let owned = if k.ends_with(".weight") && !k.ends_with(".scale") && t.shape().dims().len() == 2 {
-                    flame_core::bf16_elementwise::transpose2d_bf16(&t)?
+        // BlockOffloader's prepare_weights auto-transposes 2D .weight tensors,
+        // but Klein's block_forward uses linear3d_nt (TRANSA=T on non-transposed
+        // weights). We undo the transpose to get back to [out, in] layout.
+        let prepare_block = |arc: Arc<HashMap<String, Tensor>>| -> Result<HashMap<String, Tensor>> {
+            let mut out = HashMap::with_capacity(arc.len());
+            for (k, t) in arc.iter() {
+                let owned = if k.ends_with(".weight") && t.shape().dims().len() == 2 {
+                    // BlockOffloader transposed to [in, out]. Undo → [out, in]
+                    // for linear3d_nt's TRANSA=T path.
+                    t.transpose()?.requires_grad_(false)
                 } else {
-                    // 1D weights: copy to a fresh tensor so the result no
-                    // longer aliases the swap slot.
-                    let bytes = t.to_vec_bf16()?;
-                    let mut owned = Tensor::zeros_dtype(
-                        t.shape().clone(), DType::BF16, t.device().clone(),
-                    )?;
-                    owned.copy_from_bf16_slice(&bytes)?;
-                    owned
+                    t.clone()
                 };
-                out.insert(k, owned);
+                out.insert(k.clone(), owned);
             }
             Ok(out)
         };
 
         // Kick off staging for the very first block (double_blocks.0).
-        swap.prefetch(0).map_err(|e| flame_core::Error::InvalidInput(format!("swap prefetch(0): {e}")))?;
+        offloader.prefetch_block(0).map_err(|e| flame_core::Error::InvalidInput(format!("prefetch(0): {e}")))?;
 
         for i in 0..cfg.num_double {
-            let raw = swap.await_block(i)
-                .map_err(|e| flame_core::Error::InvalidInput(format!("swap await({i}): {e}")))?;
+            let raw = offloader.await_block(i)
+                .map_err(|e| flame_core::Error::InvalidInput(format!("await({i}): {e}")))?;
             // Pre-fetch the next block while we materialize this one.
             let next = i + 1;
             if next < total_blocks {
-                swap.prefetch(next)
-                    .map_err(|e| flame_core::Error::InvalidInput(format!("swap prefetch({next}): {e}")))?;
+                offloader.prefetch_block(next)
+                    .map_err(|e| flame_core::Error::InvalidInput(format!("prefetch({next}): {e}")))?;
             }
-            let block_w = materialize(raw)?;
+            let block_w = prepare_block(raw)?;
             let (new_img, new_txt) = double_block_forward(
                 &block_w, i, &img, &txt,
                 &img_mods_arr, &txt_mods_arr,
                 &pe_cos, &pe_sin,
                 cfg.num_heads, cfg.head_dim,
+                true,
             )?;
             img = new_img;
             txt = new_txt;
@@ -1156,21 +1178,22 @@ impl KleinOffloaded {
         let txt_len = txt.shape().dims()[1];
 
         for i in 0..cfg.num_single {
-            let swap_idx = cfg.num_double + i;
-            let raw = swap.await_block(swap_idx)
-                .map_err(|e| flame_core::Error::InvalidInput(format!("swap await({swap_idx}): {e}")))?;
-            let next = swap_idx + 1;
+            let block_idx = cfg.num_double + i;
+            let raw = offloader.await_block(block_idx)
+                .map_err(|e| flame_core::Error::InvalidInput(format!("await({block_idx}): {e}")))?;
+            let next = block_idx + 1;
             if next < total_blocks {
-                swap.prefetch(next)
-                    .map_err(|e| flame_core::Error::InvalidInput(format!("swap prefetch({next}): {e}")))?;
+                offloader.prefetch_block(next)
+                    .map_err(|e| flame_core::Error::InvalidInput(format!("prefetch({next}): {e}")))?;
             }
-            let block_w = materialize(raw)?;
+            let block_w = prepare_block(raw)?;
             x = single_block_forward(
                 &block_w, i, &x,
                 &single_mods_arr,
                 &pe_cos, &pe_sin,
                 cfg.num_heads, cfg.head_dim,
                 cfg.inner_dim, cfg.mlp_hidden,
+                true,
             )?;
         }
 

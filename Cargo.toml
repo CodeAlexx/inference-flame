@@ -8,7 +8,7 @@ description = "Pure Rust diffusion model inference using flame-core"
 
 [dependencies]
 flame-core = { path = "../flame-core", default-features = false, features = ["cuda", "bf16_u16", "cudnn", "shared_storage"] }
-flame-swap = { path = "flame-swap" }
+flame-diffusion = { path = "../flame-diffusion" }
 cudarc = { version = "0.11.9", default-features = false, features = ["driver", "cublas", "cublaslt", "nvrtc", "cuda-12050", "f16"] }
 half = { version = "2.3", features = ["num-traits"] }
 serde_json = "1.0"
@@ -112,22 +112,6 @@ path = "src/bin/rope_dump.rs"
 [[bin]]
 name = "temb_dump"
 path = "src/bin/temb_dump.rs"
-
-[[bin]]
-name = "swap_weight_compare"
-path = "src/bin/swap_weight_compare.rs"
-
-[[bin]]
-name = "swap_v2_parity"
-path = "src/bin/swap_v2_parity.rs"
-
-[[bin]]
-name = "klein_swap_e2e"
-path = "src/bin/klein_swap_e2e.rs"
-
-[[bin]]
-name = "full_weight_diff"
-path = "src/bin/full_weight_diff.rs"
 
 [[bin]]
 name = "mistral_test"

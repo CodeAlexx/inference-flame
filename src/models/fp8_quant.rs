@@ -15,7 +15,7 @@
 //! Rust mirrors this by doing a TRUE BF16 → FP8 bytes → BF16 round-trip:
 //!   - CPU: encode each BF16 element as an FP8 e4m3fn byte (round-half-to-even)
 //!   - GPU: dequant via the existing `flame_core::ops::fused_inference::
-//!     dequant_fp8_to_bf16` kernel (the same kernel used by FlameSwap to
+//!     dequant_fp8_to_bf16` kernel (the same kernel used by BlockOffloader to
 //!     decode FP8-resident weights, so the decode is bit-identical to the
 //!     production path)
 //!
@@ -209,7 +209,7 @@ pub fn quantize_bf16_to_fp8_round_trip(tensor: &Tensor) -> Result<Tensor> {
     let device = tensor.device().clone();
     let fp8_slice = device
         .htod_sync_copy(&fp8_bytes)
-        .map_err(|e| flame_core::Error::Cuda(format!("fp8 htod: {e}")))?;
+        .map_err(|e| flame_core::Error::Cuda(format!("fp8 htod: {e:?}")))?;
 
     // Step 4: GPU dequant to BF16 (scale=1.0, no scaling)
     let shape = Shape::from_dims(tensor.shape().dims());
