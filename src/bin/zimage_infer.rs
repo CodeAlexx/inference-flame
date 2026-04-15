@@ -200,9 +200,26 @@ fn main() -> Result<()> {
 
     // Load ALL transformer weights into GPU via mmap (12.3GB fits in 24GB).
     // After denoising, we drop everything to make room for VAE.
+    // Supports single file OR directory of sharded safetensors.
     println!("[+] Loading all transformer weights to GPU (mmap)...");
     let t_load = Instant::now();
-    let all_weights = load_file_filtered(&args.model_path, &device, |_| true)?;
+    let model_p = std::path::Path::new(&args.model_path);
+    let all_weights = if model_p.is_dir() {
+        let mut weights = std::collections::HashMap::new();
+        let mut entries: Vec<_> = std::fs::read_dir(model_p)?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("safetensors"))
+            .collect();
+        entries.sort_by_key(|e| e.file_name());
+        for entry in &entries {
+            let partial = flame_core::serialization::load_file(entry.path(), &device)?;
+            weights.extend(partial);
+        }
+        println!("    Loaded {} shards from directory", entries.len());
+        weights
+    } else {
+        load_file_filtered(&args.model_path, &device, |_| true)?
+    };
     println!(
         "    Loaded {} tensors in {:.1}s",
         all_weights.len(),
