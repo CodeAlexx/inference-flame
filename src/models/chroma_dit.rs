@@ -239,8 +239,23 @@ impl ChromaDit {
     }
 
     // -----------------------------------------------------------------------
-    // Helpers (mirror of flux1_dit helpers)
+    // Helpers
     // -----------------------------------------------------------------------
+
+    /// BlockOffloader's prepare_weights auto-transposes 2D .weight tensors
+    /// to [Cin, Cout] for matmul. But fused_linear3d_native expects the
+    /// original [Cout, Cin] layout. Un-transpose them back.
+    fn untranspose_block_weights(raw: &Arc<HashMap<String, Tensor>>) -> Result<HashMap<String, Tensor>> {
+        let mut out = HashMap::with_capacity(raw.len());
+        for (k, v) in raw.iter() {
+            if k.ends_with(".weight") && v.shape().dims().len() == 2 {
+                out.insert(k.clone(), v.transpose()?);
+            } else {
+                out.insert(k.clone(), v.clone());
+            }
+        }
+        Ok(out)
+    }
 
     /// Flatten [B, N, C] → [1, B*N, C], call fused_linear3d, reshape back.
     /// `fused_linear3d_bf16_native` uses cuBLASLt strided batched GEMM with
@@ -602,12 +617,13 @@ impl ChromaDit {
             .map_err(|e| flame_core::Error::InvalidInput(format!("prefetch: {e}")))?;
 
         for i in 0..cfg.num_double_blocks {
-            let raw = self.offloader.await_block(i)
+            let raw_arc = self.offloader.await_block(i)
                 .map_err(|e| flame_core::Error::InvalidInput(format!("await: {e}")))?;
             if i + 1 < total_blocks {
                 self.offloader.prefetch_block(i + 1)
                     .map_err(|e| flame_core::Error::InvalidInput(format!("prefetch: {e}")))?;
             }
+            let raw = Self::untranspose_block_weights(&raw_arc)?;
 
             // Slice modulation params for this block.
             // pooled_temb is [B, L, inner_dim].
@@ -630,12 +646,13 @@ impl ChromaDit {
 
         for i in 0..cfg.num_single_blocks {
             let block_idx = cfg.num_double_blocks + i;
-            let raw = self.offloader.await_block(block_idx)
+            let raw_arc = self.offloader.await_block(block_idx)
                 .map_err(|e| flame_core::Error::InvalidInput(format!("await: {e}")))?;
             if block_idx + 1 < total_blocks {
                 self.offloader.prefetch_block(block_idx + 1)
                     .map_err(|e| flame_core::Error::InvalidInput(format!("prefetch: {e}")))?;
             }
+            let raw = Self::untranspose_block_weights(&raw_arc)?;
 
             let single_mod = pooled_temb.narrow(1, 3 * i, 3)?; // [B, 3, dim]
             x = self.single_block_forward(&x, &single_mod, pe_cos, pe_sin, &raw, i)?;
