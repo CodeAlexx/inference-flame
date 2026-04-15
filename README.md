@@ -12,10 +12,10 @@ Pure Rust diffusion model inference using [flame-core](https://github.com/CodeAl
 | ![SDXL](docs/sdxl_sample.png) | ![Chroma](docs/chroma_sample.png) | ![QwenImage-2512](docs/qwenimage_sample.png) |
 | *30 steps, CFG 7.5* | *40 steps, CFG 4.0* | *30 steps, CFG 4.0, 1024²* |
 
-| SD3.5 Medium | LTX-2.3 Video |
-|---|---|
-| ![SD3.5 Medium](docs/sd3_medium_sample.png) | ![LTX-2.3](docs/ltx2_sample.png) |
-| *28 steps, CFG 4.5, 1024²* | *10s video + audio — [sample.mp4](docs/ltx2_sample.mp4)* |
+| SD3.5 Medium | ERNIE-Image 8B | LTX-2.3 Video |
+|---|---|---|
+| ![SD3.5 Medium](docs/sd3_medium_sample.png) | ![ERNIE-Image](docs/ernie_image_sample.png) | ![LTX-2.3](docs/ltx2_sample.png) |
+| *28 steps, CFG 4.5, 1024²* | *28 steps, CFG 4.0, 1024²* | *10s video + audio — [sample.mp4](docs/ltx2_sample.mp4)* |
 
 https://github.com/CodeAlexx/inference-flame/raw/master/docs/ltx2_sample.mp4
 
@@ -40,11 +40,12 @@ Denoise is **10% faster per-step** than PyTorch. Fits entirely on a single 24GB 
 | Klein 4B | Flux 2 DiT (5+20 blocks) | Working |
 | Klein 9B | Flux 2 DiT (8+24 blocks) | Working |
 | Z-Image | NextDiT (6.15B) | Working |
-| Chroma 8.9B | FLUX-schnell DiT + distilled guidance (19+38 blocks) | Working — real CFG, 1024²/40 on a 24 GB card via FlameSwap |
+| Chroma 8.9B | FLUX-schnell DiT + distilled guidance (19+38 blocks) | Working — real CFG, 1024²/40 on a 24 GB card via BlockOffloader |
 | SD3.5 Medium | MMDiT (24 blocks, dual attention) | Working — full prompt-to-PNG, CLIP-L + CLIP-G + T5-XXL, 1024² resident |
 | SD3.5 Large | MMDiT (38 blocks) | Built, needs full pipeline |
 | SDXL | LDM UNet | Working |
-| QwenImage-2512 | 60-layer DiT + 3D VAE (Qwen2.5-VL-7B text encoder) | Working — 1024²/30, true CFG with norm rescale, 3-axis RoPE, FlameSwap |
+| QwenImage-2512 | 60-layer DiT + 3D VAE (Qwen2.5-VL-7B text encoder) | Working — 1024²/30, true CFG with norm rescale, 3-axis RoPE, BlockOffloader |
+| ERNIE-Image 8B | 36-layer single-stream DiT (Mistral-3 3B text encoder) | Working — 1024²/28, sequential CFG, fused RoPE kernel, ~98s on 3090 Ti |
 | LTX-2.3 | Video DiT + 3D VAE + BigVGAN vocoder | **World's first pure-Rust video pipeline.** Video working end-to-end (prompt → MP4). Audio path runs but still has artifacts — needs more work. |
 | Anima 2B | Cosmos Predict2 DiT | Working |
 
