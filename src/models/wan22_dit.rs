@@ -96,7 +96,7 @@ impl Default for Wan22Config {
 
 pub struct Wan22Dit {
     shared: HashMap<String, Tensor>,
-    swap: FlameSwap,
+    swap: Option<FlameSwap>,
     config: Wan22Config,
     device: Arc<CudaDevice>,
     /// Precomputed complex RoPE frequencies [1024, head_dim/2] as complex pairs.
@@ -200,7 +200,64 @@ impl Wan22Dit {
 
         Ok(Self {
             shared,
-            swap,
+            swap: Some(swap),
+            config,
+            device: device.clone(),
+            rope_freqs_cos: rope_cos,
+            rope_freqs_sin: rope_sin,
+            rope_axes: axes,
+        })
+    }
+
+    /// Load shared weights only — no FlameSwap, no block weights on GPU.
+    /// For training paths that use BlockOffloader for block management.
+    pub fn load_shared_only(
+        checkpoint_paths: &[&str],
+        config: Wan22Config,
+        device: &Arc<CudaDevice>,
+    ) -> Result<Self> {
+        let shared_prefixes = [
+            "patch_embedding.", "text_embedding.", "time_embedding.",
+            "time_projection.", "head.",
+        ];
+        let mut shared: HashMap<String, Tensor> = HashMap::new();
+        for path in checkpoint_paths {
+            let partial = load_file_filtered(Path::new(path), device, |key| {
+                shared_prefixes.iter().any(|p| key.starts_with(p))
+            })?;
+            for (k, v) in partial {
+                let v_bf16 = if v.dtype() != DType::BF16 { v.to_dtype(DType::BF16).unwrap_or(v) } else { v };
+                shared.insert(k, v_bf16);
+            }
+        }
+        log::info!("[Wan22] Loaded shared-only: {} weights, no FlameSwap", shared.len());
+
+        let d = config.head_dim;
+        let d6 = d / 6;
+        let axes = [d - 4 * d6, 2 * d6, 2 * d6];
+        let max_seq: usize = 1024;
+        let theta = config.rope_theta;
+        let mut rope_cos = Vec::new();
+        let mut rope_sin = Vec::new();
+        for &axis_dim in &axes {
+            let half = axis_dim / 2;
+            let mut cos_data = vec![0.0f32; max_seq * half];
+            let mut sin_data = vec![0.0f32; max_seq * half];
+            for pos in 0..max_seq {
+                for i in 0..half {
+                    let freq = 1.0 / theta.powf(2.0 * i as f64 / axis_dim as f64);
+                    let angle = pos as f64 * freq;
+                    cos_data[pos * half + i] = angle.cos() as f32;
+                    sin_data[pos * half + i] = angle.sin() as f32;
+                }
+            }
+            rope_cos.push(cos_data);
+            rope_sin.push(sin_data);
+        }
+
+        Ok(Self {
+            shared,
+            swap: None,
             config,
             device: device.clone(),
             rope_freqs_cos: rope_cos,
@@ -484,16 +541,17 @@ impl Wan22Dit {
 
         // ── Transformer blocks ──
         let total_blocks = cfg.num_layers;
-        self.swap.prefetch(0)
+        self.swap.as_mut().expect("forward requires FlameSwap")
+            .prefetch(0)
             .map_err(|e| flame_core::Error::InvalidInput(format!("prefetch: {e}")))?;
 
         let seq_lens_val = n_patches;
 
         for i in 0..total_blocks {
-            let raw = self.swap.await_block(i)
+            let raw = self.swap.as_mut().unwrap().await_block(i)
                 .map_err(|e| flame_core::Error::InvalidInput(format!("await: {e}")))?;
             if i + 1 < total_blocks {
-                self.swap.prefetch(i + 1)
+                self.swap.as_mut().unwrap().prefetch(i + 1)
                     .map_err(|e| flame_core::Error::InvalidInput(format!("prefetch: {e}")))?;
             }
 
@@ -976,14 +1034,17 @@ impl Wan22Dit {
         self.block_forward_with_prefix(x, e0, e, context, seq_len_actual, grid_sizes, weights, block_idx, prefix_base)
     }
 
-    /// FlameSwap accessors for VACE
+    /// FlameSwap accessors for VACE and 5B resident init.
+    /// Panics if called when swap is None (shared-only mode).
     pub fn swap_prefetch(&mut self, idx: usize) -> Result<()> {
-        self.swap.prefetch(idx)
+        self.swap.as_mut().expect("swap_prefetch: no FlameSwap (shared-only mode)")
+            .prefetch(idx)
             .map_err(|e| flame_core::Error::InvalidInput(format!("prefetch: {e}")))
     }
 
     pub fn swap_await(&mut self, idx: usize) -> Result<HashMap<String, Tensor>> {
-        self.swap.await_block(idx)
+        self.swap.as_mut().expect("swap_await: no FlameSwap (shared-only mode)")
+            .await_block(idx)
             .map_err(|e| flame_core::Error::InvalidInput(format!("await: {e}")))
     }
 
