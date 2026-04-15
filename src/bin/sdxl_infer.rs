@@ -117,15 +117,19 @@ fn main() -> anyhow::Result<()> {
     let latent_w = WIDTH / 8;
     let numel = 4 * latent_h * latent_w; // 4 latent channels
 
-    // Load PyTorch noise (same seed=42) for exact comparison with diffusers
-    let noise_path = "/home/alex/EriDiffusion/inference-flame/output/sdxl_noise_seed42.safetensors";
-    let noise_tensors = flame_core::serialization::load_file(
-        std::path::Path::new(noise_path), &device,
-    )?;
-    let noise_tensor = noise_tensors.get("noise")
-        .ok_or_else(|| anyhow::anyhow!("Missing 'noise' tensor"))?
-        .clone();
-    println!("  Loaded PyTorch noise: {:?}", noise_tensor.dims());
+    // Generate initial noise
+    let noise_tensor = {
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(SEED);
+        let mut data = vec![0.0f32; numel];
+        for v in &mut data {
+            let u1: f32 = rand::Rng::gen_range(&mut rng, 1e-7f32..1.0);
+            let u2: f32 = rand::Rng::gen_range(&mut rng, 0.0f32..std::f32::consts::TAU);
+            *v = (-2.0 * u1.ln()).sqrt() * u2.cos();
+        }
+        Tensor::from_vec(data, Shape::from_dims(&[1, 4, latent_h, latent_w]), device.clone())?
+    };
+    println!("  Generated noise: {:?}", noise_tensor.shape().dims());
 
     let (sigmas, timesteps) = build_sdxl_schedule(NUM_STEPS);
     println!("  sigma_max={:.4}, sigma_min={:.6}", sigmas[0], sigmas[NUM_STEPS - 1]);
@@ -180,24 +184,37 @@ fn main() -> anyhow::Result<()> {
     println!("  {:.1}s ({:.2}s/step)", dt, dt / NUM_STEPS as f32);
 
     // ------------------------------------------------------------------
-    // Stage 4: Save latent for Python VAE decode
+    // Stage 4: VAE Decode
     // ------------------------------------------------------------------
-    println!("\n--- Stage 4: Save latent ---");
+    println!("\n--- Stage 4: VAE Decode ---");
     drop(model);
 
-    let latent_path = OUTPUT_PATH.replace(".png", "_latent.safetensors");
-    {
-        use std::collections::HashMap;
-        let mut tensors = HashMap::new();
-        tensors.insert("latent".to_string(), x.clone());
-        flame_core::serialization::save_file(&tensors, std::path::Path::new(&latent_path))?;
-        println!("  Saved latent to {}", latent_path);
-    }
+    let vae_device = flame_core::device::Device::from_arc(device.clone());
+    let vae = LdmVAEDecoder::from_safetensors(VAE_PATH, 4, 0.13025, 0.0, &device)?;
+    let decoded = vae.decode(&x)?;
+    let dec_dims = decoded.shape().dims();
+    println!("  Decoded: {:?}", dec_dims);
 
-    // Decode with Python: python decode_sdxl_latent.py
-    println!("  Run: python decode_sdxl_latent.py");
+    // Save PNG
+    let img_data = decoded.to_vec_f32()?;
+    let (c, h, w) = (dec_dims[1], dec_dims[2], dec_dims[3]);
+    let mut rgb = vec![0u8; h * w * 3];
+    for y in 0..h {
+        for xx in 0..w {
+            for ch in 0..3.min(c) {
+                let v = img_data[ch * h * w + y * w + xx];
+                let v = ((v + 1.0) * 127.5).clamp(0.0, 255.0) as u8;
+                rgb[(y * w + xx) * 3 + ch] = v;
+            }
+        }
+    }
+    std::fs::create_dir_all(std::path::Path::new(OUTPUT_PATH).parent().unwrap_or(std::path::Path::new(".")))?;
+    let img = image::RgbImage::from_raw(w as u32, h as u32, rgb)
+        .ok_or_else(|| anyhow::anyhow!("failed to create image"))?;
+    img.save(OUTPUT_PATH)?;
 
     println!("\n============================================================");
+    println!("IMAGE SAVED: {OUTPUT_PATH}");
     println!("Total: {:.1}s", t_total.elapsed().as_secs_f32());
     println!("============================================================");
 
