@@ -180,3 +180,11 @@ path = "src/bin/wan22_vae_encode_parity.rs"
 [[bin]]
 name = "wan21_vae_encode_parity"
 path = "src/bin/wan21_vae_encode_parity.rs"
+
+[[bin]]
+name = "acestep_gen"
+path = "src/bin/acestep_gen.rs"
+
+[[bin]]
+name = "acestep_parity"
+path = "src/bin/acestep_parity.rs"
