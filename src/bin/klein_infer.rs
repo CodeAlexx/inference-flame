@@ -17,7 +17,7 @@ use std::time::Instant;
 
 const MODEL_PATH: &str = "/home/alex/EriDiffusion/Models/checkpoints/flux-2-klein-base-4b.safetensors";
 const ENCODER_PATH: &str = "/home/alex/.serenity/models/text_encoders/qwen_3_4b.safetensors";
-const TOKENIZER_PATH: &str = "/home/alex/Wan2GP/ckpts/Qwen3/tokenizer.json";
+const TOKENIZER_PATH: &str = "/home/alex/.cache/huggingface/hub/models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218/tokenizer.json";
 const EMBEDDINGS_PATH: &str = "/home/alex/EriDiffusion/flame-core/inference-test/cached_embeddings.safetensors";
 const VAE_PATH: &str = "/home/alex/EriDiffusion/Models/vaes/flux2-vae.safetensors";
 const OUTPUT_PATH: &str = "/home/alex/EriDiffusion/inference-flame/output/klein4b_rust_v2.png";
