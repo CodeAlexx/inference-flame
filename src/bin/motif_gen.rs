@@ -82,20 +82,44 @@ fn main() -> anyhow::Result<()> {
     let lat_w = width / VAE_SCALE_SPATIAL;
     let numel = 16 * latent_frames * lat_h * lat_w;
 
-    use rand::{Rng, SeedableRng};
-    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-    let mut noise_f32 = Vec::with_capacity(numel);
-    for _ in 0..numel {
-        // Box-Muller
-        let u1: f32 = rng.gen_range(f32::EPSILON..1.0);
-        let u2: f32 = rng.gen();
-        noise_f32.push((-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos());
+    // Optional: load noise from a safetensors file (key `noise`) instead of
+    // generating via Box-Muller. Used for parity traces against Python — feed
+    // the exact same initial latent tensor so the two pipelines only differ in
+    // the DiT / scheduler / guidance implementation, not the random start.
+    let noise = if let Ok(path) = std::env::var("MOTIF_NOISE_FROM") {
+        println!("  Loading noise from {}", path);
+        let ns = flame_core::serialization::load_file(std::path::Path::new(&path), &device)?;
+        let n = ns.get("noise").ok_or_else(|| anyhow::anyhow!("missing 'noise' key in {}", path))?
+            .clone().to_dtype(DType::BF16)?;
+        let expected = [1, 16, latent_frames, lat_h, lat_w];
+        if n.shape().dims() != expected {
+            return Err(anyhow::anyhow!("noise shape {:?} != expected {:?}", n.shape().dims(), expected));
+        }
+        n
+    } else {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        let mut noise_f32 = Vec::with_capacity(numel);
+        for _ in 0..numel {
+            // Box-Muller
+            let u1: f32 = rng.gen_range(f32::EPSILON..1.0);
+            let u2: f32 = rng.gen();
+            noise_f32.push((-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos());
+        }
+        Tensor::from_vec(
+            noise_f32,
+            Shape::from_dims(&[1, 16, latent_frames, lat_h, lat_w]),
+            device.clone(),
+        )?.to_dtype(DType::BF16)?
+    };
+
+    // Optional: per-step latent dump directory. If set, each denoise step's
+    // output latents are saved as `step_{i}.safetensors` for parity diff.
+    let dump_steps_dir = std::env::var("MOTIF_DUMP_STEPS").ok();
+    if let Some(ref d) = dump_steps_dir {
+        std::fs::create_dir_all(d).ok();
+        println!("  Dumping per-step latents to {}", d);
     }
-    let noise = Tensor::from_vec(
-        noise_f32,
-        Shape::from_dims(&[1, 16, latent_frames, lat_h, lat_w]),
-        device.clone(),
-    )?.to_dtype(DType::BF16)?;
 
     // --- Denoise loop ---
     let sigmas = motif_sampling::get_schedule(num_steps);
@@ -147,10 +171,34 @@ fn main() -> anyhow::Result<()> {
         )?;
         let full = Tensor::cat(&[&latents, &lat_cond, &lat_mask], 1)?;
 
+        // Parity trace: dump DiT inputs at step 0 for bit-compare vs Python.
+        if i == 0 {
+            if let Ok(path) = std::env::var("MOTIF_DUMP_DIT_INPUTS") {
+                let mut m = HashMap::new();
+                m.insert("hidden_states".into(), full.clone());
+                m.insert("encoder_hidden_states".into(), cond.clone());
+                m.insert("timestep".into(), timestep.clone());
+                flame_core::serialization::save_file(&m, &path)?;
+                println!("  Dumped DiT inputs at step 0 to {}", path);
+            }
+        }
+
         // Cond forward
         let pred_cond = dit.forward(&full, &cond, &timestep, None)?;
         // Uncond forward
         let pred_uncond = dit.forward(&full, &uncond, &timestep, None)?;
+
+        // Parity trace: dump pred_cond/pred_uncond at selected steps.
+        if let Ok(dir) = std::env::var("MOTIF_DUMP_PREDS") {
+            if i == 0 || i == 25 || i == 45 {
+                std::fs::create_dir_all(&dir).ok();
+                let mut m = HashMap::new();
+                m.insert("pred_cond".into(), pred_cond.clone());
+                m.insert("pred_uncond".into(), pred_uncond.clone());
+                let path = format!("{}/preds_step_{:02}.safetensors", dir.trim_end_matches('/'), i);
+                flame_core::serialization::save_file(&m, &path)?;
+            }
+        }
 
         // APG guidance — with MOTIF_PLAIN_CFG=1, bypass APG's projected component
         // and use standard CFG instead: `pred_uncond + scale * diff`. Diagnostic.
@@ -164,8 +212,26 @@ fn main() -> anyhow::Result<()> {
             )?
         };
 
+        // Parity trace: dump post-APG noise_pred at selected steps.
+        if let Ok(dir) = std::env::var("MOTIF_DUMP_PREDS") {
+            if i == 0 || i == 25 || i == 45 {
+                let mut m = HashMap::new();
+                m.insert("noise_pred_post_apg".into(), noise_pred.clone());
+                let path = format!("{}/noise_pred_step_{:02}.safetensors", dir.trim_end_matches('/'), i);
+                flame_core::serialization::save_file(&m, &path)?;
+            }
+        }
+
         // Euler step
         latents = motif_sampling::euler_step(&latents, &noise_pred, dt)?;
+
+        // Parity trace: dump per-step latents if requested.
+        if let Some(ref d) = dump_steps_dir {
+            let mut m = HashMap::new();
+            m.insert(format!("step_{i}"), latents.clone());
+            let path = format!("{}/step_{:02}.safetensors", d.trim_end_matches('/'), i);
+            flame_core::serialization::save_file(&m, &path)?;
+        }
 
         if i == 0 || i == num_steps - 1 || (i + 1) % 10 == 0 {
             println!("  step {}/{}  sigma={:.4}  elapsed={:.1}s",
