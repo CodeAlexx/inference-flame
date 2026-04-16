@@ -111,13 +111,32 @@ fn main() -> anyhow::Result<()> {
 
     drop(encoder);
 
-    // Save
+    // Slice to real token prefix before saving. The Rust DiT's cross-attention
+    // has no attention-mask support (line 1198 in motif_video_dit.rs uses
+    // `sdpa(..., None)`), so any pad positions in the embedding would pollute
+    // cross-attention softmax weights across 494 zero-mask positions. Python's
+    // DiT applies the mask; slicing here is the shape-level equivalent. Also
+    // save `cond_real_len` / `uncond_real_len` metadata in case a consumer
+    // wants to reconstruct the original [1, 512] tensor with pads zeroed.
+    let cond_sliced = cond_hidden.narrow(1, 0, cond_len)?;
+    let uncond_sliced = uncond_hidden.narrow(1, 0, uncond_len)?;
+    drop(cond_hidden);
+    drop(uncond_hidden);
+
     if let Some(parent) = std::path::Path::new(&out_path).parent() {
         std::fs::create_dir_all(parent).ok();
     }
     let mut tensors: HashMap<String, Tensor> = HashMap::new();
-    tensors.insert("cond".into(), cond_hidden);
-    tensors.insert("uncond".into(), uncond_hidden);
+    tensors.insert("cond".into(), cond_sliced);
+    tensors.insert("uncond".into(), uncond_sliced);
+    tensors.insert(
+        "cond_real_len".into(),
+        Tensor::from_vec(vec![cond_len as f32], flame_core::Shape::from_dims(&[1]), device.clone())?,
+    );
+    tensors.insert(
+        "uncond_real_len".into(),
+        Tensor::from_vec(vec![uncond_len as f32], flame_core::Shape::from_dims(&[1]), device.clone())?,
+    );
     flame_core::serialization::save_file(&tensors, &out_path)?;
     println!("Saved to {} ({:.1}s total)", out_path, t_total.elapsed().as_secs_f32());
     Ok(())
