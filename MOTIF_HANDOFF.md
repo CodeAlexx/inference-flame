@@ -152,6 +152,23 @@ disc-shape sun artifact.
    everywhere, no denoising happened, VAE decoded pure noise. First
    fix that produced visibly-structured output.
 
+### Quality verification (2026-04-16, after APG fix)
+
+Second gen at 1280×720×49 frames with the full APG now matching
+reference (`norm_threshold=12`, `momentum=0.1`; committed as `2281c5f`).
+27 min denoise total on 3090 Ti, VRAM peaks at 23.6/24 GB with
+RESIDENT+torch_sdpa.
+
+- ✓ Actual fur, eye, snout detail on the dog (was impressionistic at 480p)
+- ✓ Sunflowers render real petals + centers (was glowing orbs at 480p)
+- ✓ Black-sun eclipse artifact is gone — that was clipping-less
+  guidance blowup
+- Minor: model interpreted "golden retriever" loosely (renders more
+  German-shepherd-like); sky is "dusky" not explicitly golden-hour.
+  Model/prompt-adherence issues, not pipeline bugs.
+
+Output: `/home/alex/serenity/output/motif_output_hd.mp4`
+
 ### Known rough edges on the "end-to-end" path
 
 - **VAE decode goes through Python** (`scripts/motif_vae_decode_bridge.py`)
