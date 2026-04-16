@@ -57,25 +57,35 @@ use flame_core::{DType, Result, Tensor};
 /// Returns `num_steps + 1` f32 values in descending order (sigma=1.0 → 0.0).
 pub fn get_schedule(num_steps: usize) -> Vec<f32> {
     const SHIFT: f32 = 15.0;
-    // Parity fix: diffusers' FlowMatchEulerDiscreteScheduler uses
-    //   sigmas = linspace(1.0, 1/num_train_timesteps, N)
-    // where `num_train_timesteps=1000` (from Motif's scheduler_config.json),
-    // NOT `1/N`. For N=50 the endpoint difference is 0.001 vs 0.02 — small
-    // but accumulates through the static-shift transform and shifts the
-    // final-step denoise target. Matches Python to ~5 decimal places:
-    //   Python last 3 sigmas: [0.3517, 0.1838, 0.0]
-    //   Rust (old 1/N)      : [0.3846, 0.2344, 0.0]  ← 25% final-sigma error
-    //   Rust (1/1000)       : [0.3517, 0.1838, 0.0]  ← matches
     const NUM_TRAIN_TIMESTEPS: f32 = 1000.0;
-    let end = 1.0 / NUM_TRAIN_TIMESTEPS;
+    // Parity with diffusers' FlowMatchEulerDiscreteScheduler. It applies the
+    // static shift TWICE — once in `__init__` on `linspace(1, N_train, N_train)
+    // / N_train` (to compute `sigma_min`/`sigma_max`), and again in
+    // `set_timesteps` on `linspace(sigma_max, sigma_min, N)`.
+    //
+    // The first-shift pulls `sigma_min` from the naive `1/N_train = 0.001`
+    // to `shift * 0.001 / (1 + (shift-1)*0.001) ≈ 0.01479`. Then the
+    // per-inference linspace runs from 1.0 down to 0.01479, and shift is
+    // re-applied.
+    //
+    // Without the double-shift, my original Rust fix (linspace to 1/1000,
+    // shift once) still had the wrong tail — matched Python's mid-schedule
+    // but diverged on the last few steps (final sigma 0.0148 vs Python's
+    // 0.1838, a 12× error on the last-step dt). This version matches
+    // Python to ~5 decimal places end-to-end.
+    let one_over_nt = 1.0 / NUM_TRAIN_TIMESTEPS;
+    // First shift → `sigma_min`
+    let sigma_min = SHIFT * one_over_nt / (1.0 + (SHIFT - 1.0) * one_over_nt);
+    // linspace(sigma_max=1.0, sigma_min, num_steps)
+    let span = 1.0 - sigma_min;
     let mut sigmas: Vec<f32> = (0..num_steps)
         .map(|i| {
             let frac = i as f32 / (num_steps - 1).max(1) as f32;
-            1.0 - frac * (1.0 - end)
+            1.0 - frac * span
         })
         .collect();
 
-    // Static shift: sigmas = 15 * sigmas / (1 + 14 * sigmas)
+    // Second shift: sigmas = 15 * sigmas / (1 + 14 * sigmas)
     for s in sigmas.iter_mut() {
         *s = SHIFT * *s / (1.0 + (SHIFT - 1.0) * *s);
     }
