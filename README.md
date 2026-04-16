@@ -17,14 +17,7 @@ Pure Rust diffusion model inference using [flame-core](https://github.com/CodeAl
 | ![SD3.5 Medium](docs/sd3_medium_sample.png) | ![ERNIE-Image](docs/ernie_image_sample.png) | ![LTX-2.3](docs/ltx2_sample.png) |
 | *28 steps, CFG 4.5, 1024²* | *28 steps, CFG 4.0, 1024²* | *10s video + audio — [sample.mp4](docs/ltx2_sample.mp4)* |
 
-| Motif-Video 2B |
-|---|
-| ![Motif](docs/motif_sample.png) |
-| *50 steps, APG cfg 8.0, 1280×720×49 @ 24fps — [sample.mp4](docs/motif_sample.mp4)* |
-
 https://github.com/CodeAlexx/inference-flame/raw/master/docs/ltx2_sample.mp4
-
-https://github.com/CodeAlexx/inference-flame/raw/master/docs/motif_sample.mp4
 
 ## Performance
 
