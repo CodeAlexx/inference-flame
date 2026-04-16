@@ -106,6 +106,10 @@ fn main() -> anyhow::Result<()> {
         guidance_scale,
         ..Default::default()
     };
+    // Momentum buffer persists across all 50 steps — its `running` is the
+    // decaying sum of past `diff`s (matches diffusers `MomentumBuffer` with
+    // momentum=0.1).
+    let mut momentum = motif_sampling::MomentumBuffer::new(0.1);
 
     let mut latents = noise;
     let t_steps = Instant::now();
@@ -149,15 +153,15 @@ fn main() -> anyhow::Result<()> {
         let pred_uncond = dit.forward(&full, &uncond, &timestep, None)?;
 
         // APG guidance — with MOTIF_PLAIN_CFG=1, bypass APG's projected component
-        // clipping and use standard CFG instead: `pred_uncond + scale * diff`.
-        // Diagnostic for when Rust APG is suspected to diverge from the diffusers
-        // `VideoAdaptiveProjectedGuidance` (e.g. missing norm_threshold clipping).
+        // and use standard CFG instead: `pred_uncond + scale * diff`. Diagnostic.
         let noise_pred = if std::env::var_os("MOTIF_PLAIN_CFG").is_some() {
             let diff = pred_cond.sub(&pred_uncond)?;
             let scaled = diff.mul_scalar(guidance_scale)?;
             pred_uncond.add(&scaled)?
         } else {
-            motif_sampling::apg_guidance(&pred_cond, &pred_uncond, &apg_cfg)?
+            motif_sampling::apg_guidance(
+                &pred_cond, &pred_uncond, &apg_cfg, Some(&mut momentum),
+            )?
         };
 
         // Euler step
