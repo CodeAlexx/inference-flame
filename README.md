@@ -17,7 +17,14 @@ Pure Rust diffusion model inference using [flame-core](https://github.com/CodeAl
 | ![SD3.5 Medium](docs/sd3_medium_sample.png) | ![ERNIE-Image](docs/ernie_image_sample.png) | ![LTX-2.3](docs/ltx2_sample.png) |
 | *28 steps, CFG 4.5, 1024²* | *28 steps, CFG 4.0, 1024²* | *10s video + audio — [sample.mp4](docs/ltx2_sample.mp4)* |
 
+| Motif-Video 2B |
+|---|
+| ![Motif](docs/motif_sample.png) |
+| *50 steps, APG cfg 8.0, 1280×720×49 @ 24fps — [sample.mp4](docs/motif_sample.mp4)* |
+
 https://github.com/CodeAlexx/inference-flame/raw/master/docs/ltx2_sample.mp4
+
+https://github.com/CodeAlexx/inference-flame/raw/master/docs/motif_sample.mp4
 
 ## Performance
 
@@ -47,6 +54,7 @@ Denoise is **10% faster per-step** than PyTorch. Fits entirely on a single 24GB 
 | QwenImage-2512 | 60-layer DiT + 3D VAE (Qwen2.5-VL-7B text encoder) | Working — 1024²/30, true CFG with norm rescale, 3-axis RoPE, BlockOffloader |
 | ERNIE-Image 8B | 36-layer single-stream DiT (Mistral-3 3B text encoder) | Working — 1024²/28, sequential CFG, fused RoPE kernel, ~98s on 3090 Ti |
 | LTX-2.3 | Video DiT + 3D VAE + BigVGAN vocoder | **World's first pure-Rust video pipeline.** Video working end-to-end (prompt → MP4). Audio path runs but still has artifacts — needs more work. |
+| Motif-Video 2B | 12 dual + 24 single DiT (T5Gemma2 text encoder, Wan 2.1 VAE) | Working end-to-end (prompt → MP4). 1280×720×49 @ 24fps, APG with norm-threshold clipping + momentum EMA matching reference. VAE decode currently via Python bridge (Rust `Wan21VaeDecoder` uses different safetensors key layout than diffusers-style motif checkpoint — `MOTIF_HANDOFF.md` has the diff). |
 | Anima 2B | Cosmos Predict2 DiT | Working |
 
 ## Pipeline
