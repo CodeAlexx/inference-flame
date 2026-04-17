@@ -139,6 +139,18 @@ fn main() -> anyhow::Result<()> {
     let init_sigma = (sigmas[0] * sigmas[0] + 1.0).sqrt();
     let mut x = noise_tensor.to_dtype(DType::BF16)?.mul_scalar(init_sigma)?;
 
+    // Save initial noise (pre-init_sigma) so a Python reference can start from
+    // the bit-identical seed.
+    if std::env::var("SDXL_SAVE_INIT_NOISE").is_ok() {
+        use std::collections::HashMap;
+        use std::path::Path;
+        let mut m: HashMap<String, Tensor> = HashMap::new();
+        m.insert("noise".to_string(), noise_tensor.to_dtype(DType::BF16)?);
+        let p = Path::new("/home/alex/EriDiffusion/inference-flame/output/sdxl_init_noise.safetensors");
+        flame_core::serialization::save_file(&m, p)?;
+        println!("  saved init noise -> {}", p.display());
+    }
+
     let t0 = Instant::now();
     // Keep denoising state in FP32 — only convert to BF16 for UNet input
     let mut x_f32 = x.to_dtype(DType::F32)?;
@@ -160,6 +172,44 @@ fn main() -> anyhow::Result<()> {
         // Conditional + unconditional predictions (eps-prediction)
         let pred_cond = model.forward(&x_in, &timestep, &context, &y)?;
         let pred_uncond = model.forward(&x_in, &timestep, &context_uncond, &y_uncond)?;
+
+        // Multi-step parity save: save x_in and pred_cond/pred_uncond at
+        // several steps so we can track UNet accuracy vs diffusers across
+        // the sigma range.
+        if [0usize, 5, 15, 25, 29].contains(&i) && std::env::var("SDXL_SAVE_STEPS").is_ok() {
+            use std::collections::HashMap;
+            use std::path::Path;
+            let mut m: HashMap<String, Tensor> = HashMap::new();
+            m.insert("x_in".to_string(), x_in.clone_result()?);
+            m.insert("pred_cond".to_string(), pred_cond.clone_result()?);
+            m.insert("pred_uncond".to_string(), pred_uncond.clone_result()?);
+            let p_str = format!(
+                "/home/alex/EriDiffusion/inference-flame/output/sdxl_step{i:02}.safetensors"
+            );
+            let p = Path::new(&p_str);
+            flame_core::serialization::save_file(&m, p)?;
+            eprintln!("  saved step{i:02} parity data t={} sigma={}", timesteps[i], sigma);
+        }
+
+        // Step-0 single-forward parity: save UNet inputs + outputs so a
+        // Python reference can feed the exact same tensors into diffusers UNet
+        // and diff layer outputs.
+        if i == 0 && std::env::var("SDXL_SAVE_STEP0").is_ok() {
+            use std::collections::HashMap;
+            use std::path::Path;
+            let mut m: HashMap<String, Tensor> = HashMap::new();
+            m.insert("x_in".to_string(), x_in.clone_result()?);
+            m.insert("timestep".to_string(), timestep.clone_result()?);
+            m.insert("context".to_string(), context.clone_result()?);
+            m.insert("y".to_string(), y.clone_result()?);
+            m.insert("context_uncond".to_string(), context_uncond.clone_result()?);
+            m.insert("y_uncond".to_string(), y_uncond.clone_result()?);
+            m.insert("pred_cond".to_string(), pred_cond.clone_result()?);
+            m.insert("pred_uncond".to_string(), pred_uncond.clone_result()?);
+            let p = Path::new("/home/alex/EriDiffusion/inference-flame/output/sdxl_step0.safetensors");
+            flame_core::serialization::save_file(&m, p)?;
+            println!("  saved step0 parity data -> {}", p.display());
+        }
 
         // CFG in FP32
         let pred_cond_f32 = pred_cond.to_dtype(DType::F32)?;
@@ -189,7 +239,21 @@ fn main() -> anyhow::Result<()> {
     println!("\n--- Stage 4: VAE Decode ---");
     drop(model);
 
-    let vae_device = flame_core::device::Device::from_arc(device.clone());
+    // Save post-UNet, pre-VAE latent for cross-tool bisection. When
+    // SDXL_SAVE_LATENT=1 is set, writes the BF16 latent to
+    // output/sdxl_rust_latent.safetensors so it can be decoded by diffusers
+    // for comparison, OR a diffusers-produced latent can be loaded in here.
+    if std::env::var("SDXL_SAVE_LATENT").is_ok() {
+        use std::collections::HashMap;
+        use std::path::Path;
+        let mut m: HashMap<String, Tensor> = HashMap::new();
+        m.insert("latent".to_string(), x.clone_result()?);
+        let p = Path::new("/home/alex/EriDiffusion/inference-flame/output/sdxl_rust_latent.safetensors");
+        flame_core::serialization::save_file(&m, p)?;
+        println!("  saved latent -> {}", p.display());
+    }
+
+    let _vae_device = flame_core::device::Device::from_arc(device.clone());
     let vae = LdmVAEDecoder::from_safetensors(VAE_PATH, 4, 0.13025, 0.0, &device)?;
     let decoded = vae.decode(&x)?;
     let dec_dims = decoded.shape().dims();

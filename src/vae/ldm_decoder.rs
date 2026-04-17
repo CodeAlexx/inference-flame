@@ -86,6 +86,63 @@ fn group_norm_nchw(
     to_nchw(&out_nhwc)
 }
 
+/// VAE per-stage telemetry, gated on SDXL_STAGE_DEBUG (same env var as unet
+/// so a single run shows both halves). Capped at 20 total calls so the log
+/// is readable.
+fn vae_log_stage(name: &str, t: &Tensor) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    if std::env::var("SDXL_STAGE_DEBUG").is_err() {
+        return;
+    }
+    static CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
+    const MAX_CALLS: usize = 20;
+    let idx = CALL_COUNT.fetch_add(1, Ordering::Relaxed);
+    if idx >= MAX_CALLS {
+        return;
+    }
+    let f32t = match t.to_dtype(DType::F32) {
+        Ok(x) => x,
+        Err(_) => return,
+    };
+    let data = match f32t.to_vec() {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let n = data.len();
+    let mut mn = f32::INFINITY;
+    let mut mx = f32::NEG_INFINITY;
+    let mut abs_sum = 0f64;
+    let mut nan_cnt = 0usize;
+    let mut inf_cnt = 0usize;
+    for v in &data {
+        if v.is_nan() {
+            nan_cnt += 1;
+            continue;
+        }
+        if v.is_infinite() {
+            inf_cnt += 1;
+            continue;
+        }
+        if *v < mn {
+            mn = *v;
+        }
+        if *v > mx {
+            mx = *v;
+        }
+        abs_sum += v.abs() as f64;
+    }
+    let finite = n - nan_cnt - inf_cnt;
+    let abs_mean = if finite > 0 {
+        abs_sum / finite as f64
+    } else {
+        0.0
+    };
+    let dims = t.shape().dims();
+    eprintln!(
+        "[stage] {name:<36} shape={dims:?} min={mn:+.4e} max={mx:+.4e} abs_mean={abs_mean:+.4e} nan={nan_cnt} inf={inf_cnt}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // ResBlock
 // ---------------------------------------------------------------------------
@@ -413,6 +470,10 @@ impl UpBlock {
 /// Z-Image (16ch, scale=0.3611, shift=0.1159), SD 1.5 (4ch, scale=0.18215),
 /// SDXL (4ch, scale=0.13025), etc.
 pub struct LdmVAEDecoder {
+    /// SDXL / SD 1.5 VAE has a 1x1 post_quant_conv(in_ch, in_ch) applied
+    /// to the (un-rescaled) latent before the main decoder. Z-Image disables
+    /// it. We construct it when weights are present in the checkpoint.
+    post_quant_conv: Option<Conv2d>,
     conv_in: Conv2d,
     mid_block: MidBlock,
     up_blocks: Vec<UpBlock>, // in processing order: up.3, up.2, up.1, up.0
@@ -587,6 +648,26 @@ impl LdmVAEDecoder {
 
         let top_ch = ch * ch_mult[3]; // 512
 
+        // Optional post_quant_conv: 1x1 Conv(in_channels, in_channels) applied
+        // pre-decoder. Present in SDXL/SD 1.5 VAE, absent in Z-Image VAE.
+        let post_quant_conv = if w.contains_key("post_quant_conv.weight") {
+            let mut c = Conv2d::new_with_bias(
+                in_channels,
+                in_channels,
+                1,
+                1,
+                0,
+                device.clone(),
+                true,
+            )?;
+            c.copy_weight_from(get("post_quant_conv.weight")?)?;
+            c.copy_bias_from(get("post_quant_conv.bias")?)?;
+            println!("[LdmVAE] post_quant_conv loaded");
+            Some(c)
+        } else {
+            None
+        };
+
         // conv_in: in_channels -> 512ch
         let mut conv_in = Conv2d::new_with_bias(in_channels, top_ch, 3, 1, 1, device.clone(), true)?;
         conv_in.copy_weight_from(get("decoder.conv_in.weight")?)?;
@@ -621,6 +702,7 @@ impl LdmVAEDecoder {
         let kernels = CudaKernels::new(device.clone())?;
 
         Ok(Self {
+            post_quant_conv,
             conv_in,
             mid_block,
             up_blocks,
@@ -651,25 +733,45 @@ impl LdmVAEDecoder {
     /// ```
     /// Inverse of `encode`: divide by scale first, then add shift.
     pub fn decode(&self, z: &Tensor) -> Result<Tensor> {
+        vae_log_stage("vae:0:z_input", z);
+
         // Undo VAE encode-time normalization: z = z / scale_factor + shift_factor
         let z = z.mul_scalar(1.0 / self.scaling_factor)?
             .add_scalar(self.shift_factor)?;
+        vae_log_stage("vae:0:z_rescaled", &z);
+
+        // SDXL / SD 1.5: post_quant_conv (1x1 Conv) applied pre-decoder.
+        // Matches diffusers AutoencoderKL._decode which runs post_quant_conv
+        // on the already-rescaled latent before passing it to self.decoder.
+        let z = if let Some(ref pqc) = self.post_quant_conv {
+            let h = pqc.forward(&z)?;
+            vae_log_stage("vae:0:post_quant_conv", &h);
+            h
+        } else {
+            z
+        };
 
         // decoder.conv_in
         let mut h = self.conv_in.forward(&z)?;
+        vae_log_stage("vae:1:conv_in", &h);
 
         // mid block
         h = self.mid_block.forward(&h)?;
+        vae_log_stage("vae:2:mid_block", &h);
 
         // up blocks (processed in order: up.3 -> up.2 -> up.1 -> up.0)
-        for block in &self.up_blocks {
+        for (i, block) in self.up_blocks.iter().enumerate() {
             h = block.forward(&h, &self.kernels)?;
+            vae_log_stage(&format!("vae:3:up_block.{i}"), &h);
         }
 
         // final norm + silu + conv
         h = group_norm_nchw(&h, 32, Some(&self.norm_out_w), Some(&self.norm_out_b), 1e-6)?;
+        vae_log_stage("vae:4:final_gn", &h);
         h = h.silu()?;
+        vae_log_stage("vae:4:final_silu", &h);
         h = self.conv_out.forward(&h)?;
+        vae_log_stage("vae:4:final_conv", &h);
 
         Ok(h)
     }

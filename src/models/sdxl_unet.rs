@@ -69,6 +69,97 @@ fn transpose_2d(t: &Tensor) -> Result<Tensor> {
     t.permute(&[1, 0])
 }
 
+/// Per-stage numerical telemetry. Prints stats when SDXL_STAGE_DEBUG is set.
+/// Additionally, when SDXL_SAVE_STAGES is set, saves each stage's tensor to
+/// a separate safetensors file for layer-by-layer parity vs diffusers UNet.
+/// Only fires for the first ~20 calls (one forward, cond branch).
+fn log_stage(name: &str, t: &Tensor) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let debug_on = std::env::var("SDXL_STAGE_DEBUG").is_ok();
+    let save_on = std::env::var("SDXL_SAVE_STAGES").is_ok();
+    if !debug_on && !save_on {
+        return;
+    }
+
+    if save_on {
+        use std::collections::HashMap;
+        use std::path::Path;
+        static SAVE_COUNT: AtomicUsize = AtomicUsize::new(0);
+        const MAX_SAVES: usize = 25;
+        let s = SAVE_COUNT.fetch_add(1, Ordering::Relaxed);
+        if s < MAX_SAVES {
+            let safe_name = name.replace(':', "_").replace('.', "_");
+            let p_str = format!(
+                "/home/alex/EriDiffusion/inference-flame/output/rust_stage_{s:02}_{safe_name}.safetensors"
+            );
+            let p = Path::new(&p_str);
+            let mut m: HashMap<String, Tensor> = HashMap::new();
+            if let Ok(cloned) = t.clone_result() {
+                m.insert("value".to_string(), cloned);
+                let _ = flame_core::serialization::save_file(&m, p);
+                eprintln!("[stage-save] {s:02} {name}");
+            }
+        }
+    }
+
+    if !debug_on {
+        return;
+    }
+    static CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
+    const MAX_CALLS: usize = 50; // ~20 stages × 2 CFG branches + a bit of headroom
+    let call_idx = CALL_COUNT.fetch_add(1, Ordering::Relaxed);
+    if call_idx >= MAX_CALLS {
+        return;
+    }
+    let f32t = match t.to_dtype(DType::F32) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("[stage] {name}: to_dtype(F32) err: {e}");
+            return;
+        }
+    };
+    let data = match f32t.to_vec() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[stage] {name}: to_vec err: {e}");
+            return;
+        }
+    };
+    let n = data.len();
+    let mut mn = f32::INFINITY;
+    let mut mx = f32::NEG_INFINITY;
+    let mut abs_sum = 0f64;
+    let mut nan_cnt = 0usize;
+    let mut inf_cnt = 0usize;
+    for v in &data {
+        if v.is_nan() {
+            nan_cnt += 1;
+            continue;
+        }
+        if v.is_infinite() {
+            inf_cnt += 1;
+            continue;
+        }
+        if *v < mn {
+            mn = *v;
+        }
+        if *v > mx {
+            mx = *v;
+        }
+        abs_sum += v.abs() as f64;
+    }
+    let finite = n - nan_cnt - inf_cnt;
+    let abs_mean = if finite > 0 {
+        abs_sum / finite as f64
+    } else {
+        0.0
+    };
+    let dims = t.shape().dims();
+    eprintln!(
+        "[stage] {name:<36} shape={dims:?} min={mn:+.4e} max={mx:+.4e} abs_mean={abs_mean:+.4e} nan={nan_cnt} inf={inf_cnt}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
@@ -385,7 +476,8 @@ impl SDXLUNet {
         let t_data = t.to_vec()?;
         let batch = t_data.len();
 
-        // Build [cos, sin] embedding
+        // Build [cos, sin] embedding (LDM convention — SDXL checkpoint was
+        // trained this way; diffusers remaps internally, do not change).
         let mut emb_data = vec![0.0f32; batch * dim];
         for b in 0..batch {
             let t_val = t_data[b];
@@ -752,10 +844,14 @@ impl SDXLUNet {
         context: &Tensor,
         y: &Tensor,
     ) -> Result<Tensor> {
+        log_stage("0:noise_in", x);
+        log_stage("0:context", context);
+
         // 1. Time embedding + label embedding -> [B, 1280]
         let emb = self.time_embed(timesteps)?;
         let label_emb = self.label_embed(y)?;
         let emb = emb.add(&label_emb)?;
+        log_stage("1:emb", &emb);
 
         // 2. Input blocks — store hidden states for skip connections
         let mut hs: Vec<Tensor> = Vec::new();
@@ -795,12 +891,14 @@ impl SDXLUNet {
                 _ => unreachable!("Input block has invalid descriptor type"),
             }
 
+            log_stage(&format!("2:in_block.{block_idx}"), &h);
             hs.push(h.clone_result()?);
         }
 
         // 3. Middle block: ResBlock(0) + SpatialTransformer(1) + ResBlock(2)
         self.load_block("middle_block")?;
         h = self.resblock(&h, &emb, "middle_block.0")?;
+        log_stage("3:mid.resblock.0", &h);
         if self.config.transformer_depth_middle > 0 {
             h = self.spatial_transformer(
                 &h,
@@ -808,8 +906,10 @@ impl SDXLUNet {
                 "middle_block.1",
                 self.config.transformer_depth_middle,
             )?;
+            log_stage("3:mid.transformer", &h);
         }
         h = self.resblock(&h, &emb, "middle_block.2")?;
+        log_stage("3:mid.resblock.2", &h);
         self.unload_block();
 
         // 4. Output blocks — pop skip connections and concat
@@ -864,6 +964,7 @@ impl SDXLUNet {
                             }
                         }
                     }
+                    log_stage(&format!("4:out_block.{block_idx}"), &h);
                 }
                 _ => unreachable!("Output block has invalid descriptor type"),
             }
@@ -873,8 +974,11 @@ impl SDXLUNet {
         let out_gn_w = self.w("out.0.weight")?;
         let out_gn_b = self.w("out.0.bias")?;
         h = group_norm_nchw(&h, 32, Some(out_gn_w), Some(out_gn_b), 1e-5)?;
+        log_stage("5:final_gn", &h);
         h = h.silu()?;
+        log_stage("5:final_silu", &h);
         h = self.conv2d_forward(&h, "out.2")?;
+        log_stage("5:final_conv", &h);
 
         Ok(h)
     }
