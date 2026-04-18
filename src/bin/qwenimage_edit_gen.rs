@@ -43,16 +43,17 @@ use flame_core::{global_cuda_device, DType, Shape, Tensor};
 
 use inference_flame::models::qwenimage_dit::QwenImageDit;
 
+// Qwen-Image-Edit-2511 (Dec 2025). Same 60-layer / head_dim=128 transformer
+// architecture as the Aug 2025 base, repackaged into 5 bf16 shards. The only
+// config diff is `zero_cond_t: true` at the pipeline level; the ComfyUI
+// shard repack normalizes weight keys to the same 1933 identifiers this bin
+// already loads. Override via QWEN_DIT_SHARDS=path1:path2:...
 const DEFAULT_DIT_SHARDS: &[&str] = &[
-    "/home/alex/.cache/huggingface/hub/models--Qwen--Qwen-Image-Edit/snapshots/ac7f9318f633fc4b5778c59367c8128225f1e3de/transformer/diffusion_pytorch_model-00001-of-00009.safetensors",
-    "/home/alex/.cache/huggingface/hub/models--Qwen--Qwen-Image-Edit/snapshots/ac7f9318f633fc4b5778c59367c8128225f1e3de/transformer/diffusion_pytorch_model-00002-of-00009.safetensors",
-    "/home/alex/.cache/huggingface/hub/models--Qwen--Qwen-Image-Edit/snapshots/ac7f9318f633fc4b5778c59367c8128225f1e3de/transformer/diffusion_pytorch_model-00003-of-00009.safetensors",
-    "/home/alex/.cache/huggingface/hub/models--Qwen--Qwen-Image-Edit/snapshots/ac7f9318f633fc4b5778c59367c8128225f1e3de/transformer/diffusion_pytorch_model-00004-of-00009.safetensors",
-    "/home/alex/.cache/huggingface/hub/models--Qwen--Qwen-Image-Edit/snapshots/ac7f9318f633fc4b5778c59367c8128225f1e3de/transformer/diffusion_pytorch_model-00005-of-00009.safetensors",
-    "/home/alex/.cache/huggingface/hub/models--Qwen--Qwen-Image-Edit/snapshots/ac7f9318f633fc4b5778c59367c8128225f1e3de/transformer/diffusion_pytorch_model-00006-of-00009.safetensors",
-    "/home/alex/.cache/huggingface/hub/models--Qwen--Qwen-Image-Edit/snapshots/ac7f9318f633fc4b5778c59367c8128225f1e3de/transformer/diffusion_pytorch_model-00007-of-00009.safetensors",
-    "/home/alex/.cache/huggingface/hub/models--Qwen--Qwen-Image-Edit/snapshots/ac7f9318f633fc4b5778c59367c8128225f1e3de/transformer/diffusion_pytorch_model-00008-of-00009.safetensors",
-    "/home/alex/.cache/huggingface/hub/models--Qwen--Qwen-Image-Edit/snapshots/ac7f9318f633fc4b5778c59367c8128225f1e3de/transformer/diffusion_pytorch_model-00009-of-00009.safetensors",
+    "/home/alex/.cache/huggingface/hub/models--Qwen--Qwen-Image-Edit-2511/snapshots/6f3ccc0b56e431dc6a0c2b2039706d7d26f22cb9/transformer/diffusion_pytorch_model-00001-of-00005.safetensors",
+    "/home/alex/.cache/huggingface/hub/models--Qwen--Qwen-Image-Edit-2511/snapshots/6f3ccc0b56e431dc6a0c2b2039706d7d26f22cb9/transformer/diffusion_pytorch_model-00002-of-00005.safetensors",
+    "/home/alex/.cache/huggingface/hub/models--Qwen--Qwen-Image-Edit-2511/snapshots/6f3ccc0b56e431dc6a0c2b2039706d7d26f22cb9/transformer/diffusion_pytorch_model-00003-of-00005.safetensors",
+    "/home/alex/.cache/huggingface/hub/models--Qwen--Qwen-Image-Edit-2511/snapshots/6f3ccc0b56e431dc6a0c2b2039706d7d26f22cb9/transformer/diffusion_pytorch_model-00004-of-00005.safetensors",
+    "/home/alex/.cache/huggingface/hub/models--Qwen--Qwen-Image-Edit-2511/snapshots/6f3ccc0b56e431dc6a0c2b2039706d7d26f22cb9/transformer/diffusion_pytorch_model-00005-of-00005.safetensors",
 ];
 
 const VAE_SCALE_FACTOR: usize = 8;
@@ -67,10 +68,10 @@ fn main() -> anyhow::Result<()> {
 
     let args: Vec<String> = std::env::args().collect();
     let embeds_path = args.get(1).cloned().unwrap_or_else(|| {
-        "/home/alex/serenity/output/qwenimage_edit_embeds.safetensors".to_string()
+        "/home/alex/EriDiffusion/inference-flame/output/qwenimage_edit_embeds.safetensors".to_string()
     });
     let out_latents = args.get(2).cloned().unwrap_or_else(|| {
-        "/home/alex/serenity/output/qwenimage_edit_latents.safetensors".to_string()
+        "/home/alex/EriDiffusion/inference-flame/output/qwenimage_edit_latents.safetensors".to_string()
     });
 
     // Knobs

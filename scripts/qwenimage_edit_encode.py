@@ -55,10 +55,10 @@ PROMPT_TEMPLATE_ENCODE = (
 )
 PROMPT_TEMPLATE_ENCODE_START_IDX = 64
 
-REPO = "Qwen/Qwen-Image-Edit"
+REPO = "Qwen/Qwen-Image-Edit-2511"
 SNAP = (
-    "/home/alex/.cache/huggingface/hub/models--Qwen--Qwen-Image-Edit/snapshots/"
-    "ac7f9318f633fc4b5778c59367c8128225f1e3de"
+    "/home/alex/.cache/huggingface/hub/models--Qwen--Qwen-Image-Edit-2511/snapshots/"
+    "6f3ccc0b56e431dc6a0c2b2039706d7d26f22cb9"
 )
 VAE_SCALE_FACTOR = 8  # 2 ** len(temperal_downsample) = 2^3
 LATENT_CHANNELS = 16  # z_dim
@@ -244,7 +244,7 @@ def main() -> int:
     t0 = time.time()
     vae = AutoencoderKLQwenImage.from_pretrained(
         snap / "vae",
-        dtype=dtype,
+        torch_dtype=dtype,
     ).to(device)
     vae.eval()
     print(f"  Loaded in {time.time() - t0:.1f}s")
@@ -273,6 +273,10 @@ def main() -> int:
     )
     image_latents = (image_latents - latents_mean) / latents_std
     print(f"  Raw VAE output: {tuple(image_latents.shape)} in {time.time() - t0:.1f}s")
+
+    # AutoencoderKLQwenImage emits NCFHW (B, C, F, H, W); pack_latents
+    # expects NFCHW (B, F, C, H, W) to match the diffusers pipeline.
+    image_latents = image_latents.permute(0, 2, 1, 3, 4).contiguous()
 
     # Pack with the same _pack_latents the pipeline uses
     image_latents_packed = pack_latents(image_latents)
