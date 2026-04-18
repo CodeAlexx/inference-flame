@@ -559,12 +559,27 @@ impl Wan22Dit {
         let seq_lens_val = n_patches;
 
         for i in 0..total_blocks {
-            let weights = self.offloader.as_mut().unwrap().await_block(i)
+            let raw_weights = self.offloader.as_mut().unwrap().await_block(i)
                 .map_err(|e| flame_core::Error::InvalidInput(format!("await: {e}")))?;
             if i + 1 < total_blocks {
                 self.offloader.as_mut().unwrap().prefetch_block(i + 1)
                     .map_err(|e| flame_core::Error::InvalidInput(format!("prefetch: {e}")))?;
             }
+
+            // Un-transpose 2D .weight tensors: BlockOffloader::prepare_weights
+            // auto-transposes to [Cin, Cout] but fused_linear3d_native (called
+            // by linear_bias/linear_nobias) wants native PyTorch [Cout, Cin].
+            // Same fix as LTX-2 / FLUX1 / Chroma / Qwen / Gemma-3.
+            let weights: std::collections::HashMap<String, Tensor> = raw_weights.iter()
+                .map(|(k, v)| {
+                    let tensor = if k.ends_with(".weight") && v.shape().dims().len() == 2 {
+                        v.transpose()?
+                    } else {
+                        v.clone()
+                    };
+                    Ok::<_, flame_core::Error>((k.clone(), tensor))
+                })
+                .collect::<Result<_>>()?;
 
             img = self.block_forward(
                 &img, &e0, &e, &txt, seq_lens_val, grid_sizes, &weights, i,

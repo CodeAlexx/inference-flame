@@ -302,6 +302,11 @@ fn main() -> anyhow::Result<()> {
     drop(dit);
     drop(cond);
     drop(uncond);
+    // Return DiT allocations to the driver before VAE load/decode. Without
+    // this, the infinite-caching mempool holds the DiT block buffers and
+    // the VAE's im2vol conv3d OOMs. Same pattern as ernie_image_infer.
+    flame_core::cuda_alloc_pool::clear_pool_cache();
+    flame_core::device::trim_cuda_mempool(0);
     println!("  DiT dropped, stage 2: {:.1}s", t0.elapsed().as_secs_f32());
 
     // Print denoised latent stats for diagnostics.
