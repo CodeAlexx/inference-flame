@@ -314,31 +314,20 @@ fn main() -> anyhow::Result<()> {
             )?
             .to_dtype(DType::BF16)?;
 
-            // Reference region timestep. 2511's QwenImageEditPlusPipeline uses
-            // `index_timestep_zero` — the reference latents are clean
-            // conditioning, so they get t=0 while target uses sigma_curr.
-            // Without this, every token gets the same AdaLN modulation and
-            // the model "denoises" the reference back to itself, leaving
-            // prompt influence dominated by the reference image.
-            let t_ref_vec = Tensor::from_vec(
-                vec![0.0f32],
-                Shape::from_dims(&[1]),
-                device.clone(),
-            )?
-            .to_dtype(DType::BF16)?;
-
             // Concat the noisy target with the (constant) reference latents
             // along the seq dim. This is the diffusers
             // `latent_model_input = torch.cat([latents, image_latents], dim=1)`
             // step.
             let concat_input = Tensor::cat(&[&latents, &image_latents], 1)?;
 
-            let cond_pred_full = dit.forward_edit_with_ref_timestep(
-                &concat_input, &cond, &t_vec, Some(&t_ref_vec), &regions,
-            )?;
-            let uncond_pred_full = dit.forward_edit_with_ref_timestep(
-                &concat_input, &uncond, &t_vec, Some(&t_ref_vec), &regions,
-            )?;
+            // Diffusers' QwenImageEditPlusPipeline (and the Aug 2025 base)
+            // pass ONE timestep to the transformer; the model uses RoPE
+            // positions to distinguish target vs reference tokens, not
+            // separate timesteps. (`index_timestep_zero` in ComfyUI's
+            // FluxKontextMultiReferenceLatentMethod is a separate node, not
+            // what diffusers does.) Using single-temb here.
+            let cond_pred_full = dit.forward_edit(&concat_input, &cond, &t_vec, &regions)?;
+            let uncond_pred_full = dit.forward_edit(&concat_input, &uncond, &t_vec, &regions)?;
 
             // Defensive: forward_edit must return [B, target_seq_len + ref_seq_len, 64].
             // Catch any future shape regression before the narrow silently
