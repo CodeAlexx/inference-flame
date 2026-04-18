@@ -21,7 +21,7 @@ use std::time::Instant;
 const SOURCE_IMAGE: &str = "/home/alex/Downloads/59605771.png";
 const MODEL_PATH: &str = "/home/alex/EriDiffusion/Models/checkpoints/flux-2-klein-base-4b.safetensors";
 const ENCODER_PATH: &str = "/home/alex/.serenity/models/text_encoders/qwen_3_4b.safetensors";
-const TOKENIZER_PATH: &str = "/home/alex/Wan2GP/ckpts/Qwen3/tokenizer.json";
+const TOKENIZER_PATH: &str = "/home/alex/.cache/huggingface/hub/models--Qwen--Qwen3-4B/snapshots/1cfa9a7208912126459214e8b04321603b3df60c/tokenizer.json";
 const VAE_PATH: &str = "/home/alex/EriDiffusion/Models/vaes/flux2-vae.safetensors";
 const OUTPUT_PATH: &str = "/home/alex/EriDiffusion/inference-flame/output/klein4b_edit_rust.png";
 
@@ -339,9 +339,13 @@ fn main() -> anyhow::Result<()> {
     println!("\n--- Stage 7: VAE Decode ---");
     let t0 = Instant::now();
 
-    // Free DiT weights to make room for VAE
+    // Free DiT weights to make room for VAE. Pool cache is saturated by
+    // the denoise loop; clear + trim so the VAE decode's big NHWC conv
+    // buffers (e.g. [1,1024,1024,256] at the head) can allocate cleanly.
     drop(model);
-    println!("  DiT weights freed");
+    flame_core::cuda_alloc_pool::clear_pool_cache();
+    flame_core::device::trim_cuda_mempool(0);
+    println!("  DiT weights freed + pool trimmed");
 
     // Unpack: [1, H*W, 128] -> [1, H, W, 128] -> [1, 128, H, W]
     let latents = denoised
