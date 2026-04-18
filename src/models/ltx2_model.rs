@@ -819,6 +819,26 @@ impl LTX2TransformerBlock {
         // LTX2_BYPASS_FUSED=1 diagnostic path routes through separate
         // rms_norm + modulate so we can isolate kernel-level bugs.
         let bypass_fused = std::env::var("LTX2_BYPASS_FUSED").is_ok();
+        // Sub-step parity probe: set LTX2_PROBE_SUBSTEPS=1 to log mean/abs
+        // stats at each sub-step boundary. Cheap (2K-element reduction per
+        // print), gated, intended for single-forward block-3 localization.
+        let probe_substeps = std::env::var("LTX2_PROBE_SUBSTEPS").is_ok();
+        fn probe(label: &str, t: &Tensor) {
+            if let Ok(v) = t.to_dtype(DType::F32).and_then(|x| x.to_vec1::<f32>()) {
+                let n = v.len() as f32;
+                let mean: f32 = v.iter().sum::<f32>() / n;
+                let abs_mean: f32 = v.iter().map(|x| x.abs()).sum::<f32>() / n;
+                let abs_max: f32 = v.iter().map(|x| x.abs()).fold(0f32, f32::max);
+                println!("      [substep] {label:30} mean={mean:+.4} |mean|={abs_mean:.4} |max|={abs_max:.2}");
+            }
+        }
+        if probe_substeps {
+            probe("pre-attn1 input", hidden_states);
+            probe("gate_msa", &gate_msa);
+            probe("gate_mlp", &gate_mlp);
+            probe("scale_msa", &scale_msa);
+            probe("shift_msa", &shift_msa);
+        }
         let mod_h = if bypass_fused {
             let norm_h = rms_norm(hidden_states, self.norm1_weight.as_ref(), self.eps)?;
             fused_modulate(&norm_h, &scale_msa, &shift_msa)?
@@ -828,10 +848,13 @@ impl LTX2TransformerBlock {
             let norm_h = rms_norm(hidden_states, None, self.eps)?;
             fused_modulate(&norm_h, &scale_msa, &shift_msa)?
         };
+        if probe_substeps { probe("post-norm1+modulate", &mod_h); }
         let t_adaln = t0.elapsed().as_millis();
         let attn_out = self.attn1.forward(&mod_h, None, None, video_rotary_emb, None)?;
+        if probe_substeps { probe("post-attn1 raw", &attn_out); }
         let t_sa = t0.elapsed().as_millis() - t_adaln;
         let mut hs = fused_residual_gate(hidden_states, &attn_out, &gate_msa)?;
+        if probe_substeps { probe("post-attn1 gated+res", &hs); }
 
         // 2. Cross-Attention (text) — with or without adaln modulation
         if num_ada_params >= 9 {
@@ -867,10 +890,13 @@ impl LTX2TransformerBlock {
                 encoder_hidden_states.clone()
             };
 
+            if probe_substeps { probe("pre-ca attn_input", &attn_input); }
             let ca_out = self.attn2.forward(
                 &attn_input, Some(&modulated_context), encoder_attention_mask, None, None,
             )?;
+            if probe_substeps { probe("post-ca raw", &ca_out); }
             hs = fused_residual_gate(&hs, &ca_out, &gate_ca)?;
+            if probe_substeps { probe("post-ca gated+res", &hs); }
         } else {
             // Legacy 6-param path: no cross-attn modulation
             let norm_h2 = rms_norm(&hs, self.norm2_weight.as_ref(), self.eps)?;
@@ -892,8 +918,11 @@ impl LTX2TransformerBlock {
             let norm_ff = rms_norm(&hs, None, self.eps)?;
             fused_modulate(&norm_ff, &scale_mlp, &shift_mlp)?
         };
+        if probe_substeps { probe("pre-ff mod_ff", &mod_ff); }
         let ff_out = self.ff.forward(&mod_ff)?;
+        if probe_substeps { probe("post-ff raw", &ff_out); }
         hs = fused_residual_gate(&hs, &ff_out, &gate_mlp)?;
+        if probe_substeps { probe("post-ff gated+res (OUT)", &hs); }
         let t_ff = t0.elapsed().as_millis() - t_adaln - t_sa - t_ca;
         log::info!("[PERF] adaln={}ms sa={}ms ca={}ms ff={}ms total={}ms",
             t_adaln, t_sa, t_ca, t_ff, t0.elapsed().as_millis());
