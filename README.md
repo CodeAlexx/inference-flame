@@ -22,6 +22,13 @@ Pure Rust diffusion model inference using [flame-core](https://github.com/CodeAl
 | ![FLUX.1-dev](docs/flux1_sample.png) | ![Motif](docs/motif_sample.png) |
 | *20 steps, guidance 3.5, 1024²* | *50 steps, APG cfg 8.0, 1280×720×49 @ 24fps — [sample.mp4](docs/motif_sample.mp4)* |
 
+### Klein image editing — "change her dress to blue"
+
+| Source | Klein 4B edit | Klein 9B edit |
+|---|---|---|
+| ![source](docs/klein_edit_source.png) | ![Klein 4B edit](docs/klein4b_edit_sample.png) | ![Klein 9B edit](docs/klein9b_edit_sample.png) |
+| *reference image* | *35 steps, guidance 3.5, 1024², 477s* | *35 steps, guidance 3.5, 1024², 1006s (offloaded)* |
+
 https://github.com/CodeAlexx/inference-flame/raw/master/docs/ltx2_sample.mp4
 
 https://github.com/CodeAlexx/inference-flame/raw/master/docs/motif_sample.mp4
