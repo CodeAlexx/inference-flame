@@ -22,12 +22,12 @@ Pure Rust diffusion model inference using [flame-core](https://github.com/CodeAl
 | ![FLUX.1-dev](docs/flux1_sample.png) | ![Motif](docs/motif_sample.png) |
 | *20 steps, guidance 3.5, 1024²* | *50 steps, APG cfg 8.0, 1280×720×49 @ 24fps — [sample.mp4](docs/motif_sample.mp4)* |
 
-### Klein image editing — "change her dress to blue"
+### Image editing — "change her dress to blue"
 
-| Source | Klein 4B edit | Klein 9B edit |
-|---|---|---|
-| ![source](docs/klein_edit_source.png) | ![Klein 4B edit](docs/klein4b_edit_sample.png) | ![Klein 9B edit](docs/klein9b_edit_sample.png) |
-| *reference image* | *35 steps, guidance 3.5, 1024², 477s* | *35 steps, guidance 3.5, 1024², 1006s (offloaded)* |
+| Source | Klein 4B edit | Klein 9B edit | Qwen-Image-Edit-2511 |
+|---|---|---|---|
+| ![source](docs/klein_edit_source.png) | ![Klein 4B edit](docs/klein4b_edit_sample.png) | ![Klein 9B edit](docs/klein9b_edit_sample.png) | ![Qwen-Edit-2511](docs/qwenimage_edit_2511_sample.png) |
+| *reference image* | *35 steps, guidance 3.5, 1024², 477s* | *35 steps, guidance 3.5, 1024², 1006s (offloaded)* | *50 steps, true CFG 4.0, 1024², 1513s (BlockOffloader, per-region timestep)* |
 
 https://github.com/CodeAlexx/inference-flame/raw/master/docs/ltx2_sample.mp4
 
@@ -60,6 +60,7 @@ Denoise is **10% faster per-step** than PyTorch. Fits entirely on a single 24GB 
 | SD3.5 Large | MMDiT (38 blocks) | Built, needs full pipeline |
 | SDXL | LDM UNet | Working |
 | QwenImage-2512 | 60-layer DiT + 3D VAE (Qwen2.5-VL-7B text encoder) | Working — 1024²/30, true CFG with norm rescale, 3-axis RoPE, BlockOffloader |
+| Qwen-Image-Edit-2511 | Same 60-layer DiT, multi-region RoPE, per-region timestep (`index_timestep_zero`) | Working — 1024² edit with reference image, BlockOffloader. Stage 1 Python encode (Qwen2.5-VL + AutoencoderKLQwenImage), Stage 2 Rust DiT, Stage 3 Python VAE decode |
 | ERNIE-Image 8B | 36-layer single-stream DiT (Mistral-3 3B text encoder) | Working — 1024²/28, sequential CFG, fused RoPE kernel, ~98s on 3090 Ti |
 | LTX-2.3 | Video DiT + 3D VAE + BigVGAN vocoder | **World's first pure-Rust video pipeline.** Video working end-to-end (prompt → MP4). Audio path runs but still has artifacts — needs more work. |
 | Motif-Video 2B | 12 dual + 24 single DiT (T5Gemma2 text encoder, Wan 2.1 VAE) | Working end-to-end (prompt → MP4). 1280×720×49 @ 24fps, APG with norm-threshold clipping + momentum EMA matching reference. VAE decode currently via Python bridge (Rust `Wan21VaeDecoder` uses different safetensors key layout than diffusers-style motif checkpoint — `MOTIF_HANDOFF.md` has the diff). |
