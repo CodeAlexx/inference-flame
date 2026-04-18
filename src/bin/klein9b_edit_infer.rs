@@ -246,17 +246,27 @@ fn main() -> anyhow::Result<()> {
     println!("\n--- Stage 3: Load Klein 9B ---");
     let t0 = Instant::now();
 
-    let model = match KleinTransformer::from_safetensors(MODEL_PATH) {
-        Ok(m) => {
-            println!("  All weights on GPU");
-            Model::OnGpu(m)
-        }
-        Err(e) => {
-            println!(
-                "  GPU load failed ({:?}), falling back to offloaded...",
-                e
-            );
-            Model::Offloaded(KleinOffloaded::from_safetensors(MODEL_PATH)?)
+    // Klein 9B edit doubles the image seq (target+reference = 8192 tokens)
+    // which O(N²) balloons SDPA intermediates at 1024². On 24 GB cards the
+    // on-GPU path loads fine but then OOMs mid-denoise. Force offloaded
+    // unless KLEIN9B_ONGPU=1 is set.
+    let force_offload = std::env::var("KLEIN9B_ONGPU").is_err();
+    let model = if force_offload {
+        println!("  Using block-offloaded path for VRAM headroom (set KLEIN9B_ONGPU=1 to override)");
+        Model::Offloaded(KleinOffloaded::from_safetensors(MODEL_PATH)?)
+    } else {
+        match KleinTransformer::from_safetensors(MODEL_PATH) {
+            Ok(m) => {
+                println!("  All weights on GPU");
+                Model::OnGpu(m)
+            }
+            Err(e) => {
+                println!(
+                    "  GPU load failed ({:?}), falling back to offloaded...",
+                    e
+                );
+                Model::Offloaded(KleinOffloaded::from_safetensors(MODEL_PATH)?)
+            }
         }
     };
     println!("  {}", model.config_str());
