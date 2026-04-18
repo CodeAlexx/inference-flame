@@ -152,12 +152,13 @@ pub fn compute_rope_embeddings(
 pub fn precompute_rope_cos_sin(
     height_patches: usize,
     width_patches: usize,
-    text_len: usize,
+    t_max: usize,
+    text_len_real: usize,
     config: &ErnieImageConfig,
     device: &Arc<cudarc::driver::CudaDevice>,
 ) -> Result<(Tensor, Tensor)> {
     let n_img = height_patches * width_patches;
-    let total = n_img + text_len;
+    let total = n_img + t_max;
     let [ax0, ax1, ax2] = config.rope_axes_dim;
     let half = config.head_dim / 2;
     let d = config.head_dim;
@@ -166,14 +167,20 @@ pub fn precompute_rope_cos_sin(
     let mut ids_ax1 = Vec::with_capacity(total);
     let mut ids_ax2 = Vec::with_capacity(total);
 
+    // Image tokens: axis-0 offset is the REAL text length (matches diffusers
+    // ErnieImageTransformer2DModel.forward:386-389 — `text_lens.float()`).
+    // Using t_max instead (as prior code did) positions images far outside any
+    // regime the model saw during training and causes systematic drift across
+    // all image tokens, independent of CFG.
     for r in 0..height_patches {
         for c in 0..width_patches {
-            ids_ax0.push(text_len as f32);
+            ids_ax0.push(text_len_real as f32);
             ids_ax1.push(r as f32);
             ids_ax2.push(c as f32);
         }
     }
-    for t in 0..text_len {
+    // Text tokens: axis 0 = 0..t_max-1 (full padded range, including padding).
+    for t in 0..t_max {
         ids_ax0.push(t as f32);
         ids_ax1.push(0.0);
         ids_ax2.push(0.0);
@@ -466,8 +473,11 @@ impl ErnieImageModel {
         let x = Tensor::cat(&[&img_tokens, &txt_tokens], 1)?;
         let s_total = n_img + t_max;
 
-        // 4. RoPE — precompute cos/sin once, reuse for all blocks
-        let (rope_cos, rope_sin) = precompute_rope_cos_sin(hp, wp, t_max, cfg, &self.device)?;
+        // 4. RoPE — precompute cos/sin once, reuse for all blocks.
+        // Use real text length (not t_max) for image axis-0 offset so image
+        // positions match what the model saw during training.
+        let text_len_real = text_lens.get(0).copied().unwrap_or(t_max);
+        let (rope_cos, rope_sin) = precompute_rope_cos_sin(hp, wp, t_max, text_len_real, cfg, &self.device)?;
 
         // 5. Attention mask: True for valid tokens
         let mut mask_data = vec![0u8; b * s_total];
@@ -760,8 +770,9 @@ impl ErnieImageSwapped {
         // 3. Concatenate
         let mut x = Tensor::cat(&[&img_tokens, &txt_tokens], 1)?;
 
-        // 4. RoPE — precompute cos/sin once
-        let (rope_cos, rope_sin) = precompute_rope_cos_sin(hp, wp, t_max, cfg, &self.device)?;
+        // 4. RoPE — precompute cos/sin once. Real text length for image axis 0.
+        let text_len_real = text_lens.get(0).copied().unwrap_or(t_max);
+        let (rope_cos, rope_sin) = precompute_rope_cos_sin(hp, wp, t_max, text_len_real, cfg, &self.device)?;
 
         // 5. Time embedding + AdaLN modulation
         let te_w1 = self.get("time_embedding.linear_1.weight")?;

@@ -22,7 +22,9 @@ const VAE_PATH: &str = "/home/alex/models/ERNIE-Image/vae/diffusion_pytorch_mode
 
 const WIDTH: usize = 1024;
 const HEIGHT: usize = 1024;
-const STEPS: usize = 28;
+// Baidu's ErnieImagePipeline default (pipeline_ernie_image.py:204). Lower
+// step counts produce visibly worse quality — this is SFT not Turbo.
+const STEPS: usize = 50;
 const GUIDANCE: f32 = 4.0;
 const SEED: u64 = 42;
 
@@ -63,12 +65,25 @@ fn run() -> anyhow::Result<()> {
     let text_len = token_ids.len();
     println!("  tokenized: {text_len} tokens");
 
-    let text_embeds = {
+    // Diffusers ErnieImagePipeline uses an encoded empty string for the
+    // unconditional branch, NOT zeros (pipeline_ernie_image.py:280-298).
+    // Passing zeros as uncond_embeds pushes CFG in a wrong direction — it
+    // biases toward "anything-not-the-prompt" instead of "generic image",
+    // which is visible as stylization drift.
+    let empty_encoding = tokenizer.encode("", true)
+        .map_err(|e| anyhow::anyhow!("tokenize empty: {e}"))?;
+    let empty_ids: Vec<i32> = empty_encoding.get_ids().iter().map(|&id| id as i32).collect();
+    let empty_len = empty_ids.len();
+    println!("  uncond tokenized: {empty_len} tokens");
+
+    let (text_embeds, uncond_embeds_real) = {
         let encoder = Mistral3bEncoder::load(TEXT_ENCODER, &device)?;
         println!("  encoder loaded in {:.1}s", t0.elapsed().as_secs_f32());
         let embeds = encoder.encode(&token_ids, 256)?;
         println!("  encoded: shape={:?}", embeds.shape().dims());
-        embeds
+        let uncond = encoder.encode(&empty_ids, 256)?;
+        println!("  uncond encoded: shape={:?}", uncond.shape().dims());
+        (embeds, uncond)
         // encoder dropped here — ~7GB freed
     };
     println!("  text encoding done in {:.1}s", t0.elapsed().as_secs_f32());
@@ -134,10 +149,23 @@ fn run() -> anyhow::Result<()> {
     };
     let text_lens = vec![text_len.min(256)];
 
-    let uncond_embeds = Tensor::zeros_dtype(
-        text_3d.shape().clone(), DType::BF16, device.clone(),
-    )?;
-    let uncond_lens = vec![0usize];
+    let uncond_3d = if uncond_embeds_real.rank() == 2 {
+        uncond_embeds_real.unsqueeze(0)?
+    } else {
+        uncond_embeds_real.clone()
+    };
+    let uncond_embeds = uncond_3d;
+    let uncond_lens = vec![empty_len.min(256)];
+
+    // Trim text embeddings to real length — ERNIE has no attention mask path,
+    // so zero-padded text tokens steal softmax weight from real text and
+    // dilute conditioning (~1/256 for uncond, ~32/256 for cond). Reference
+    // pipeline pads to max(cond,uncond) = 32 when batching B=2; Rust runs
+    // sequentially so each forward gets its own real length with no padding.
+    let cond_trim = text_3d.narrow(1, 0, text_lens[0])?;
+    let uncond_trim = uncond_embeds.narrow(1, 0, uncond_lens[0])?;
+    let cond_lens = vec![text_lens[0]];
+    let uncond_trim_lens = vec![uncond_lens[0]];
 
     for step in 0..STEPS {
         let sigma = sigmas[step];
@@ -147,11 +175,11 @@ fn run() -> anyhow::Result<()> {
 
         // Sequential CFG: run cond pass, then uncond pass — never both at once
         let pred = if GUIDANCE > 1.0 {
-            let pred_cond = model.forward(&latent, &t_tensor, &text_3d, &text_lens)?;
-            let pred_uncond = model.forward(&latent, &t_tensor, &uncond_embeds, &uncond_lens)?;
+            let pred_cond = model.forward(&latent, &t_tensor, &cond_trim, &cond_lens)?;
+            let pred_uncond = model.forward(&latent, &t_tensor, &uncond_trim, &uncond_trim_lens)?;
             pred_uncond.add(&pred_cond.sub(&pred_uncond)?.mul_scalar(GUIDANCE)?)?
         } else {
-            model.forward(&latent, &t_tensor, &text_3d, &text_lens)?
+            model.forward(&latent, &t_tensor, &cond_trim, &cond_lens)?
         };
         latent = ernie_euler_step(&latent, &pred, sigma, sigma_next)?;
 

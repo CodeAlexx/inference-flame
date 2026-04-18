@@ -391,7 +391,9 @@ impl KleinVaeDecoder {
 
         // BatchNorm inverse normalization: z * sqrt(var + eps) + mean
         // BFL stores bn.running_mean [128] and bn.running_var [128] as F32.
-        let bn_eps = 1e-4f32;
+        // eps matches diffusers ErnieImagePipeline.decode path
+        // (pipeline_ernie_image.py:367 — `running_var + 1e-5`).
+        let bn_eps = 1e-5f32;
         let bn_scale = if let Some(var) = weights.get("bn.running_var") {
             let var_f32 = var.to_dtype(DType::F32)?;
             let scale_f32 = var_f32.add_scalar(bn_eps)?.sqrt()?;
