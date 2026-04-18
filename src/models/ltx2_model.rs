@@ -539,9 +539,24 @@ pub struct FeedForward {
 
 impl FeedForward {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let probe = std::env::var("LTX2_PROBE_FF").is_ok();
+        fn ff_probe(label: &str, t: &Tensor) {
+            if let Ok(v) = t.to_dtype(DType::F32).and_then(|x| x.to_vec1::<f32>()) {
+                let n = v.len() as f32;
+                let mean: f32 = v.iter().sum::<f32>() / n;
+                let abs_mean: f32 = v.iter().map(|x| x.abs()).sum::<f32>() / n;
+                let abs_max: f32 = v.iter().map(|x| x.abs()).fold(0f32, f32::max);
+                println!("        [ff] {label:24} mean={mean:+.4} |mean|={abs_mean:.4} |max|={abs_max:.2}");
+            }
+        }
+        if probe { ff_probe("in", x); }
         let h = linear3d(x, &self.gelu_proj_weight, Some(&self.gelu_proj_bias))?;
+        if probe { ff_probe("post-linear1 (pre-GELU)", &h); }
         let h = gelu_approximate(&h)?;
-        linear3d(&h, &self.out_weight, Some(&self.out_bias))
+        if probe { ff_probe("post-GELU", &h); }
+        let out = linear3d(&h, &self.out_weight, Some(&self.out_bias))?;
+        if probe { ff_probe("post-linear2 (out)", &out); }
+        Ok(out)
     }
 }
 

@@ -127,8 +127,27 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        // LTX2_DUMP_WEIGHTS: print FF out_weight stats per block — isolates
+        // weight-loading bugs from forward-path bugs.
+        if std::env::var("LTX2_DUMP_WEIGHTS").is_ok() {
+            if let Ok(data) = block.ff.out_weight.to_dtype(DType::F32).and_then(|t| t.to_vec1::<f32>()) {
+                let n = data.len() as f32;
+                let abs_mean: f32 = data.iter().map(|x| x.abs()).sum::<f32>() / n;
+                let abs_max: f32 = data.iter().map(|x| x.abs()).fold(0f32, f32::max);
+                let shape = block.ff.out_weight.shape().dims().to_vec();
+                println!("  [W] block {i} ff.out_weight shape={:?} |mean|={abs_mean:.4} |max|={abs_max:.4}",
+                    shape);
+            }
+        }
+
+        // LTX2_ISOLATE=1: feed Python's reference input to each block so
+        // block_i is tested in isolation (drift-free) against block_i_output.
+        // Distinguishes "this block is buggy" from "this block is fed a
+        // drifted input by upstream blocks".
+        let isolate = std::env::var("LTX2_ISOLATE").is_ok();
+        let forward_in = if isolate { &ref_input } else { &x };
         x = block.forward_video_only(
-            &x, &context, &timestep,
+            forward_in, &context, &timestep,
             None,  // no rotary emb
             None,  // no encoder mask
             None,  // no prompt_timestep
