@@ -44,15 +44,21 @@ from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 from diffusers import AutoencoderKLQwenImage
 from diffusers.image_processor import VaeImageProcessor
 
-# Diffusers pipeline_qwenimage_edit constants
+# Diffusers pipeline_qwenimage_edit_plus (2511) template.
+# Differs from Aug 2025 base `pipeline_qwenimage_edit` by wrapping vision tokens
+# with "Picture 1: " and keeping them separate from the prompt text. The 2511
+# run under the old template silently left prompt conditioning weak — the
+# model received the right vision input but the wrong textual framing, so
+# edits like "change her dress to blue" did not land even at CFG=7.
 PROMPT_TEMPLATE_ENCODE = (
     "<|im_start|>system\nDescribe the key features of the input image (color, "
     "shape, size, texture, objects, background), then explain how the user's "
     "text instruction should alter or modify the image. Generate a new image "
     "that meets the user's requirements while maintaining consistency with the "
     "original input where appropriate.<|im_end|>\n<|im_start|>user\n"
-    "<|vision_start|><|image_pad|><|vision_end|>{}<|im_end|>\n<|im_start|>assistant\n"
+    "{}<|im_end|>\n<|im_start|>assistant\n"
 )
+IMG_PROMPT_TEMPLATE = "Picture {}: <|vision_start|><|image_pad|><|vision_end|>"
 PROMPT_TEMPLATE_ENCODE_START_IDX = 64
 
 REPO = "Qwen/Qwen-Image-Edit-2511"
@@ -104,7 +110,11 @@ def encode_prompt_with_image(
 ) -> torch.Tensor:
     """Run the VLM with vision input and return the [1, L, 3584] hidden states
     for a single prompt + image, with the system-prompt tokens dropped."""
-    txt = PROMPT_TEMPLATE_ENCODE.format(prompt)
+    # 2511 EditPlus: wrap the single reference image with "Picture 1: ..." and
+    # concatenate with the user's text instruction before dropping into the
+    # user role. Multi-reference would loop img_prompt_template.format(i+1).
+    base_img_prompt = IMG_PROMPT_TEMPLATE.format(1)
+    txt = PROMPT_TEMPLATE_ENCODE.format(base_img_prompt + prompt)
     drop_idx = PROMPT_TEMPLATE_ENCODE_START_IDX
 
     model_inputs = processor(
