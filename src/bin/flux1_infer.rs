@@ -176,7 +176,6 @@ fn main() -> anyhow::Result<()> {
 
     // Pack: [1, 16, H, W] → ([1, H*W/4, 64], img_ids[H*W/4, 3])
     let (img_packed, img_ids) = pack_latent(&noise_nchw, &device)?;
-    drop(noise_nchw);
     let n_img = img_packed.shape().dims()[1];
     println!("  Packed img: {:?}", img_packed.shape().dims());
     println!("  img_ids:    {:?}", img_ids.shape().dims());
@@ -187,6 +186,24 @@ fn main() -> anyhow::Result<()> {
         DType::BF16,
         device.clone(),
     )?;
+
+    // Save prompt-conditioning bundle for diffusers FLUX.1-dev parity:
+    // bit-identical noise + CLIP pooled + T5 hidden + img_ids + txt_ids.
+    if std::env::var("FLUX1_SAVE_INPUTS").is_ok() {
+        use std::collections::HashMap;
+        use std::path::Path;
+        let mut m: HashMap<String, Tensor> = HashMap::new();
+        m.insert("noise_nchw".to_string(), noise_nchw.clone_result()?);
+        m.insert("img_packed".to_string(), img_packed.clone_result()?);
+        m.insert("img_ids".to_string(), img_ids.clone_result()?);
+        m.insert("txt_ids".to_string(), txt_ids.clone_result()?);
+        m.insert("t5_hidden".to_string(), t5_hidden_bf16.clone_result()?);
+        m.insert("clip_pooled".to_string(), clip_pooled.clone_result()?);
+        let p = Path::new("/home/alex/EriDiffusion/inference-flame/output/flux1_inputs.safetensors");
+        flame_core::serialization::save_file(&m, p)?;
+        println!("  saved flux1_inputs -> {}", p.display());
+    }
+    drop(noise_nchw);
 
     // Schedule — FLUX 1 linear mu (256→0.5, 4096→1.15)
     let timesteps = get_schedule(NUM_STEPS, n_img, 0.5, 1.15, true);

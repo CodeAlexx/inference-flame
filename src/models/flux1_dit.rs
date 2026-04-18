@@ -194,6 +194,62 @@ impl Flux1DiT {
     // Helpers
     // -----------------------------------------------------------------------
 
+    /// Per-stage telemetry, env-gated.
+    ///   FLUX1_STAGE_DEBUG=1 — print abs_mean / min / max / NaN per capture.
+    ///   FLUX1_SAVE_STAGES=1 — dump each capture to safetensors for parity
+    ///                        diff vs diffusers FLUX.1-dev.
+    /// Early-return if both unset; zero cost on normal runs.
+    fn log_stage(name: &str, t: &Tensor) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let stats_on = std::env::var("FLUX1_STAGE_DEBUG").is_ok();
+        let save_on  = std::env::var("FLUX1_SAVE_STAGES").is_ok();
+        if !stats_on && !save_on {
+            return;
+        }
+        static CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
+        const MAX_CALLS: usize = 200;
+        let idx = CALL_COUNT.fetch_add(1, Ordering::Relaxed);
+        if idx >= MAX_CALLS {
+            return;
+        }
+        if save_on {
+            use std::path::Path;
+            let safe_name = name.replace(':', "_").replace('.', "_");
+            let p_str = format!(
+                "/home/alex/EriDiffusion/inference-flame/output/flux1_stage_{idx:03}_{safe_name}.safetensors"
+            );
+            let p = Path::new(&p_str);
+            let mut m: HashMap<String, Tensor> = HashMap::new();
+            if let Ok(c) = t.clone_result() {
+                m.insert("value".to_string(), c);
+                let _ = flame_core::serialization::save_file(&m, p);
+            }
+        }
+        if !stats_on {
+            return;
+        }
+        let f32t = match t.to_dtype(DType::F32) { Ok(x) => x, Err(_) => return };
+        let data = match f32t.to_vec() { Ok(v) => v, Err(_) => return };
+        let n = data.len();
+        let mut mn = f32::INFINITY;
+        let mut mx = f32::NEG_INFINITY;
+        let mut abs_sum = 0f64;
+        let mut nan_cnt = 0usize;
+        let mut inf_cnt = 0usize;
+        for v in &data {
+            if v.is_nan() { nan_cnt += 1; continue; }
+            if v.is_infinite() { inf_cnt += 1; continue; }
+            if *v < mn { mn = *v; }
+            if *v > mx { mx = *v; }
+            abs_sum += v.abs() as f64;
+        }
+        let abs_mean = if n > 0 { abs_sum / n as f64 } else { 0.0 };
+        eprintln!(
+            "[flux1] {idx:03} {name:<24} shape={:?} abs_mean={:.4e} min={:+.4e} max={:+.4e} nan={} inf={}",
+            t.shape().dims(), abs_mean, mn, mx, nan_cnt, inf_cnt
+        );
+    }
+
     /// 3D linear with fused bias epilogue via cuBLASLt.
     /// Weight is in standard PyTorch `[Cout, Cin]` row-major layout (no
     /// pre-transpose). The transpose happens inside the GEMM via TRANSA=T,
@@ -524,6 +580,10 @@ impl Flux1DiT {
         // --- Build RoPE (fused-kernel cos/sin tables) ---
         let (pe_cos, pe_sin) = Self::build_rope_2d(img_ids, txt_ids, &cfg, &self.device)?;
 
+        Self::log_stage("0:img_in", &img);
+        Self::log_stage("0:txt_in", &txt);
+        Self::log_stage("0:vec", &vec);
+
         // --- Double blocks ---
         let mut img = img;
         let mut txt = txt;
@@ -559,6 +619,14 @@ impl Flux1DiT {
 
             let raw = Self::untranspose_block_weights(&raw_arc)?;
 
+            // Dump block-0 weights after untranspose — for comparing to
+            // the raw checkpoint keys in Python.
+            if i == 0 && std::env::var("FLUX1_DUMP_BLOCK0").is_ok() {
+                use std::path::Path;
+                let p = Path::new("/home/alex/EriDiffusion/inference-flame/output/flux1_block0_weights.safetensors");
+                let _ = flame_core::serialization::save_file(&raw, p);
+            }
+
             let t_fwd = std::time::Instant::now();
             let (new_img, new_txt) = self.double_block_forward(
                 &img, &txt, &vec, &pe_cos, &pe_sin, &raw, i,
@@ -573,6 +641,11 @@ impl Flux1DiT {
             total_compute_ms += fwd_ms;
             img = new_img;
             txt = new_txt;
+
+            if i == 0 || i == 4 || i == 9 || i == 14 || i == cfg.num_double_blocks - 1 {
+                Self::log_stage(&format!("1:dbl_img.{i:02}"), &img);
+                Self::log_stage(&format!("1:dbl_txt.{i:02}"), &txt);
+            }
 
             if profile {
                 eprintln!("[PROF] double {:>2}/{}: await={:>4}ms prefetch={:>3}ms compute={:>5}ms",
@@ -614,6 +687,10 @@ impl Flux1DiT {
             }
             let fwd_ms = t_fwd.elapsed().as_millis();
             total_compute_ms += fwd_ms;
+
+            if i == 0 || i == 9 || i == 18 || i == 27 || i == cfg.num_single_blocks - 1 {
+                Self::log_stage(&format!("2:sgl.{i:02}"), &x);
+            }
 
             if profile {
                 eprintln!("[PROF] single {:>2}/{}: await={:>4}ms prefetch={:>3}ms compute={:>5}ms",
@@ -903,13 +980,16 @@ impl Flux1DiT {
         let scale = mods.narrow(1, dim, dim)?;
 
         let x = Self::modulate_pre(x, &shift, &scale)?;
+        Self::log_stage("3:pre_final_linear", &x);
 
         let out_w = self.shared.get("final_layer.linear.weight")
             .ok_or_else(|| flame_core::Error::InvalidInput("Missing final_layer.linear.weight".into()))?;
         let out_b = self.shared.get("final_layer.linear.bias")
             .ok_or_else(|| flame_core::Error::InvalidInput("Missing final_layer.linear.bias".into()))?;
 
-        Self::linear_bias(&x, out_w, out_b)
+        let out = Self::linear_bias(&x, out_w, out_b)?;
+        Self::log_stage("4:final_out", &out);
+        Ok(out)
     }
 
     // -----------------------------------------------------------------------
