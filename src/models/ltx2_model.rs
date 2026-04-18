@@ -810,8 +810,14 @@ impl LTX2TransformerBlock {
         let (shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp) =
             self.compute_ada_params_6(&self.scale_shift_table, temb, b, dim)?;
 
-        // 1. Self-Attention with AdaLN-Zero (fused: rms_norm+modulate → 1 kernel, residual+gate → 1 kernel)
-        let mod_h = if let Some(w) = self.norm1_weight.as_ref() {
+        // 1. Self-Attention with AdaLN-Zero. Fused path kept as default; an
+        // LTX2_BYPASS_FUSED=1 diagnostic path routes through separate
+        // rms_norm + modulate so we can isolate kernel-level bugs.
+        let bypass_fused = std::env::var("LTX2_BYPASS_FUSED").is_ok();
+        let mod_h = if bypass_fused {
+            let norm_h = rms_norm(hidden_states, self.norm1_weight.as_ref(), self.eps)?;
+            fused_modulate(&norm_h, &scale_msa, &shift_msa)?
+        } else if let Some(w) = self.norm1_weight.as_ref() {
             fused_rms_norm_modulate(hidden_states, w, &scale_msa, &shift_msa, self.eps)?
         } else {
             let norm_h = rms_norm(hidden_states, None, self.eps)?;
@@ -871,8 +877,11 @@ impl LTX2TransformerBlock {
 
         let t_ca = t0.elapsed().as_millis() - t_adaln - t_sa;
 
-        // 3. FeedForward with AdaLN-Zero (fused: rms_norm+modulate → 1 kernel, residual+gate → 1 kernel)
-        let mod_ff = if let Some(w) = self.norm3_weight.as_ref() {
+        // 3. FeedForward with AdaLN-Zero
+        let mod_ff = if bypass_fused {
+            let norm_ff = rms_norm(&hs, self.norm3_weight.as_ref(), self.eps)?;
+            fused_modulate(&norm_ff, &scale_mlp, &shift_mlp)?
+        } else if let Some(w) = self.norm3_weight.as_ref() {
             fused_rms_norm_modulate(&hs, w, &scale_mlp, &shift_mlp, self.eps)?
         } else {
             let norm_ff = rms_norm(&hs, None, self.eps)?;
