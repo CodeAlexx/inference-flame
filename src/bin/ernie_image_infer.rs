@@ -36,7 +36,7 @@ fn main() {
 
 fn run() -> anyhow::Result<()> {
     let prompt = std::env::args().nth(1).unwrap_or_else(|| "a beautiful sunset over the ocean".to_string());
-    let output = std::env::args().nth(2).unwrap_or_else(|| "/home/alex/serenity/output/ernie_cat_1024.png".to_string());
+    let output = std::env::args().nth(2).unwrap_or_else(|| "/home/alex/EriDiffusion/inference-flame/output/ernie_cat_1024.png".to_string());
 
     let device = global_cuda_device();
     let _no_grad = flame_core::autograd::AutogradContext::no_grad();
@@ -179,6 +179,12 @@ fn run() -> anyhow::Result<()> {
     let t3 = Instant::now();
 
     drop(model);
+    // Return DiT allocations to the driver — the pool caches freed blocks,
+    // and without this VAE decode OOMs on the 1024×128×1024×1024 conv2d
+    // intermediate even though the DiT has been dropped from Rust-side
+    // ownership.
+    flame_core::cuda_alloc_pool::clear_pool_cache();
+    flame_core::device::trim_cuda_mempool(0);
 
     let vae_weights = flame_core::serialization::load_file(VAE_PATH, &device)?;
     let vae_device = flame_core::device::Device::from_arc(device.clone());
