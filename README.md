@@ -17,10 +17,10 @@ Pure Rust diffusion model inference using [flame-core](https://github.com/CodeAl
 | ![SD3.5 Medium](docs/sd3_medium_sample.png) | ![ERNIE-Image](docs/ernie_image_sample.png) | ![LTX-2.3](docs/ltx2_sample.png) |
 | *28 steps, CFG 4.5, 1024²* | *28 steps, CFG 4.0, 1024²* | *10s video + audio — [sample.mp4](docs/ltx2_sample.mp4)* |
 
-| Motif-Video 2B |
-|---|
-| ![Motif](docs/motif_sample.png) |
-| *50 steps, APG cfg 8.0, 1280×720×49 @ 24fps — [sample.mp4](docs/motif_sample.mp4)* |
+| FLUX.1-dev | Motif-Video 2B |
+|---|---|
+| ![FLUX.1-dev](docs/flux1_sample.png) | ![Motif](docs/motif_sample.png) |
+| *20 steps, guidance 3.5, 1024²* | *50 steps, APG cfg 8.0, 1280×720×49 @ 24fps — [sample.mp4](docs/motif_sample.mp4)* |
 
 https://github.com/CodeAlexx/inference-flame/raw/master/docs/ltx2_sample.mp4
 
@@ -44,6 +44,7 @@ Denoise is **10% faster per-step** than PyTorch. Fits entirely on a single 24GB 
 
 | Model | Architecture | Status |
 |---|---|---|
+| FLUX.1-dev | Dual-stream DiT (19 double + 38 single blocks, 12B) | Working — BFL-parity 1024²/20, F32 RoPE PE, batched CFG, BlockOffloader |
 | Klein 4B | Flux 2 DiT (5+20 blocks) | Working |
 | Klein 9B | Flux 2 DiT (8+24 blocks) | Working |
 | Z-Image | NextDiT (6.15B) | Working |
