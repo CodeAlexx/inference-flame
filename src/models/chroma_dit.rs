@@ -153,6 +153,60 @@ impl ChromaConfig {
 ///
 /// Double blocks (`transformer_blocks.{i}`) and single blocks
 /// (`single_transformer_blocks.{i}`) are managed by BlockOffloader.
+/// Per-stage telemetry, gated on CHROMA_STAGE_DEBUG (stats) or
+/// CHROMA_SAVE_STAGES (also dumps each tensor to safetensors for
+/// layer-by-layer parity vs diffusers).
+fn chroma_log_stage(name: &str, t: &Tensor) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let stats_on = std::env::var("CHROMA_STAGE_DEBUG").is_ok();
+    let save_on  = std::env::var("CHROMA_SAVE_STAGES").is_ok();
+    if !stats_on && !save_on {
+        return;
+    }
+    static CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
+    const MAX_CALLS: usize = 120;
+    let idx = CALL_COUNT.fetch_add(1, Ordering::Relaxed);
+    if idx >= MAX_CALLS {
+        return;
+    }
+    if save_on {
+        use std::path::Path;
+        let safe_name = name.replace(':', "_").replace('.', "_");
+        let p_str = format!(
+            "/home/alex/EriDiffusion/inference-flame/output/chroma_stage_{idx:03}_{safe_name}.safetensors"
+        );
+        let p = Path::new(&p_str);
+        let mut m: HashMap<String, Tensor> = HashMap::new();
+        if let Ok(c) = t.clone_result() {
+            m.insert("value".to_string(), c);
+            let _ = flame_core::serialization::save_file(&m, p);
+        }
+    }
+    if !stats_on {
+        return;
+    }
+    let f32t = match t.to_dtype(DType::F32) { Ok(x) => x, Err(_) => return };
+    let data = match f32t.to_vec() { Ok(v) => v, Err(_) => return };
+    let n = data.len();
+    let mut mn = f32::INFINITY;
+    let mut mx = f32::NEG_INFINITY;
+    let mut abs_sum = 0f64;
+    let mut nan_cnt = 0usize;
+    let mut inf_cnt = 0usize;
+    for v in &data {
+        if v.is_nan() { nan_cnt += 1; continue; }
+        if v.is_infinite() { inf_cnt += 1; continue; }
+        if *v < mn { mn = *v; }
+        if *v > mx { mx = *v; }
+        abs_sum += v.abs() as f64;
+    }
+    let abs_mean = if n > 0 { abs_sum / n as f64 } else { 0.0 };
+    eprintln!(
+        "[chroma] {idx:03} {name:<24} shape={:?} abs_mean={:.4e} min={:+.4e} max={:+.4e} nan={} inf={}",
+        t.shape().dims(), abs_mean, mn, mx, nan_cnt, inf_cnt
+    );
+}
+
 /// Shared weights (x_embedder, context_embedder, proj_out, distilled_guidance_layer)
 /// stay GPU-resident.
 pub struct ChromaDit {
@@ -353,12 +407,14 @@ impl ChromaDit {
     /// returning `[B, mod_index_length, inner_dim]`.
     fn approximator_forward(&self, x: &Tensor) -> Result<Tensor> {
         let cfg = &self.config;
+        chroma_log_stage("approx:0:input", x);
         // in_proj
         let in_w = self.shared.get("distilled_guidance_layer.in_proj.weight")
             .ok_or_else(|| flame_core::Error::InvalidInput("Missing distilled_guidance_layer.in_proj.weight".into()))?;
         let in_b = self.shared.get("distilled_guidance_layer.in_proj.bias")
             .ok_or_else(|| flame_core::Error::InvalidInput("Missing distilled_guidance_layer.in_proj.bias".into()))?;
         let mut x = Self::linear_bias(x, in_w, in_b)?;
+        chroma_log_stage("approx:1:in_proj", &x);
 
         // Residual block stack
         for i in 0..cfg.approximator_num_layers {
@@ -378,6 +434,7 @@ impl ChromaDit {
             let h = h.silu()?;
             let h = Self::linear_bias(&h, l2_w, l2_b)?;
             x = x.add(&h)?;
+            chroma_log_stage(&format!("approx:2:res.{i}"), &x);
         }
 
         // out_proj
@@ -602,6 +659,9 @@ impl ChromaDit {
         let ctx_b = self.shared.get("context_embedder.bias")
             .ok_or_else(|| flame_core::Error::InvalidInput("Missing context_embedder.bias".into()))?;
         let mut txt = Self::linear_bias(txt, ctx_w, ctx_b)?;
+        chroma_log_stage("0:img_in", &img);
+        chroma_log_stage("0:txt_in", &txt);
+        chroma_log_stage("0:pooled_temb", pooled_temb);
 
         // --- Block indexing constants (layout from diffusers transformer_chroma.py) ---
         //   single block i:  [3*i : 3*i + 3]                          for i in 0..38
@@ -638,6 +698,10 @@ impl ChromaDit {
             if i % 5 == 0 || i == cfg.num_double_blocks - 1 {
                 log::info!("[Chroma] Double block {}/{}", i + 1, cfg.num_double_blocks);
             }
+            if i == 0 || i == 4 || i == 9 || i == 14 || i == cfg.num_double_blocks - 1 {
+                chroma_log_stage(&format!("1:dbl_img.{i:02}"), &img);
+                chroma_log_stage(&format!("1:dbl_txt.{i:02}"), &txt);
+            }
         }
 
         // --- Concat for single blocks: [B, N_txt + N_img, dim] ---
@@ -660,6 +724,9 @@ impl ChromaDit {
             if i % 10 == 0 || i == cfg.num_single_blocks - 1 {
                 log::info!("[Chroma] Single block {}/{}", i + 1, cfg.num_single_blocks);
             }
+            if i == 0 || i == 9 || i == 18 || i == 27 || i == cfg.num_single_blocks - 1 {
+                chroma_log_stage(&format!("2:sgl.{i:02}"), &x);
+            }
         }
 
         // --- Extract image portion (drop the txt prefix) and apply norm_out ---
@@ -674,12 +741,16 @@ impl ChromaDit {
         let scaled = normed.mul(&one_plus.unsqueeze(1)?)?;
         let modulated = scaled.add(&shift.unsqueeze(1)?)?;
 
+        chroma_log_stage("3:pre_proj_out", &modulated);
+
         // proj_out
         let proj_w = self.shared.get("proj_out.weight")
             .ok_or_else(|| flame_core::Error::InvalidInput("Missing proj_out.weight".into()))?;
         let proj_b = self.shared.get("proj_out.bias")
             .ok_or_else(|| flame_core::Error::InvalidInput("Missing proj_out.bias".into()))?;
-        Self::linear_bias(&modulated, proj_w, proj_b)
+        let out = Self::linear_bias(&modulated, proj_w, proj_b)?;
+        chroma_log_stage("4:proj_out", &out);
+        Ok(out)
     }
 
     // -----------------------------------------------------------------------
