@@ -615,14 +615,25 @@ impl Gemma3Encoder {
             // BlockOffloader returns keys with full safetensors names, e.g.
             // "language_model.model.layers.5.self_attn.q_proj.weight"
             // Strip prefix to get "layers.5.self_attn.q_proj.weight"
+            //
+            // BlockOffloader::prepare_weights auto-transposes 2D .weight tensors
+            // to [Cin, Cout] for its own matmul path, but `linear_3d` below
+            // expects the native PyTorch [Cout, Cin] layout (it does its own
+            // transpose before matmul). Un-transpose here — same fix as
+            // LTX-2 / FLUX1 / Chroma / Qwen (see commit 02c70c5).
             let weights: HashMap<String, Tensor> = raw_weights.iter()
                 .map(|(k, v)| {
                     let stripped = k.strip_prefix("language_model.model.")
                         .unwrap_or(k)
                         .to_string();
-                    (stripped, v.clone())
+                    let tensor = if stripped.ends_with(".weight") && v.shape().dims().len() == 2 {
+                        v.transpose()?
+                    } else {
+                        v.clone()
+                    };
+                    Ok::<_, flame_core::Error>((stripped, tensor))
                 })
-                .collect();
+                .collect::<Result<HashMap<_, _>>>()?;
 
             if i == 0 {
                 let mut keys: Vec<&String> = weights.keys().collect();
