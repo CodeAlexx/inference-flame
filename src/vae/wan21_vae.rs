@@ -521,7 +521,7 @@ impl Wan21VaeDecoder {
         Self::from_weights(&weights, device)
     }
 
-    fn from_weights(
+    pub(crate) fn from_weights(
         weights: &Weights,
         device: &Arc<cudarc::driver::CudaDevice>,
     ) -> Result<Self> {
