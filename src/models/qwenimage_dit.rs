@@ -543,6 +543,25 @@ impl QwenImageDit {
     /// - `img_shape`: `(frame, height, width)` — for a single-frame 1024²
     ///   image with `vae_scale=8` and `patch_size=2` the latent grid is
     ///   `(1, 64, 64)`.
+    /// BlockOffloader's `prepare_weights` auto-transposes 2D `.weight` tensors
+    /// to `[Cin, Cout]` for its matmul fast path. `fused_linear3d_native`
+    /// (which `block_forward` routes through) expects PyTorch layout
+    /// `[Cout, Cin]`. Un-transpose here so 2D weights match the kernel
+    /// contract. Same pattern Chroma uses.
+    fn untranspose_block_weights(
+        raw: &Arc<HashMap<String, Tensor>>,
+    ) -> Result<HashMap<String, Tensor>> {
+        let mut out = HashMap::with_capacity(raw.len());
+        for (k, v) in raw.iter() {
+            if k.ends_with(".weight") && v.shape().dims().len() == 2 {
+                out.insert(k.clone(), v.transpose()?);
+            } else {
+                out.insert(k.clone(), v.clone());
+            }
+        }
+        Ok(out)
+    }
+
     pub fn forward(
         &mut self,
         hidden_states: &Tensor,
@@ -591,12 +610,13 @@ impl QwenImageDit {
             .map_err(|e| flame_core::Error::InvalidInput(format!("prefetch: {e}")))?;
 
         for i in 0..total_blocks {
-            let raw = self.offloader.await_block(i)
+            let raw_arc = self.offloader.await_block(i)
                 .map_err(|e| flame_core::Error::InvalidInput(format!("await: {e}")))?;
             if i + 1 < total_blocks {
                 self.offloader.prefetch_block(i + 1)
                     .map_err(|e| flame_core::Error::InvalidInput(format!("prefetch: {e}")))?;
             }
+            let raw = Self::untranspose_block_weights(&raw_arc)?;
 
             let (new_img, new_txt) =
                 self.block_forward(&img, &txt, &temb, &pe_cos, &pe_sin, &raw, i)?;
@@ -669,6 +689,30 @@ impl QwenImageDit {
         timestep: &Tensor,
         image_regions: &[(usize, usize, usize)],
     ) -> Result<Tensor> {
+        // Backwards-compatible: same timestep for every region (no per-region zero).
+        self.forward_edit_with_ref_timestep(hidden_states, encoder_hidden_states,
+            timestep, None, image_regions)
+    }
+
+    /// Edit forward with optional per-region timestep for the reference.
+    ///
+    /// `ref_timestep`: when `Some(t_ref)`, the reference region (region index 1
+    /// in `image_regions`) gets its own timestep — typically near-zero
+    /// (`index_timestep_zero` semantics from `QwenImageEditPlusPipeline`) so
+    /// the model treats reference tokens as clean conditioning while the
+    /// target region uses the noise-schedule sigma. When `None`, every region
+    /// shares `timestep` (legacy single-temb behavior).
+    ///
+    /// The first region in `image_regions` is treated as the target; all
+    /// subsequent regions use `ref_timestep` (or share `timestep` if None).
+    pub fn forward_edit_with_ref_timestep(
+        &mut self,
+        hidden_states: &Tensor,
+        encoder_hidden_states: &Tensor,
+        timestep: &Tensor,
+        ref_timestep: Option<&Tensor>,
+        image_regions: &[(usize, usize, usize)],
+    ) -> Result<Tensor> {
         let cfg = self.config.clone();
         let img_len = hidden_states.shape().dims()[1];
         let txt_len = encoder_hidden_states.shape().dims()[1];
@@ -684,6 +728,10 @@ impl QwenImageDit {
                 img_len, expected_img_len, image_regions
             )));
         }
+        let target_seq_len: usize = {
+            let (f, h, w) = image_regions[0];
+            f * h * w
+        };
 
         // ── img_in ──
         let img_in_w = self.shared.get("img_in.weight")
@@ -702,8 +750,12 @@ impl QwenImageDit {
         let txt_normed = Self::rms_norm(encoder_hidden_states, txt_norm_w, 1e-6)?;
         let mut txt = Self::linear_bias(&txt_normed, txt_in_w, txt_in_b)?;
 
-        // ── time_text_embed ──
+        // ── time_text_embed (target) and optional per-region ref temb ──
         let temb = self.time_text_embed(timestep)?;
+        let temb_ref: Option<Tensor> = match ref_timestep {
+            Some(rt) => Some(self.time_text_embed(rt)?),
+            None => None,
+        };
 
         // ── Multi-region RoPE tables ──
         let (pe_cos, pe_sin) = Self::build_rope_tables_multi(
@@ -719,15 +771,21 @@ impl QwenImageDit {
             .map_err(|e| flame_core::Error::InvalidInput(format!("prefetch: {e}")))?;
 
         for i in 0..total_blocks {
-            let raw = self.offloader.await_block(i)
+            let raw_arc = self.offloader.await_block(i)
                 .map_err(|e| flame_core::Error::InvalidInput(format!("await: {e}")))?;
             if i + 1 < total_blocks {
                 self.offloader.prefetch_block(i + 1)
                     .map_err(|e| flame_core::Error::InvalidInput(format!("prefetch: {e}")))?;
             }
+            let raw = Self::untranspose_block_weights(&raw_arc)?;
 
-            let (new_img, new_txt) =
-                self.block_forward(&img, &txt, &temb, &pe_cos, &pe_sin, &raw, i)?;
+            let (new_img, new_txt) = match &temb_ref {
+                Some(tr) => self.block_forward_per_region(
+                    &img, &txt, &temb, tr, target_seq_len,
+                    &pe_cos, &pe_sin, &raw, i,
+                )?,
+                None => self.block_forward(&img, &txt, &temb, &pe_cos, &pe_sin, &raw, i)?,
+            };
             img = new_img;
             txt = new_txt;
 
@@ -909,6 +967,172 @@ impl QwenImageDit {
         let txt = txt.add(&txt_gate2.unsqueeze(1)?.mul(&txt_mlp)?)?;
 
         let _ = Self::linear_nobias; // silence unused
+        Ok((img, txt))
+    }
+
+    /// Per-region image-stream modulation variant of `block_forward`.
+    ///
+    /// Target tokens `[0, target_seq_len)` get `img_mod(temb_target)`; reference
+    /// tokens `[target_seq_len, n_img)` get `img_mod(temb_ref)`. Txt stream
+    /// uses `temb_target` only — it has no reference region. Everything else
+    /// matches `block_forward` (attention, QK norm, RoPE, residuals).
+    ///
+    /// This implements the `index_timestep_zero` semantics from
+    /// `QwenImageEditPlusPipeline` / the 2511 Qwen-Image-Edit model:
+    /// reference tokens are treated as clean (t=0) conditioning while target
+    /// tokens use the noise-schedule sigma.
+    #[allow(clippy::too_many_arguments)]
+    fn block_forward_per_region(
+        &self,
+        img: &Tensor,
+        txt: &Tensor,
+        temb_target: &Tensor,
+        temb_ref: &Tensor,
+        target_seq_len: usize,
+        pe_cos: &Tensor,
+        pe_sin: &Tensor,
+        weights: &HashMap<String, Tensor>,
+        block_idx: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        let cfg = &self.config;
+        let h = cfg.num_heads;
+        let d = cfg.head_dim;
+        let dim = cfg.inner_dim;
+        let prefix = format!("transformer_blocks.{block_idx}");
+        let w = |suffix: &str| -> Result<&Tensor> {
+            let key = format!("{prefix}.{suffix}");
+            weights.get(&key).ok_or_else(|| {
+                flame_core::Error::InvalidInput(format!("Missing: {key}"))
+            })
+        };
+
+        let b = img.shape().dims()[0];
+        let n_img = img.shape().dims()[1];
+        let n_txt = txt.shape().dims()[1];
+        let ref_seq_len = n_img.saturating_sub(target_seq_len);
+
+        // Both temb tensors go through the SAME img_mod linear (weights are
+        // timestep-independent), producing two [B, 6*dim] mod vectors.
+        let img_mod_w = w("img_mod.1.weight")?;
+        let img_mod_b = w("img_mod.1.bias")?;
+        let txt_mod_w = w("txt_mod.1.weight")?;
+        let txt_mod_b = w("txt_mod.1.bias")?;
+
+        let temb_target_silu = temb_target.silu()?;
+        let temb_ref_silu = temb_ref.silu()?;
+
+        let img_mods_t = Self::linear_bias(&temb_target_silu.unsqueeze(1)?, img_mod_w, img_mod_b)?
+            .squeeze(Some(1))?; // [B, 6*dim]
+        let img_mods_r = Self::linear_bias(&temb_ref_silu.unsqueeze(1)?, img_mod_w, img_mod_b)?
+            .squeeze(Some(1))?; // [B, 6*dim]
+
+        // Broadcast each [B, dim] component to [B, seq_len, dim], then concat
+        // along the seq dim so the per-token mod tensor has shape [B, n_img, dim].
+        // Used as a drop-in for the unsqueeze(1) broadcast in `block_forward`.
+        let expand_cat = |t_target: &Tensor, t_ref: &Tensor| -> Result<Tensor> {
+            let t_exp = t_target.unsqueeze(1)?.repeat_axis_device(1, target_seq_len)?;
+            if ref_seq_len == 0 {
+                return Ok(t_exp);
+            }
+            let r_exp = t_ref.unsqueeze(1)?.repeat_axis_device(1, ref_seq_len)?;
+            Tensor::cat(&[&t_exp, &r_exp], 1)
+        };
+
+        // Split img_mods_{t,r} into norm1/norm2 halves, then into shift/scale/gate.
+        let img_mod1_t = img_mods_t.narrow(1, 0, 3 * dim)?;
+        let img_mod2_t = img_mods_t.narrow(1, 3 * dim, 3 * dim)?;
+        let img_mod1_r = img_mods_r.narrow(1, 0, 3 * dim)?;
+        let img_mod2_r = img_mods_r.narrow(1, 3 * dim, 3 * dim)?;
+
+        let img_shift1 = expand_cat(&img_mod1_t.narrow(1, 0, dim)?,       &img_mod1_r.narrow(1, 0, dim)?)?;
+        let img_scale1 = expand_cat(&img_mod1_t.narrow(1, dim, dim)?,      &img_mod1_r.narrow(1, dim, dim)?)?;
+        let img_gate1  = expand_cat(&img_mod1_t.narrow(1, 2 * dim, dim)?,  &img_mod1_r.narrow(1, 2 * dim, dim)?)?;
+        let img_shift2 = expand_cat(&img_mod2_t.narrow(1, 0, dim)?,       &img_mod2_r.narrow(1, 0, dim)?)?;
+        let img_scale2 = expand_cat(&img_mod2_t.narrow(1, dim, dim)?,      &img_mod2_r.narrow(1, dim, dim)?)?;
+        let img_gate2  = expand_cat(&img_mod2_t.narrow(1, 2 * dim, dim)?,  &img_mod2_r.narrow(1, 2 * dim, dim)?)?;
+
+        // Txt stream: single-temb (target), same as block_forward.
+        let txt_mods = Self::linear_bias(&temb_target_silu.unsqueeze(1)?, txt_mod_w, txt_mod_b)?
+            .squeeze(Some(1))?;
+        let txt_mod1 = txt_mods.narrow(1, 0, 3 * dim)?;
+        let txt_mod2 = txt_mods.narrow(1, 3 * dim, 3 * dim)?;
+        let txt_shift1 = txt_mod1.narrow(1, 0, dim)?;
+        let txt_scale1 = txt_mod1.narrow(1, dim, dim)?;
+        let txt_gate1  = txt_mod1.narrow(1, 2 * dim, dim)?;
+        let txt_shift2 = txt_mod2.narrow(1, 0, dim)?;
+        let txt_scale2 = txt_mod2.narrow(1, dim, dim)?;
+        let txt_gate2  = txt_mod2.narrow(1, 2 * dim, dim)?;
+
+        // ── norm1 + modulate (img uses per-token, txt uses broadcast) ──
+        let img_normed = Self::layer_norm_no_affine(img, 1e-6)?;
+        let img_modulated = img_normed
+            .mul(&img_scale1.add_scalar(1.0)?)?
+            .add(&img_shift1)?;
+
+        let txt_normed = Self::layer_norm_no_affine(txt, 1e-6)?;
+        let txt_modulated = txt_normed
+            .mul(&txt_scale1.add_scalar(1.0)?.unsqueeze(1)?)?
+            .add(&txt_shift1.unsqueeze(1)?)?;
+
+        // ── QKV projections per stream ──
+        let img_q = Self::linear_bias(&img_modulated, w("attn.to_q.weight")?, w("attn.to_q.bias")?)?;
+        let img_k = Self::linear_bias(&img_modulated, w("attn.to_k.weight")?, w("attn.to_k.bias")?)?;
+        let img_v = Self::linear_bias(&img_modulated, w("attn.to_v.weight")?, w("attn.to_v.bias")?)?;
+        let txt_q = Self::linear_bias(&txt_modulated, w("attn.add_q_proj.weight")?, w("attn.add_q_proj.bias")?)?;
+        let txt_k = Self::linear_bias(&txt_modulated, w("attn.add_k_proj.weight")?, w("attn.add_k_proj.bias")?)?;
+        let txt_v = Self::linear_bias(&txt_modulated, w("attn.add_v_proj.weight")?, w("attn.add_v_proj.bias")?)?;
+
+        let img_q = img_q.reshape(&[b, n_img, h, d])?.permute(&[0, 2, 1, 3])?;
+        let img_k = img_k.reshape(&[b, n_img, h, d])?.permute(&[0, 2, 1, 3])?;
+        let img_v = img_v.reshape(&[b, n_img, h, d])?.permute(&[0, 2, 1, 3])?;
+        let txt_q = txt_q.reshape(&[b, n_txt, h, d])?.permute(&[0, 2, 1, 3])?;
+        let txt_k = txt_k.reshape(&[b, n_txt, h, d])?.permute(&[0, 2, 1, 3])?;
+        let txt_v = txt_v.reshape(&[b, n_txt, h, d])?.permute(&[0, 2, 1, 3])?;
+
+        let img_q = Self::rms_norm(&img_q, w("attn.norm_q.weight")?, 1e-6)?;
+        let img_k = Self::rms_norm(&img_k, w("attn.norm_k.weight")?, 1e-6)?;
+        let txt_q = Self::rms_norm(&txt_q, w("attn.norm_added_q.weight")?, 1e-6)?;
+        let txt_k = Self::rms_norm(&txt_k, w("attn.norm_added_k.weight")?, 1e-6)?;
+
+        let q = Tensor::cat(&[&txt_q, &img_q], 2)?;
+        let k = Tensor::cat(&[&txt_k, &img_k], 2)?;
+        let v = Tensor::cat(&[&txt_v, &img_v], 2)?;
+        let (q, k) = Self::apply_rope_complex(&q, &k, pe_cos, pe_sin)?;
+
+        let attn_out = flame_core::attention::sdpa(&q, &k, &v, None)?;
+
+        let txt_attn = attn_out.narrow(2, 0, n_txt)?;
+        let img_attn = attn_out.narrow(2, n_txt, n_img)?;
+        let img_attn = img_attn.permute(&[0, 2, 1, 3])?.reshape(&[b, n_img, h * d])?;
+        let txt_attn = txt_attn.permute(&[0, 2, 1, 3])?.reshape(&[b, n_txt, h * d])?;
+
+        let img_attn = Self::linear_bias(&img_attn, w("attn.to_out.0.weight")?, w("attn.to_out.0.bias")?)?;
+        let txt_attn = Self::linear_bias(&txt_attn, w("attn.to_add_out.weight")?, w("attn.to_add_out.bias")?)?;
+
+        // ── Gated residual (img uses per-token gate, txt uses broadcast) ──
+        let img = img.add(&img_gate1.mul(&img_attn)?)?;
+        let txt = txt.add(&txt_gate1.unsqueeze(1)?.mul(&txt_attn)?)?;
+
+        // ── FFN for img (per-token mod) ──
+        let img_normed2 = Self::layer_norm_no_affine(&img, 1e-6)?;
+        let img_mlp_in = img_normed2
+            .mul(&img_scale2.add_scalar(1.0)?)?
+            .add(&img_shift2)?;
+        let img_mlp = Self::linear_bias(&img_mlp_in, w("img_mlp.net.0.proj.weight")?, w("img_mlp.net.0.proj.bias")?)?;
+        let img_mlp = img_mlp.gelu()?;
+        let img_mlp = Self::linear_bias(&img_mlp, w("img_mlp.net.2.weight")?, w("img_mlp.net.2.bias")?)?;
+        let img = img.add(&img_gate2.mul(&img_mlp)?)?;
+
+        // ── FFN for txt (broadcast mod) ──
+        let txt_normed2 = Self::layer_norm_no_affine(&txt, 1e-6)?;
+        let txt_mlp_in = txt_normed2
+            .mul(&txt_scale2.add_scalar(1.0)?.unsqueeze(1)?)?
+            .add(&txt_shift2.unsqueeze(1)?)?;
+        let txt_mlp = Self::linear_bias(&txt_mlp_in, w("txt_mlp.net.0.proj.weight")?, w("txt_mlp.net.0.proj.bias")?)?;
+        let txt_mlp = txt_mlp.gelu()?;
+        let txt_mlp = Self::linear_bias(&txt_mlp, w("txt_mlp.net.2.weight")?, w("txt_mlp.net.2.bias")?)?;
+        let txt = txt.add(&txt_gate2.unsqueeze(1)?.mul(&txt_mlp)?)?;
+
         Ok((img, txt))
     }
 }
