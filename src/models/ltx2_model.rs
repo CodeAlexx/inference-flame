@@ -3579,14 +3579,23 @@ impl LTX2StreamingModel {
                     offloader.prefetch_block(i + 1)
                         .map_err(|e| flame_core::Error::Io(format!("prefetch: {e}")))?;
                 }
-                // Strip key prefix
+                // Strip key prefix + un-transpose 2D .weight tensors
+                // (BlockOffloader::prepare_weights auto-transposes to [Cin,Cout]
+                // but fused_linear3d_native expects [Cout,Cin] — same pattern
+                // Chroma/FLUX1/Qwen fixed).
                 let mut block_weights: HashMap<String, Tensor> = raw_weights.iter()
                     .map(|(k, v)| {
                         let stripped = k.strip_prefix(key_prefix).unwrap_or(k).to_string();
-                        (stripped, v.clone())
+                        let tensor = if stripped.ends_with(".weight") && v.shape().dims().len() == 2 {
+                            v.transpose()?
+                        } else {
+                            v.clone()
+                        };
+                        Ok::<_, flame_core::Error>((stripped, tensor))
                     })
-                    .collect();
-                // Merge F32 tensors from cache
+                    .collect::<Result<HashMap<_, _>>>()?;
+                // Merge F32 tensors from cache (scale_shift_table only — not
+                // a .weight key, so not affected by the transpose pass above)
                 let n_f32 = if i < self.f32_cache.len() {
                     let cache = &self.f32_cache[i];
                     for (k, v) in cache {
@@ -4026,12 +4035,19 @@ impl LTX2StreamingModel {
                     offloader.prefetch_block(i + 1)
                         .map_err(|e| flame_core::Error::Io(format!("prefetch: {e}")))?;
                 }
+                // Strip key prefix + un-transpose 2D .weight tensors (see
+                // parallel block in forward_video at line 3583 for rationale).
                 let mut block_weights: HashMap<String, Tensor> = raw_weights.iter()
                     .map(|(k, v)| {
                         let stripped = k.strip_prefix(key_prefix).unwrap_or(k).to_string();
-                        (stripped, v.clone())
+                        let tensor = if stripped.ends_with(".weight") && v.shape().dims().len() == 2 {
+                            v.transpose()?
+                        } else {
+                            v.clone()
+                        };
+                        Ok::<_, flame_core::Error>((stripped, tensor))
                     })
-                    .collect();
+                    .collect::<Result<HashMap<_, _>>>()?;
                 // Merge F32 tensors from cache
                 if i < self.f32_cache.len() {
                     for (k, v) in &self.f32_cache[i] {

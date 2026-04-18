@@ -87,13 +87,19 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 .map_err(|e| format!("prefetch: {e}"))?;
         }
 
-        // Strip key prefix
+        // Strip key prefix + un-transpose 2D .weight tensors
+        // (BlockOffloader pre-transposes; fused_linear3d_native wants [Cout,Cin]).
         let block_weights: HashMap<String, Tensor> = raw_weights.iter()
             .map(|(k, v)| {
                 let stripped = k.strip_prefix(KEY_PREFIX).unwrap_or(k).to_string();
-                (stripped, v.clone())
+                let tensor = if stripped.ends_with(".weight") && v.shape().dims().len() == 2 {
+                    v.transpose()?
+                } else {
+                    v.clone()
+                };
+                Ok::<_, flame_core::Error>((stripped, tensor))
             })
-            .collect();
+            .collect::<flame_core::Result<HashMap<_, _>>>()?;
 
         // Build block struct
         let block = inference_flame::models::ltx2_model::LTX2StreamingModel::load_block_from_weights_static(
