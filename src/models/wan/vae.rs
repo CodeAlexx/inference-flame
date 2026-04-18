@@ -225,11 +225,13 @@ impl CausalConv3d {
         let (pd, _ph, _pw) = self.conv.padding;
         let d_out_total = (d_in + 2 * pd - kd) / sd + 1;
 
-        // Budget: aim for < 1 GB column buffer per chunk. For 256-channel
-        // input with H*W ≈ 73k and kernel 3×3×3, col_rows = 256*27 ≈ 6912
-        // and col_cols/chunk = target_bytes / (col_rows * 2) ≈ 75k. Set the
-        // chunk to cover about 1 temporal frame at a time in the worst case.
-        const COL_BYTE_BUDGET: usize = 1usize << 30; // 1 GB
+        // Budget: aim for ≤ 256 MB column buffer per chunk. Earlier budget of
+        // 1 GB hit OOM on 24 GB cards when combined with the DiT pool cache
+        // and the VAE's surrounding activations — observed at head_conv on
+        // [1, 256, 8, 96, 128] (192×256 output) where a 6-frame chunk
+        // materialized a 973 MB col buffer. 256 MB gives a ~4× safety margin
+        // and pushes worst-case into 1.5-frame chunks at the head stage.
+        const COL_BYTE_BUDGET: usize = 256usize << 20; // 256 MB
         let hw = dims_in[3] * dims_in[4];
         let col_rows = dims_in[1] * kd * self.conv.kernel_size.1 * self.conv.kernel_size.2;
         let cols_per_out_frame = hw; // with stride 1 spatially
