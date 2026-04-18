@@ -425,6 +425,26 @@ impl Flux1DiT {
     /// - `txt_ids`: text position IDs [N_txt, 3]
     /// - `guidance`: guidance scale [B] (Dev only, None for Schnell)
     /// - `vector`: CLIP pooled [B, 768]
+    /// BlockOffloader's `prepare_weights` auto-transposes 2D `.weight` tensors
+    /// to `[Cin, Cout]` for its own matmul fast path. `fused_linear3d_native`
+    /// (which our block-forward helpers call) expects the original PyTorch
+    /// layout `[Cout, Cin]`. Un-transpose here so every 2D weight is back in
+    /// the layout the kernel checks. Same pattern Chroma uses in
+    /// `chroma_dit::untranspose_block_weights`.
+    fn untranspose_block_weights(
+        raw: &std::sync::Arc<HashMap<String, Tensor>>,
+    ) -> Result<HashMap<String, Tensor>> {
+        let mut out = HashMap::with_capacity(raw.len());
+        for (k, v) in raw.iter() {
+            if k.ends_with(".weight") && v.shape().dims().len() == 2 {
+                out.insert(k.clone(), v.transpose()?);
+            } else {
+                out.insert(k.clone(), v.clone());
+            }
+        }
+        Ok(out)
+    }
+
     pub fn forward(
         &mut self,
         img: &Tensor,
@@ -521,8 +541,9 @@ impl Flux1DiT {
         }
 
         for i in 0..cfg.num_double_blocks {
+            flame_core::device::trim_cuda_mempool(0);
             let t_aw = std::time::Instant::now();
-            let raw = self.offloader.await_block(i)
+            let raw_arc = self.offloader.await_block(i)
                 .map_err(|e| flame_core::Error::InvalidInput(format!("await: {e}")))?;
             let aw_ms = t_aw.elapsed().as_millis();
             total_await_ms += aw_ms;
@@ -534,6 +555,8 @@ impl Flux1DiT {
             }
             let pf_ms = t_pf.elapsed().as_millis();
             total_prefetch_ms += pf_ms;
+
+            let raw = Self::untranspose_block_weights(&raw_arc)?;
 
             let t_fwd = std::time::Instant::now();
             let (new_img, new_txt) = self.double_block_forward(
@@ -565,8 +588,9 @@ impl Flux1DiT {
         for i in 0..cfg.num_single_blocks {
             let block_idx = cfg.num_double_blocks + i;
 
+            flame_core::device::trim_cuda_mempool(0);
             let t_aw = std::time::Instant::now();
-            let raw = self.offloader.await_block(block_idx)
+            let raw_arc = self.offloader.await_block(block_idx)
                 .map_err(|e| flame_core::Error::InvalidInput(format!("await: {e}")))?;
             let aw_ms = t_aw.elapsed().as_millis();
             total_await_ms += aw_ms;
@@ -578,6 +602,8 @@ impl Flux1DiT {
             }
             let pf_ms = t_pf.elapsed().as_millis();
             total_prefetch_ms += pf_ms;
+
+            let raw = Self::untranspose_block_weights(&raw_arc)?;
 
             let t_fwd = std::time::Instant::now();
             x = self.single_block_forward(&x, &vec, &pe_cos, &pe_sin, txt_len, &raw, i)?;
