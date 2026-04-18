@@ -441,29 +441,27 @@ impl Flux1DiT {
         let cos_full = Tensor::cat(&cos_refs, 1)?; // [N, sum(half)]
         let sin_full = Tensor::cat(&sin_refs, 1)?;
 
-        // [1, 1, N, sum(half)] BF16 — shape consumed by rope_fused_bf16.
-        let pe_cos = cos_full
-            .unsqueeze(0)?
-            .unsqueeze(0)?
-            .to_dtype(DType::BF16)?;
-        let pe_sin = sin_full
-            .unsqueeze(0)?
-            .unsqueeze(0)?
-            .to_dtype(DType::BF16)?;
+        // [1, 1, N, sum(half)] **F32** — kept in FP32 to match BFL's apply_rope
+        // precision. The ~1 MiB table cost is trivial; the ~4e-3 BF16 floor on
+        // cos/sin otherwise accumulates across 57×20×2=2280 RoPE applications
+        // per inference (blocks × steps × Q+K) and shows up as muddy detail.
+        let pe_cos = cos_full.unsqueeze(0)?.unsqueeze(0)?;
+        let pe_sin = sin_full.unsqueeze(0)?.unsqueeze(0)?;
         Ok((pe_cos, pe_sin))
     }
 
-    /// Apply RoPE to q and k via the fused kernel.
+    /// Apply RoPE to q and k via the fused kernel (F32 PE variant).
     ///
-    /// `pe_cos`, `pe_sin`: `[1, 1, N, D/2]` BF16. `q`, `k`: `[B, H, N, D]` BF16.
+    /// `pe_cos`, `pe_sin`: `[1, 1, N, D/2]` **F32**. `q`, `k`: `[B, H, N, D]` BF16.
+    /// See `build_rope_2d` for rationale on keeping PE in F32.
     fn apply_rope_complex(
         q: &Tensor,
         k: &Tensor,
         pe_cos: &Tensor,
         pe_sin: &Tensor,
     ) -> Result<(Tensor, Tensor)> {
-        let q_out = flame_core::bf16_ops::rope_fused_bf16(q, pe_cos, pe_sin)?;
-        let k_out = flame_core::bf16_ops::rope_fused_bf16(k, pe_cos, pe_sin)?;
+        let q_out = flame_core::bf16_ops::rope_fused_bf16_f32pe(q, pe_cos, pe_sin)?;
+        let k_out = flame_core::bf16_ops::rope_fused_bf16_f32pe(k, pe_cos, pe_sin)?;
         Ok((q_out, k_out))
     }
 
