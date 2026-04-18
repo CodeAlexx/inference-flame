@@ -388,6 +388,8 @@ fn main() -> anyhow::Result<()> {
     println!("\n--- Stage 6: VAE Decode ---");
     let t0 = Instant::now();
     drop(model);
+    flame_core::cuda_alloc_pool::clear_pool_cache();
+    flame_core::device::trim_cuda_mempool(0);
 
     let latents = denoised
         .reshape(&[1, latent_h, latent_w, 128])?
