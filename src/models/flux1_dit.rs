@@ -542,6 +542,7 @@ impl Flux1DiT {
 
         for i in 0..cfg.num_double_blocks {
             flame_core::device::trim_cuda_mempool(0);
+            flame_core::cuda_alloc_pool::clear_pool_cache();
             let t_aw = std::time::Instant::now();
             let raw_arc = self.offloader.await_block(i)
                 .map_err(|e| flame_core::Error::InvalidInput(format!("await: {e}")))?;
@@ -589,6 +590,7 @@ impl Flux1DiT {
             let block_idx = cfg.num_double_blocks + i;
 
             flame_core::device::trim_cuda_mempool(0);
+            flame_core::cuda_alloc_pool::clear_pool_cache();
             let t_aw = std::time::Instant::now();
             let raw_arc = self.offloader.await_block(block_idx)
                 .map_err(|e| flame_core::Error::InvalidInput(format!("await: {e}")))?;
