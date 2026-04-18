@@ -709,9 +709,12 @@ impl LTX2Attention {
         let attn_out = flame_core::sdpa::forward(&q, &k, &v, attention_mask)?;
         tick("sdpa", &mut t, &mut phases);
 
-        // Reshape back: [B, heads, S, head_dim] -> [B, S, inner_dim]
-        let attn_out = attn_out.permute(&[0, 2, 1, 3])?; // [B, S, H, D]
+        // Reshape back: [B, heads, S, head_dim] → [B, S, inner_dim] (force
+        // contiguous first — the post-permute view is non-contig, and the
+        // subsequent gate-mul does elementwise on the strided layout, which
+        // silently returned wrong data for gated LTX-2 blocks).
         let inner_dim = self.num_heads * self.head_dim;
+        let attn_out = attn_out.permute(&[0, 2, 1, 3])?.reshape(&[b, s_q, inner_dim])?;
 
         // Apply per-head gating if present (ComfyUI LTX-2.3)
         let attn_out = if let (Some(gate_w), Some(gate_b)) =
@@ -719,13 +722,15 @@ impl LTX2Attention {
         {
             // gate_logits = hidden_states @ gate_w.T + gate_b → [B, S, num_heads]
             let gate_logits = linear3d(hidden_states, gate_w, Some(gate_b))?;
-            // gates = 2.0 * sigmoid(gate_logits) → [B, S, num_heads]
             let gates = gate_logits.sigmoid()?.mul_scalar(2.0)?;
-            // gates: [B, S, H] → [B, S, H, 1] for broadcast with attn_out [B, S, H, D]
-            let gates = gates.unsqueeze(3)?;
-            attn_out.mul(&gates)?.reshape(&[b, s_q, inner_dim])?
+            // Reshape contiguous attn_out to 4D for per-head multiply,
+            // multiply by gates [B, S, H, 1], then flatten back to inner_dim.
+            let attn_4d = attn_out.reshape(&[b, s_q, self.num_heads, self.head_dim])?;
+            let gates_4d = gates.unsqueeze(3)?;
+            let gated = attn_4d.mul(&gates_4d)?;
+            gated.reshape(&[b, s_q, inner_dim])?
         } else {
-            attn_out.reshape(&[b, s_q, inner_dim])?
+            attn_out
         };
 
         // Output projection
