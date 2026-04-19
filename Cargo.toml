@@ -196,3 +196,15 @@ path = "src/bin/acestep_parity.rs"
 [[bin]]
 name = "ltx2_neg_prompt_parity"
 path = "src/bin/ltx2_neg_prompt_parity.rs"
+
+[[bin]]
+name = "ltx2_latent_upsampler_parity"
+path = "src/bin/ltx2_latent_upsampler_parity.rs"
+
+[[bin]]
+name = "ltx2_adain_tone_map_parity"
+path = "src/bin/ltx2_adain_tone_map_parity.rs"
+
+[[bin]]
+name = "ltx2_generate_ms"
+path = "src/bin/ltx2_generate_ms.rs"
