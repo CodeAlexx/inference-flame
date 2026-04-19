@@ -88,16 +88,37 @@ fn group_norm_nchw(
 
 /// VAE per-stage telemetry, gated on SDXL_STAGE_DEBUG (same env var as unet
 /// so a single run shows both halves). Capped at 20 total calls so the log
-/// is readable.
+/// is readable. When VAE_SAVE_STAGES is set, also dumps each tensor to
+/// safetensors for layer-by-layer parity vs diffusers.
 fn vae_log_stage(name: &str, t: &Tensor) {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    if std::env::var("SDXL_STAGE_DEBUG").is_err() {
+    let stats_on = std::env::var("SDXL_STAGE_DEBUG").is_ok();
+    let save_on  = std::env::var("VAE_SAVE_STAGES").is_ok();
+    if !stats_on && !save_on {
         return;
     }
     static CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
     const MAX_CALLS: usize = 20;
     let idx = CALL_COUNT.fetch_add(1, Ordering::Relaxed);
     if idx >= MAX_CALLS {
+        return;
+    }
+    if save_on {
+        use std::collections::HashMap;
+        use std::path::Path;
+        let safe_name = name.replace(':', "_").replace('.', "_");
+        let p_str = format!(
+            "/home/alex/EriDiffusion/inference-flame/output/vae_stage_{idx:02}_{safe_name}.safetensors"
+        );
+        let p = Path::new(&p_str);
+        let mut m: HashMap<String, Tensor> = HashMap::new();
+        if let Ok(c) = t.clone_result() {
+            m.insert("value".to_string(), c);
+            let _ = flame_core::serialization::save_file(&m, p);
+            eprintln!("[vae-save] {idx:02} {name}");
+        }
+    }
+    if !stats_on {
         return;
     }
     let f32t = match t.to_dtype(DType::F32) {
