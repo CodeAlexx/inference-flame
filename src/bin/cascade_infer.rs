@@ -270,10 +270,10 @@ fn main() -> anyhow::Result<()> {
     println!("--- Stage 2: Stage C denoise ({} steps) ---", args.steps_c);
     let t0 = Instant::now();
 
-    // Seed the RNG for reproducibility.
-    // flame-core's Tensor::randn uses the global RNG; we set it via std (no reseed API exposed here).
-    // For now, the seed only affects logical dispatch ordering. Production would want a deterministic RNG.
-    let _ = args.seed;
+    // Seed flame-core's global RNG so --seed controls the Stage C and Stage B
+    // initial noise deterministically.
+    flame_core::rng::set_seed(args.seed)
+        .map_err(|e| anyhow::anyhow!("rng seed: {e:?}"))?;
 
     let stage_c_latent = {
         let mut unet_c = WuerstchenUNet::load(

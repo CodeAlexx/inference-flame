@@ -170,10 +170,8 @@ pub struct PaellaVQDecoder {
     pub in_conv: Conv2d,       // up_blocks.0: 4 -> 384, 1x1
     pub mrbs_384: Vec<MixingResidualBlock>, // 12 of them
     /// up_blocks.13: ConvTranspose2d(384 -> 192, k=4, s=2, p=1).
-    /// Emulated via zero-insertion (upsample with inserted zeros) + Conv2d(k=4, s=1, p=1) with spatially-flipped kernel.
-    pub up_conv_emu_w: Tensor, // [out=192, in=384, 4, 4] — flipped spatial + transposed ch
-    pub up_conv: Conv2d,       // the actual Conv2d(k=4, s=1, p=1) with weight == up_conv_emu_w
-    pub up_conv_bias: Tensor,  // [192], applied after the Conv2d
+    /// Uses flame-core's real conv_transpose2d_forward (commit d99c8e9).
+    pub up_conv: flame_core::upsampling::ConvTranspose2d,
     pub mrb_192: MixingResidualBlock,
     pub out_conv: Conv2d,      // out_block.0: 192 -> 12, 1x1
 }
@@ -218,76 +216,30 @@ impl PaellaVQDecoder {
         }
 
         // up_blocks.13: ConvTranspose2d(384 -> 192, k=4, s=2, p=1).
-        //
-        // We use the 1x1-conv + pixel-shuffle trick but adapted for k=4, s=2, p=1.
-        // The PyTorch operation for ConvTranspose2d(k=4, s=2, p=1) produces output
-        // size 2H from input H. At output position `(h_out, w_out)`, it's:
-        //
-        //   out[h_out, w_out] = sum_{cin, ky, kx} in[cin, (h_out+1+ky)/2, ...] * w[cin, cout, ky, kx]
-        //     where h_out + 1 + ky is even and ≥ 2, < 2H+2.
-        //
-        // Split output by pixel phase a in {0,1}, b in {0,1} where h_out = 2h + a, w_out = 2w + b.
-        // For a given (a, b), valid ky pairs are a_set(a) = {even kys where (a+1+ky)%2==0 and (a+1+ky)/2 in [0, H)}
-        // = {kys where a+1+ky is even and between 0 and 2H}, equivalently ky ∈ {1-a, 3-a} (mod 2 matching,
-        // ky in [0,4]).
-        //
-        // For a=0: ky ∈ {1, 3}, h_in = h (ky=1) or h-1 (ky=3).
-        // For a=1: ky ∈ {0, 2}, h_in = h (ky=0) or h+1 (ky=2). But h+1 might be out of range at the top.
-        //
-        // This is complex. **Simplification**: we approximate with "nearest upsample 2x + Conv2d(k=3, s=1, p=1)"
-        // using the SUM of the four 3x3 subblocks of the original 4x4 kernel (i.e. averaging the kernel shifts).
-        // This is NOT mathematically equivalent — it's a smoothed approximation. Quality impact: the VQ
-        // decoder produces slightly blurrier output but avoids both the checkerboarding of zero-insertion
-        // and the spatial shape mismatch of NN upsample + raw 4x4 conv.
-        let up_conv_w_raw = get(&w, "up_blocks.13.weight")?.clone(); // [384, 192, 4, 4]
-        let up_conv_b = get(&w, "up_blocks.13.bias")?.clone();       // [192]
-        // Build a [192, 384, 3, 3] surrogate kernel that averages the four overlapping 3x3 subblocks
-        // of the flipped transposed kernel.
-        let perm = up_conv_w_raw.permute(&[1, 0, 2, 3])?; // [192, 384, 4, 4]
-        let surrogate_k3 = {
-            let f32_tensor = perm.to_dtype(DType::F32)?;
-            let data = f32_tensor.to_vec_f32()?;
-            let out_ch = 192;
-            let in_ch = 384;
-            let k = 4;
-            let mut kernel3 = vec![0.0f32; out_ch * in_ch * 3 * 3];
-            for o in 0..out_ch {
-                for i in 0..in_ch {
-                    // Sum over 4 shifted 3x3 subblocks (top-left at (0,0), (0,1), (1,0), (1,1))
-                    // of the 4x4 kernel, divided by 4 to average.
-                    for sy in 0..3 {
-                        for sx in 0..3 {
-                            let mut acc = 0.0f32;
-                            for oy in 0..2 {
-                                for ox in 0..2 {
-                                    let ky = oy + sy;
-                                    let kx = ox + sx;
-                                    acc += data[((o * in_ch + i) * k + ky) * k + kx];
-                                }
-                            }
-                            kernel3[((o * in_ch + i) * 3 + sy) * 3 + sx] = acc / 4.0;
-                        }
-                    }
-                }
-            }
-            let t = Tensor::from_vec(
-                kernel3,
-                Shape::from_dims(&[out_ch, in_ch, 3, 3]),
-                device.clone(),
-            )?;
-            t.to_dtype(DType::BF16)?
+        // Uses the real flame-core conv_transpose2d_forward (landed in
+        // flame-core d99c8e9), replacing the prior "nearest-upsample + Conv3x3
+        // with averaged kernel-subblocks" surrogate that blurred the final
+        // VAE decode.
+        let up_conv_w = get(&w, "up_blocks.13.weight")?.clone(); // [384, 192, 4, 4]
+        let up_conv_b = get(&w, "up_blocks.13.bias")?.clone();   // [192]
+        let up_conv = {
+            let cfg = flame_core::upsampling::ConvTranspose2dConfig {
+                in_channels: 384,
+                out_channels: 192,
+                kernel_size: (4, 4),
+                stride: (2, 2),
+                padding: (1, 1),
+                output_padding: (0, 0),
+                groups: 1,
+                bias: true,
+                dilation: (1, 1),
+            };
+            let mut ct = flame_core::upsampling::ConvTranspose2d::new(cfg, device.clone())?;
+            // Weight layout for ConvTranspose2d matches the checkpoint: [in, out, kh, kw].
+            ct.weight = up_conv_w;
+            ct.bias = Some(up_conv_b);
+            ct
         };
-        let cfg = Conv2dConfig {
-            in_channels: 384,
-            out_channels: 192,
-            kernel_size: (3, 3),
-            stride: (1, 1),
-            padding: (1, 1),
-            groups: 1,
-        };
-        let mut up_conv = Conv2d::from_config_with_bias(cfg, device.clone(), false)?;
-        up_conv.copy_weight_from(&surrogate_k3)?;
-        let up_conv_emu_w = surrogate_k3;
 
         // up_blocks.14: 1 MRB at c=192
         let mrb_192 = MixingResidualBlock::from_weights(&w, "up_blocks.14.", 192, device)?;
@@ -313,49 +265,10 @@ impl PaellaVQDecoder {
         Ok(Self {
             in_conv,
             mrbs_384,
-            up_conv_emu_w,
             up_conv,
-            up_conv_bias: up_conv_b,
             mrb_192,
             out_conv,
         })
-    }
-
-    /// Zero-insert (proper): `[N, C, H, W] -> [N, C, 2H-1, 2W-1]` with
-    /// `out[:, :, 2i, 2j] = in[:, :, i, j]`, zeros at odd indices. Stride-2 equivalence.
-    fn zero_insert_2x(x: &Tensor) -> Result<Tensor> {
-        let dims = x.shape().dims().to_vec();
-        let (n, c, h, w) = (dims[0], dims[1], dims[2], dims[3]);
-        // First do [N,C,2H,2W] then narrow to [N,C,2H-1,2W-1].
-        let x5 = x.reshape(&[n, c, h, 1, w])?;
-        let zeros_row = Tensor::zeros_dtype(
-            Shape::from_dims(&[n, c, h, 1, w]),
-            DType::BF16,
-            x.device().clone(),
-        )?;
-        let stacked = Tensor::cat(&[&x5, &zeros_row], 3)?;
-        let rows = stacked.reshape(&[n, c, 2 * h, w])?;
-        let r5 = rows.reshape(&[n, c, 2 * h, w, 1])?;
-        let zeros_col = Tensor::zeros_dtype(
-            Shape::from_dims(&[n, c, 2 * h, w, 1]),
-            DType::BF16,
-            x.device().clone(),
-        )?;
-        let stacked2 = Tensor::cat(&[&r5, &zeros_col], 4)?;
-        let full = stacked2.reshape(&[n, c, 2 * h, 2 * w])?;
-        // Trim last row and column.
-        let trimmed_h = full.narrow(2, 0, 2 * h - 1)?;
-        trimmed_h.narrow(3, 0, 2 * w - 1)
-    }
-
-    /// Apply a scalar bias `[C]` to an NCHW tensor `[B, C, H, W]` via broadcast.
-    fn add_bias_nchw(x: &Tensor, bias: &Tensor) -> Result<Tensor> {
-        let dims = x.shape().dims().to_vec();
-        let c = dims[1];
-        // bias [C] -> [1, C, 1, 1]
-        let b4 = bias
-            .reshape(&[1, c, 1, 1])?;
-        x.add(&b4)
     }
 
     /// Decode a latent `[B, 4, H, W]` into RGB `[B, 3, 4H, 4W]` (roughly in [-1,1]).
@@ -374,17 +287,8 @@ impl PaellaVQDecoder {
             x = b.forward(&x)?;
         }
 
-        // 4. ConvTranspose2d (approximate): nearest-upsample 2x + Conv2d(k=3) with surrogate kernel.
-        // This introduces some blurring vs diffusers reference but avoids the checkerboard that
-        // zero-insertion + k=4 Conv2d produced.
-        let dims = x.shape().dims().to_vec();
-        let up_cfg = flame_core::upsampling::Upsample2dConfig::new(
-            flame_core::upsampling::UpsampleMode::Nearest,
-        )
-        .with_size((dims[2] * 2, dims[3] * 2));
-        let xu = flame_core::upsampling::Upsample2d::new(up_cfg).forward(&x)?;
-        x = self.up_conv.forward(&xu)?;
-        x = Self::add_bias_nchw(&x, &self.up_conv_bias)?;
+        // 4. ConvTranspose2d(384 -> 192, k=4, s=2, p=1) — real op (flame-core d99c8e9).
+        x = self.up_conv.forward(&x)?;
 
         // 5. 1 MRB at c=192
         x = self.mrb_192.forward(&x)?;
