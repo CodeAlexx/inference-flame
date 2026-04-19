@@ -50,6 +50,42 @@ use std::time::Instant;
 use flame_core::{global_cuda_device, DType, Shape, Tensor};
 
 use inference_flame::models::qwenimage_dit::QwenImageDit;
+use inference_flame::sampling::exponential_multistep::{
+    deis_3m_step, dpmpp_2m_step, lambda_from_sigma, res_2m_step, res_3m_step, MultistepHistory,
+};
+
+/// Sampler selection via `QWEN_SAMPLER` env var. Default `euler`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Sampler {
+    Euler,
+    DpmPp2m,
+    Res2m,
+    Res3m,
+    Deis3m,
+}
+
+impl Sampler {
+    fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "euler" | "" => Some(Self::Euler),
+            "dpmpp_2m" | "dpmpp2m" | "dpm++2m" => Some(Self::DpmPp2m),
+            "res_2m" | "res2m" => Some(Self::Res2m),
+            "res_3m" | "res3m" => Some(Self::Res3m),
+            "deis_3m" | "deis3m" => Some(Self::Deis3m),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Euler => "euler",
+            Self::DpmPp2m => "dpmpp_2m",
+            Self::Res2m => "res_2m",
+            Self::Res3m => "res_3m",
+            Self::Deis3m => "deis_3m",
+        }
+    }
+}
 
 const DEFAULT_DIT_SHARDS: &[&str] = &[
     "/home/alex/.serenity/models/checkpoints/qwen-image-2512/transformer/diffusion_pytorch_model-00001-of-00009.safetensors",
@@ -76,10 +112,10 @@ fn main() -> anyhow::Result<()> {
 
     let args: Vec<String> = std::env::args().collect();
     let embeds_path = args.get(1).cloned().unwrap_or_else(|| {
-        "/home/alex/serenity/output/qwenimage_embeds.safetensors".to_string()
+        "/home/alex/EriDiffusion/inference-flame/output/qwenimage_embeds.safetensors".to_string()
     });
     let out_latents = args.get(2).cloned().unwrap_or_else(|| {
-        "/home/alex/serenity/output/qwenimage_latents.safetensors".to_string()
+        "/home/alex/EriDiffusion/inference-flame/output/qwenimage_latents.safetensors".to_string()
     });
 
     // Knobs
@@ -88,6 +124,20 @@ fn main() -> anyhow::Result<()> {
     let num_steps: usize = env_usize("QWEN_STEPS", 50);
     let true_cfg_scale: f32 = env_f32("QWEN_CFG", 4.0);
     let seed: u64 = env_u64("QWEN_SEED", 42);
+    let sampler = match std::env::var("QWEN_SAMPLER") {
+        Ok(s) => match Sampler::parse(&s) {
+            Some(v) => v,
+            None => {
+                eprintln!(
+                    "QWEN_SAMPLER='{}' not recognized; falling back to euler. \
+                     Supported: euler | dpmpp_2m | res_2m | res_3m | deis_3m",
+                    s
+                );
+                Sampler::Euler
+            }
+        },
+        Err(_) => Sampler::Euler,
+    };
 
     // Shards (colon-separated override)
     let dit_shards_owned: Vec<String> = match std::env::var("QWEN_DIT_SHARDS") {
@@ -99,7 +149,10 @@ fn main() -> anyhow::Result<()> {
     println!("=== Qwen-Image-2512 — Stage 2 (Rust DiT denoise) ===");
     println!("Embeddings: {}", embeds_path);
     println!("Output lat: {}", out_latents);
-    println!("Size:       {}x{}, steps={}, true_cfg={}", width, height, num_steps, true_cfg_scale);
+    println!(
+        "Size:       {}x{}, steps={}, true_cfg={}, sampler={}",
+        width, height, num_steps, true_cfg_scale, sampler.label()
+    );
     println!("Seed:       {}", seed);
     println!();
 
@@ -261,23 +314,24 @@ fn main() -> anyhow::Result<()> {
         sigmas[0], sigmas[1], sigmas[num_steps - 1], sigmas[num_steps]);
     println!();
 
-    // ── CFG Euler loop ──
+    // ── CFG sampler loop ──
     // Per-step: two forward passes (cond + uncond), norm-rescaled CFG combine,
-    // Euler step using the sigma delta:
-    //   x_next = x + (sigma_next - sigma_curr) * noise_pred
+    // then sampler step. Euler is `x + (σ_next - σ)·v`; the RES4LYF multistep
+    // samplers (dpmpp_2m / res_2m / res_3m / deis_3m) take the data-prediction
+    //   denoised = x - σ·v
+    // and a short ring buffer of past `denoised` samples.
     let frame = 1;
     let t_denoise = Instant::now();
+    // Capacity 3 is enough for every multistep we ship (deis_3m peeks back 2).
+    let mut history = MultistepHistory::new(3);
     for step in 0..num_steps {
         let sigma_curr = sigmas[step];
         let sigma_next = sigmas[step + 1];
         let dt = sigma_next - sigma_curr;
 
-        // Scoped block: every per-step temporary (t_vec, cond_pred, uncond_pred,
-        // diff, scaled, comb, noise_pred, step_tensor) drops at the closing `}`
+        // Scoped block: every per-step temporary drops at the closing `}`
         // BEFORE the next iteration allocates. Prevents VRAM accumulation.
         let next_x = {
-            // Pipeline passes `timestep = t` (not sigma) to the DiT. Here we pass
-            // sigma_curr directly; the DiT's time_text_embed scales by 1000.
             let t_vec = Tensor::from_vec(
                 vec![sigma_curr],
                 Shape::from_dims(&[1]),
@@ -292,20 +346,37 @@ fn main() -> anyhow::Result<()> {
             let diff = cond_pred.sub(&uncond_pred)?;
             let scaled = diff.mul_scalar(true_cfg_scale)?;
             let comb = uncond_pred.add(&scaled)?;
-
-            // Norm rescale to preserve cond magnitude:
-            //   cond_norm = ‖cond_pred‖_2 along last dim
-            //   comb_norm = ‖comb‖_2 along last dim
-            //   noise_pred = comb * (cond_norm / comb_norm)
-            //
-            // norm_rescale_cfg may return Err on platforms missing reduce-sum-keepdim;
-            // in that case fall back to the raw `comb` (note: that consumes `comb`,
-            // which is fine since the closure-returned `noise_pred` keeps it alive).
             let noise_pred = norm_rescale_cfg(&cond_pred, &comb).unwrap_or(comb);
 
-            // Euler step: x_next = x + dt * noise_pred
-            let step_tensor = noise_pred.mul_scalar(dt)?;
-            x.add(&step_tensor)?
+            match sampler {
+                Sampler::Euler => {
+                    // x_next = x + dt·v
+                    let step_tensor = noise_pred.mul_scalar(dt)?;
+                    x.add(&step_tensor)?
+                }
+                _ => {
+                    // denoised = x - σ·v  (data prediction)
+                    let v_sig = noise_pred.mul_scalar(sigma_curr)?;
+                    let denoised = x.sub(&v_sig)?;
+                    let next = match sampler {
+                        Sampler::Euler => unreachable!(),
+                        Sampler::DpmPp2m => {
+                            dpmpp_2m_step(&x, &denoised, sigma_curr, sigma_next, &history)?
+                        }
+                        Sampler::Res2m => {
+                            res_2m_step(&x, &denoised, sigma_curr, sigma_next, &history)?
+                        }
+                        Sampler::Res3m => {
+                            res_3m_step(&x, &denoised, sigma_curr, sigma_next, &history)?
+                        }
+                        Sampler::Deis3m => {
+                            deis_3m_step(&x, &denoised, sigma_curr, sigma_next, &history)?
+                        }
+                    };
+                    history.push(denoised, lambda_from_sigma(sigma_curr));
+                    next
+                }
+            }
         };
         x = next_x;
 
