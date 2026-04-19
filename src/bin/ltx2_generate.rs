@@ -207,7 +207,12 @@ fn encode_video_context(
     }
     let shard_refs: Vec<&str> = shards.iter().map(|s| s.as_str()).collect();
 
-    let (input_ids, attention_mask) = simple_tokenize(text, 256)?;
+    // Lightricks's `LTXVGemmaTokenizer` uses max_length=1024
+    // (`ltx_core/.../base_encoder.py:207`) and the positive-side cached
+    // embeddings in `cached_ltx2_embeddings.safetensors` are [1, 1024, 4096].
+    // We must match the positive seq_len or the DiT cross-attention shapes
+    // disagree between the uncond / cond forwards.
+    let (input_ids, attention_mask) = simple_tokenize(text, 1024)?;
     let real_count = attention_mask.iter().filter(|&&m| m != 0).count();
     println!("  tokens: {} (real: {})", input_ids.len(), real_count);
 
