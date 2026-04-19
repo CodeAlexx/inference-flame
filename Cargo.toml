@@ -70,6 +70,10 @@ name = "sdxl_infer"
 path = "src/bin/sdxl_infer.rs"
 
 [[bin]]
+name = "sd15_infer"
+path = "src/bin/sd15_infer.rs"
+
+[[bin]]
 name = "klein9b_infer"
 path = "src/bin/klein9b_infer.rs"
 

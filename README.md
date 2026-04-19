@@ -17,10 +17,10 @@ Pure Rust diffusion model inference using [flame-core](https://github.com/CodeAl
 | ![SD3.5 Medium](docs/sd3_medium_sample.png) | ![ERNIE-Image](docs/ernie_image_sample.png) | ![LTX-2.3](docs/ltx2_sample.png) |
 | *28 steps, CFG 4.5, 1024²* | *28 steps, CFG 4.0, 1024²* | *10s video + audio — [sample.mp4](docs/ltx2_sample.mp4)* |
 
-| FLUX.1-dev | Motif-Video 2B |
-|---|---|
-| ![FLUX.1-dev](docs/flux1_sample.png) | ![Motif](docs/motif_sample.png) |
-| *20 steps, guidance 3.5, 1024²* | *50 steps, APG cfg 8.0, 1280×720×49 @ 24fps — [sample.mp4](docs/motif_sample.mp4)* |
+| FLUX.1-dev | Motif-Video 2B | SD 1.5 |
+|---|---|---|
+| ![FLUX.1-dev](docs/flux1_sample.png) | ![Motif](docs/motif_sample.png) | ![SD 1.5](docs/sd15_sample.png) |
+| *20 steps, guidance 3.5, 1024²* | *50 steps, APG cfg 8.0, 1280×720×49 @ 24fps — [sample.mp4](docs/motif_sample.mp4)* | *30 steps, CFG 7.5, 512², 58s* |
 
 ### Image editing — "change her dress to blue"
 
@@ -59,6 +59,7 @@ Denoise is **10% faster per-step** than PyTorch. Fits entirely on a single 24GB 
 | SD3.5 Medium | MMDiT (24 blocks, dual attention) | Working — full prompt-to-PNG, CLIP-L + CLIP-G + T5-XXL, 1024² resident |
 | SD3.5 Large | MMDiT (38 blocks) | Built, needs full pipeline |
 | SDXL | LDM UNet | Working |
+| SD 1.5 | UNet2DConditionModel (860M) + CLIP-L only | Working — 512²/30, CFG 7.5, ~58s on 3090 Ti, diffusers→LDM key remap, shares LdmVAEDecoder + ClipEncoder with the rest of the stack |
 | QwenImage-2512 | 60-layer DiT + 3D VAE (Qwen2.5-VL-7B text encoder) | Working — 1024²/30, true CFG with norm rescale, 3-axis RoPE, BlockOffloader |
 | Qwen-Image-Edit-2511 | Same 60-layer DiT as 2512 + multi-region RoPE + `zero_cond_t` per-token modulation (target tokens t-sigma, reference tokens t=0 clean) | Working — 1024², 50 steps, BlockOffloader, ~23 min. Prompt-driven edits land cleanly while composition is preserved; the 2511 shipped scheduler constants (max_shift=0.9, max_image_seq_len=8192) are used by default. |
 | ERNIE-Image 8B | 36-layer single-stream DiT (Mistral-3 3B text encoder) | Working — 1024²/28, sequential CFG, fused RoPE kernel, ~98s on 3090 Ti |
