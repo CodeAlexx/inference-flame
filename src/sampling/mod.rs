@@ -7,3 +7,4 @@ pub mod kandinsky5_sampling;
 pub mod ernie_sampling;
 pub mod acestep_sampling;
 pub mod exponential_multistep;
+pub mod ddpm_wuerstchen;

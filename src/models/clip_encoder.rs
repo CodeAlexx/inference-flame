@@ -385,6 +385,98 @@ impl ClipEncoder {
         Ok((penultimate_hidden.unwrap(), pooled))
     }
 
+    /// Encode for Stable Cascade: returns (last_hidden_state, pooled).
+    ///
+    /// Stable Cascade uses CLIP-ViT-bigG-14 with the `text_projection` matrix.
+    /// Output:
+    /// - `hidden_states`: [1, seq_len, 1280] — post-final-LN last hidden state
+    /// - `pooled`: [1, 1280] — `text_projection.T @ hidden[EOS]`
+    ///
+    /// ## HF reference (modeling_clip.py CLIPTextModelWithProjection):
+    /// ```python
+    /// text_outputs = self.text_model(input_ids)  # last_hidden_state + pooler_output
+    /// text_embeds = self.text_projection(text_outputs.pooler_output)
+    /// ```
+    ///
+    /// `pooler_output` is: final_layer_norm → gather EOS position
+    pub fn encode_cascade(&self, token_ids: &[i32]) -> Result<(Tensor, Tensor)> {
+        let cfg = &self.config;
+        let max_len = cfg.max_position_embeddings;
+
+        let mut padded: Vec<i32> = token_ids.to_vec();
+        if padded.len() > max_len {
+            padded.truncate(max_len);
+        } else {
+            padded.resize(max_len, cfg.eos_token_id);
+        }
+        let seq_len = max_len;
+
+        // 1. Token + position embeddings
+        let token_w = self.w("text_model.embeddings.token_embedding.weight")?;
+        let pos_w = self.w("text_model.embeddings.position_embedding.weight")?;
+
+        let ids = Tensor::from_vec(
+            padded.iter().map(|&id| id as f32).collect(),
+            Shape::from_dims(&[seq_len]),
+            self.device.clone(),
+        )?.to_dtype(DType::I32)?;
+        let token_embeds = token_w.index_select0(&ids)?;
+
+        let pos_ids = Tensor::from_vec(
+            (0..seq_len as i32).map(|i| i as f32).collect(),
+            Shape::from_dims(&[seq_len]),
+            self.device.clone(),
+        )?.to_dtype(DType::I32)?;
+        let pos_embeds = pos_w.index_select0(&pos_ids)?;
+
+        let mut hidden = token_embeds.add(&pos_embeds)?.unsqueeze(0)?; // [1, seq, C]
+
+        // 2. Causal mask
+        let mask = Self::build_causal_mask(seq_len, &self.device)?;
+
+        // 3. Transformer layers
+        for i in 0..cfg.num_layers {
+            hidden = self.layer_forward(&hidden, i, &mask)?;
+        }
+
+        // Stable Cascade prior pipeline uses `hidden_states[-1]` BEFORE
+        // `final_layer_norm` for `clip_text`. (HF CLIP decorates the text
+        // transformer with `@capture_outputs(tie_last_hidden_states=False)`
+        // so `hidden_states[-1]` = last encoder layer output, NOT the LN'd
+        // `last_hidden_state`.) That's the "pre-LN" tensor we return below.
+        let pre_ln_hidden = hidden.clone();
+
+        // 4. Final layer norm on the full last-hidden-state — needed only
+        //    to compute `pooler_output`. The prior UNet receives the pre-LN
+        //    `clip_text` and the post-LN+projected pool separately.
+        let final_ln_w = self.w("text_model.final_layer_norm.weight")?;
+        let final_ln_b = self.w("text_model.final_layer_norm.bias")?;
+        let last_hidden_post_ln = Self::layer_norm(&hidden, final_ln_w, final_ln_b, cfg.layer_norm_eps)?;
+
+        // 5. Pooled: gather EOS position, then project.
+        let eos_pos = padded
+            .iter()
+            .position(|&id| id == cfg.eos_token_id)
+            .unwrap_or(seq_len - 1);
+        // [1, 1, C] -> [1, C]
+        let pooled_pre_proj = last_hidden_post_ln.narrow(1, eos_pos, 1)?.squeeze(Some(1))?;
+
+        // text_projection: [1280, 1280]; apply as pooled_pre @ text_projection.T
+        // PyTorch nn.Linear: y = x @ W.T, weight shape [out, in] -> we apply via linear().
+        // But note this is stored as a plain weight (no bias in CLIPTextModelWithProjection).
+        // Key may or may not exist; fall back to the pooled_pre if absent.
+        let pooled = if let Ok(proj_w) = self.w("text_projection.weight") {
+            // x [1, C_in]; W [C_out, C_in] -> need to reshape pooled_pre to [1, 1, C] for Self::linear.
+            let x3 = pooled_pre_proj.unsqueeze(1)?; // [1, 1, C]
+            let y = Self::linear(&x3, proj_w, None)?; // [1, 1, C_out]
+            y.squeeze(Some(1))? // [1, C_out]
+        } else {
+            pooled_pre_proj
+        };
+
+        Ok((pre_ln_hidden, pooled))
+    }
+
     pub fn config(&self) -> &ClipConfig {
         &self.config
     }
