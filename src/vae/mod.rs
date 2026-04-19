@@ -20,5 +20,7 @@ pub mod hunyuan_vae;
 pub use hunyuan_vae::HunyuanVaeDecoder;
 pub mod qwenimage_encoder;
 pub use qwenimage_encoder::QwenImageVaeEncoder;
+pub mod qwenimage_decoder;
+pub use qwenimage_decoder::QwenImageVaeDecoder;
 pub mod acestep_vae;
 pub use acestep_vae::OobleckVaeDecoder;

@@ -1,14 +1,22 @@
-//! Qwen-Image-2512 — Stage 2 (DiT denoise → save latents).
+//! Qwen-Image-2512 — Stage 2 (DiT denoise) + Stage 3 (Rust VAE decode).
 //!
 //! Loads the cached cond+uncond embeddings saved by `scripts/qwenimage_encode.py`,
-//! loads the Qwen DiT (BlockOffloader), runs the true-CFG Euler loop, and saves the
-//! final packed latent to a safetensors file. Does NOT decode. Stage 3
-//! (`scripts/qwenimage_decode.py`) handles VAE decode + PNG.
+//! loads the Qwen DiT (BlockOffloader), runs the true-CFG Euler loop,
+//! unpacks + VAE-decodes the result through the in-tree
+//! `QwenImageVaeDecoder`, and writes a PNG directly. No Python decode
+//! bridge.
 //!
 //! ## Pipeline split (OOM-safe: one model resident at a time)
-//!   Stage 1 (Python): Qwen2.5-VL text encoder only
-//!   Stage 2 (Rust):   Qwen-Image DiT only (BlockOffloader)
-//!   Stage 3 (Python): AutoencoderKLQwenImage only
+//!   Stage 1 (Python, still): Qwen2.5-VL text encoder only
+//!   Stage 2 (Rust):          Qwen-Image DiT only (BlockOffloader)
+//!   Stage 3 (Rust):          AutoencoderKLQwenImage decoder — parity-
+//!                            verified against diffusers in
+//!                            `qwenimage_vae_decode_parity`.
+//!
+//! Stage 1 is the only remaining Python dependency. The Rust
+//! `Qwen25VLEncoder` in `src/models/qwen25vl_encoder.rs` would cover it
+//! but no bin has been wired up yet. Use QWEN_SAVE_LATENT=1 to skip
+//! Stage 3 and dump the packed latent for debugging.
 //!
 //! ## Scheduler — FlowMatchEulerDiscreteScheduler with dynamic exponential shift
 //!
@@ -110,12 +118,22 @@ fn main() -> anyhow::Result<()> {
     let t_total = Instant::now();
     let device = global_cuda_device();
 
+    // Args: [embeds_path] [out_png_or_latents]
+    //   default output is now a PNG via the Rust VAE decoder. Set
+    //   QWEN_SAVE_LATENT=1 to fall back to the old "save packed latent,
+    //   decode via Python" flow — the second positional arg then
+    //   interprets as the latent path instead of the PNG path.
     let args: Vec<String> = std::env::args().collect();
     let embeds_path = args.get(1).cloned().unwrap_or_else(|| {
         "/home/alex/EriDiffusion/inference-flame/output/qwenimage_embeds.safetensors".to_string()
     });
-    let out_latents = args.get(2).cloned().unwrap_or_else(|| {
-        "/home/alex/EriDiffusion/inference-flame/output/qwenimage_latents.safetensors".to_string()
+    let save_latent_only = std::env::var("QWEN_SAVE_LATENT").ok().as_deref() == Some("1");
+    let out_path = args.get(2).cloned().unwrap_or_else(|| {
+        if save_latent_only {
+            "/home/alex/EriDiffusion/inference-flame/output/qwenimage_latents.safetensors".to_string()
+        } else {
+            "/home/alex/EriDiffusion/inference-flame/output/qwenimage_rust.png".to_string()
+        }
     });
 
     // Knobs
@@ -148,7 +166,11 @@ fn main() -> anyhow::Result<()> {
 
     println!("=== Qwen-Image-2512 — Stage 2 (Rust DiT denoise) ===");
     println!("Embeddings: {}", embeds_path);
-    println!("Output lat: {}", out_latents);
+    println!(
+        "Output:     {} ({})",
+        out_path,
+        if save_latent_only { "packed latent" } else { "PNG via Rust VAE" }
+    );
     println!(
         "Size:       {}x{}, steps={}, true_cfg={}, sampler={}",
         width, height, num_steps, true_cfg_scale, sampler.label()
@@ -404,35 +426,85 @@ fn main() -> anyhow::Result<()> {
     println!("  DiT + cached embeddings evicted");
 
     // ------------------------------------------------------------------
-    // Stage D: save packed latent for Python stage 3 VAE decode
+    // Stage D: VAE decode + save PNG (pure Rust default).
+    //          With QWEN_SAVE_LATENT=1 we instead dump the packed latent
+    //          for an external decoder — kept for regression/debug only.
     // ------------------------------------------------------------------
-    println!("--- Saving packed latent ---");
-    if let Some(parent) = std::path::Path::new(&out_latents).parent() {
+    if save_latent_only {
+        println!("--- Saving packed latent (debug path) ---");
+        if let Some(parent) = std::path::Path::new(&out_path).parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        let mut output = HashMap::new();
+        output.insert("packed_latent".to_string(), x);
+        output.insert(
+            "height".to_string(),
+            Tensor::from_vec(vec![height as f32], Shape::from_dims(&[1]), device.clone())?
+                .to_dtype(DType::BF16)?,
+        );
+        output.insert(
+            "width".to_string(),
+            Tensor::from_vec(vec![width as f32], Shape::from_dims(&[1]), device.clone())?
+                .to_dtype(DType::BF16)?,
+        );
+        flame_core::serialization::save_file(&output, &out_path)?;
+        let dt_total = t_total.elapsed().as_secs_f32();
+        println!();
+        println!("============================================================");
+        println!("LATENTS SAVED: {out_path}");
+        println!("Total time:    {dt_total:.1}s");
+        println!("============================================================");
+        let _ = device;
+        return Ok(());
+    }
+
+    println!("--- Stage D: VAE decode (Rust) ---");
+    let vae_path = std::env::var("QWEN_VAE_PATH").unwrap_or_else(|_|
+        "/home/alex/.serenity/models/checkpoints/qwen-image-2512/vae/diffusion_pytorch_model.safetensors".to_string()
+    );
+    // Unpack packed latent [1, (H/16)*(W/16), 64] -> [1, 16, 1, H/8, W/8].
+    // Matches `scripts/qwenimage_decode.py::unpack_latents`.
+    let h_lat = 2 * (height / (VAE_SCALE_FACTOR * 2));
+    let w_lat = 2 * (width / (VAE_SCALE_FACTOR * 2));
+    let unpacked = x
+        .reshape(&[1, h_lat / 2, w_lat / 2, PACKED_CHANNELS / 4, 2, 2])?
+        .permute(&[0, 3, 1, 4, 2, 5])?
+        .reshape(&[1, PACKED_CHANNELS / (2 * 2), 1, h_lat, w_lat])?;
+
+    let t_vae = Instant::now();
+    let decoder = inference_flame::vae::QwenImageVaeDecoder::from_safetensors(&vae_path, &device)?;
+    let rgb = decoder.decode(&unpacked)?; // [1, 3, 1, H, W] in [-1, 1]
+    println!(
+        "  VAE decoded {:?} in {:.1}s",
+        rgb.shape().dims(),
+        t_vae.elapsed().as_secs_f32()
+    );
+
+    // [1, 3, 1, H, W] -> [1, 3, H, W], to [0, 255] u8, save PNG.
+    let rgb = rgb.narrow(2, 0, 1)?.squeeze(Some(2))?;
+    let rgb_f32 = rgb.to_dtype(DType::F32)?.to_vec_f32()?;
+    let dims = rgb.shape().dims().to_vec();
+    let (h_img, w_img) = (dims[2], dims[3]);
+    let mut buf = vec![0u8; h_img * w_img * 3];
+    for y in 0..h_img {
+        for xp in 0..w_img {
+            for ch in 0..3 {
+                let v = rgb_f32[ch * h_img * w_img + y * w_img + xp];
+                let v = ((v.clamp(-1.0, 1.0) + 1.0) * 127.5).clamp(0.0, 255.0);
+                buf[(y * w_img + xp) * 3 + ch] = v as u8;
+            }
+        }
+    }
+    if let Some(parent) = std::path::Path::new(&out_path).parent() {
         std::fs::create_dir_all(parent).ok();
     }
-    let mut output = HashMap::new();
-    output.insert("packed_latent".to_string(), x);
-    // Save height/width as 1-element BF16 tensors so Stage 3 knows the target size.
-    output.insert(
-        "height".to_string(),
-        Tensor::from_vec(vec![height as f32], Shape::from_dims(&[1]), device.clone())?
-            .to_dtype(DType::BF16)?,
-    );
-    output.insert(
-        "width".to_string(),
-        Tensor::from_vec(vec![width as f32], Shape::from_dims(&[1]), device.clone())?
-            .to_dtype(DType::BF16)?,
-    );
-    flame_core::serialization::save_file(&output, &out_latents)?;
-
+    image::save_buffer(&out_path, &buf, w_img as u32, h_img as u32, image::ColorType::Rgb8)?;
     let dt_total = t_total.elapsed().as_secs_f32();
     println!();
     println!("============================================================");
-    println!("LATENTS SAVED: {}", out_latents);
-    println!("Total time:    {:.1}s", dt_total);
+    println!("IMAGE SAVED: {out_path}");
+    println!("Total time:  {dt_total:.1}s");
     println!("============================================================");
-    println!();
-    println!("Next: python scripts/qwenimage_decode.py {} <output.png>", out_latents);
 
     let _ = device;
     Ok(())

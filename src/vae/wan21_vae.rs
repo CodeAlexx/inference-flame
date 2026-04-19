@@ -68,10 +68,22 @@ fn get_bf16(weights: &Weights, key: &str) -> Result<Tensor> {
 // CausalConv3d
 // ---------------------------------------------------------------------------
 
+/// Left-temporal padding strategy for causal 3D convolutions.
+///
+/// - `Replicate`: repeat the first frame `time_pad` times (Wan 2.1 semantics).
+/// - `Zero`:      pad with zeros (QwenImage VAE semantics — diffusers's
+///                `QwenImageCausalConv3d.forward` uses `F.pad(..., mode='constant')`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PadMode {
+    Replicate,
+    Zero,
+}
+
 struct CausalConv3d {
     conv: Conv3d,
     time_pad: usize, // = 2 * padding[0], i.e. left-only temporal pad
     // spatial padding is handled by Conv3d itself
+    pad_mode: PadMode,
 }
 
 impl CausalConv3d {
@@ -84,6 +96,7 @@ impl CausalConv3d {
         kernel: (usize, usize, usize),
         stride: (usize, usize, usize),
         pad: (usize, usize, usize),
+        pad_mode: PadMode,
         device: &Arc<cudarc::driver::CudaDevice>,
     ) -> Result<Self> {
         // Causal: temporal pad = 2 * pad_t on left only, spatial = pad_h/pad_w symmetric
@@ -102,14 +115,25 @@ impl CausalConv3d {
         // Conv3d kernel uses F32 internally — store weights as F32
         conv.weight = get(weights, &format!("{prefix}.weight"))?.to_dtype(DType::F32)?;
         conv.bias_tensor = Some(get(weights, &format!("{prefix}.bias"))?.to_dtype(DType::F32)?);
-        Ok(Self { conv, time_pad })
+        Ok(Self { conv, time_pad, pad_mode })
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let x_padded = if self.time_pad > 0 {
-            let first_frame = x.narrow(2, 0, 1)?;
-            let repeated = first_frame.repeat_axis_device(2, self.time_pad)?;
-            Tensor::cat(&[&repeated, x], 2)?
+            let pad = match self.pad_mode {
+                PadMode::Replicate => {
+                    let first_frame = x.narrow(2, 0, 1)?;
+                    first_frame.repeat_axis_device(2, self.time_pad)?
+                }
+                PadMode::Zero => {
+                    let dims = x.shape().dims();
+                    let pad_shape = flame_core::Shape::from_dims(&[
+                        dims[0], dims[1], self.time_pad, dims[3], dims[4],
+                    ]);
+                    Tensor::zeros_dtype(pad_shape, x.dtype(), x.device().clone())?
+                }
+            };
+            Tensor::cat(&[&pad, x], 2)?
         } else {
             x.clone()
         };
@@ -203,6 +227,7 @@ impl ResidualBlock {
         prefix: &str,
         in_dim: usize,
         out_dim: usize,
+        pad_mode: PadMode,
         device: &Arc<cudarc::driver::CudaDevice>,
     ) -> Result<Self> {
         // residual: [RMS_norm(0), SiLU(1), CausalConv3d(2), RMS_norm(3), SiLU(4), Dropout(5), CausalConv3d(6)]
@@ -215,6 +240,7 @@ impl ResidualBlock {
             (3, 3, 3),
             (1, 1, 1),
             (1, 1, 1),
+            pad_mode,
             device,
         )?;
         let norm2 = RmsNorm5d::load(weights, &format!("{prefix}.residual.3"), out_dim)?;
@@ -226,6 +252,7 @@ impl ResidualBlock {
             (3, 3, 3),
             (1, 1, 1),
             (1, 1, 1),
+            pad_mode,
             device,
         )?;
         let shortcut = if in_dim != out_dim {
@@ -237,6 +264,7 @@ impl ResidualBlock {
                 (1, 1, 1),
                 (1, 1, 1),
                 (0, 0, 0),
+                pad_mode,
                 device,
             )?)
         } else {
@@ -387,6 +415,7 @@ impl UpsampleBlock {
         weights: &Weights,
         prefix: &str,
         dim: usize,
+        pad_mode: PadMode,
         device: &Arc<cudarc::driver::CudaDevice>,
     ) -> Result<Self> {
         let mut conv = Conv2d::new_with_bias(dim, dim / 2, 3, 1, 1, device.clone(), true)?;
@@ -402,6 +431,7 @@ impl UpsampleBlock {
             (3, 1, 1),
             (1, 1, 1),
             (1, 0, 0),
+            pad_mode,
             device,
         )?;
 
@@ -412,7 +442,7 @@ impl UpsampleBlock {
         })
     }
 
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, image_mode: bool) -> Result<Tensor> {
         match self {
             UpsampleBlock::Upsample2d { conv } => {
                 // x: [B, C, T, H, W] -> reshape to [B*T, C, H, W], upsample 2x, conv, reshape back
@@ -436,31 +466,36 @@ impl UpsampleBlock {
                 let dims = x.shape().dims().to_vec();
                 let (b, c, t, h, w) = (dims[0], dims[1], dims[2], dims[3], dims[4]);
 
-                // Temporal upsample via time_conv: output is [B, dim*2, T, H, W]
-                let tc_out = time_conv.forward(x)?;
-                // Reshape [B, 2, C, T, H, W] then interleave: stack dim 3 -> [B, C, T*2, H, W]
-                let tc_out = tc_out.reshape(&[b, 2, c, t, h, w])?;
-                // x0 = tc_out[:, 0, :, :, :, :] and x1 = tc_out[:, 1, :, :, :, :]
-                let x0 = tc_out.narrow(1, 0, 1)?.squeeze(Some(1))?; // [B, C, T, H, W]
-                let x1 = tc_out.narrow(1, 1, 1)?.squeeze(Some(1))?; // [B, C, T, H, W]
-                // Interleave along T: [B, C, T*2, H, W]
-                // Stack along dim 3: [B, C, T, 2, H, W] then reshape
-                let stacked = Tensor::cat(&[
-                    &x0.unsqueeze(3)?,
-                    &x1.unsqueeze(3)?,
-                ], 3)?; // [B, C, T, 2, H, W]
-                let x_t = stacked.reshape(&[b, c, t * 2, h, w])?;
+                // Image-mode (feat_cache=None in diffusers) skips the
+                // temporal doubling — upsample3d degenerates to a pure
+                // spatial upsample. See `QwenImageResample.forward`:
+                // `time_conv` only fires inside the `feat_cache is not None`
+                // branch.
+                let (x_t, t_out) = if image_mode {
+                    (x.clone(), t)
+                } else {
+                    // Temporal upsample via time_conv: output is [B, dim*2, T, H, W]
+                    let tc_out = time_conv.forward(x)?;
+                    // Reshape [B, 2, C, T, H, W] then interleave: stack dim 3 -> [B, C, T*2, H, W]
+                    let tc_out = tc_out.reshape(&[b, 2, c, t, h, w])?;
+                    let x0 = tc_out.narrow(1, 0, 1)?.squeeze(Some(1))?; // [B, C, T, H, W]
+                    let x1 = tc_out.narrow(1, 1, 1)?.squeeze(Some(1))?; // [B, C, T, H, W]
+                    let stacked = Tensor::cat(&[
+                        &x0.unsqueeze(3)?,
+                        &x1.unsqueeze(3)?,
+                    ], 3)?; // [B, C, T, 2, H, W]
+                    (stacked.reshape(&[b, c, t * 2, h, w])?, t * 2)
+                };
 
-                // Spatial upsample: [B*T*2, C, H, W] -> nearest 2x -> Conv2d -> [B, C/2, T*2, H*2, W*2]
-                let t2 = t * 2;
-                let x_4d = x_t.permute(&[0, 2, 1, 3, 4])?.reshape(&[b * t2, c, h, w])?;
+                // Spatial upsample: [B*T_out, C, H, W] -> nearest 2x -> Conv2d
+                let x_4d = x_t.permute(&[0, 2, 1, 3, 4])?.reshape(&[b * t_out, c, h, w])?;
                 let x_f32 = x_4d.to_dtype(DType::F32)?;
                 let x_up = GpuOps::upsample2d_nearest(&x_f32, (h * 2, w * 2))?;
                 let x_up = x_up.to_dtype(DType::BF16)?;
                 let x_conv = conv.forward(&x_up)?;
                 let c_out = x_conv.shape().dims()[1];
                 x_conv
-                    .reshape(&[b, t2, c_out, h * 2, w * 2])?
+                    .reshape(&[b, t_out, c_out, h * 2, w * 2])?
                     .permute(&[0, 2, 1, 3, 4])
             }
         }
@@ -477,10 +512,10 @@ enum DecoderBlock {
 }
 
 impl DecoderBlock {
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, image_mode: bool) -> Result<Tensor> {
         match self {
             DecoderBlock::Res(r) => r.forward(x),
-            DecoderBlock::Upsample(u) => u.forward(x),
+            DecoderBlock::Upsample(u) => u.forward(x, image_mode),
         }
     }
 }
@@ -525,6 +560,18 @@ impl Wan21VaeDecoder {
         weights: &Weights,
         device: &Arc<cudarc::driver::CudaDevice>,
     ) -> Result<Self> {
+        // Wan 2.1 semantics: replicate the first frame for the left temporal pad.
+        Self::from_weights_with_pad(weights, PadMode::Replicate, device)
+    }
+
+    /// Like `from_weights`, but caller chooses the causal temporal padding
+    /// mode. `PadMode::Replicate` is Wan 2.1. `PadMode::Zero` is QwenImage —
+    /// see `QwenImageVaeDecoder::from_safetensors`.
+    pub(crate) fn from_weights_with_pad(
+        weights: &Weights,
+        pad_mode: PadMode,
+        device: &Arc<cudarc::driver::CudaDevice>,
+    ) -> Result<Self> {
         let cuda_device: &Arc<cudarc::driver::CudaDevice> = device;
 
         // Build mean and inv_std tensors for unnormalization
@@ -544,7 +591,7 @@ impl Wan21VaeDecoder {
 
         // conv2: CausalConv3d(16, 16, 1x1x1) — note: padding=0 for 1x1x1
         let conv2 = CausalConv3d::load(
-            weights, "conv2", 16, 16, (1, 1, 1), (1, 1, 1), (0, 0, 0), device,
+            weights, "conv2", 16, 16, (1, 1, 1), (1, 1, 1), (0, 0, 0), pad_mode, device,
         )?;
 
         // conv1: CausalConv3d(16, 384, 3x3x3, padding=1)
@@ -556,16 +603,17 @@ impl Wan21VaeDecoder {
             (3, 3, 3),
             (1, 1, 1),
             (1, 1, 1),
+            pad_mode,
             device,
         )?;
 
         // Middle block
         let mid_res0 =
-            ResidualBlock::load(weights, "decoder.middle.0", 384, 384, device)?;
+            ResidualBlock::load(weights, "decoder.middle.0", 384, 384, pad_mode, device)?;
         let mid_attn =
             AttentionBlock::load(weights, "decoder.middle.1", 384, device)?;
         let mid_res1 =
-            ResidualBlock::load(weights, "decoder.middle.2", 384, 384, device)?;
+            ResidualBlock::load(weights, "decoder.middle.2", 384, 384, pad_mode, device)?;
 
         // Build upsamples — 15 blocks matching Python Decoder3d.__init__
         // dims = [384, 384, 384, 192, 96], temperal_upsample = [False, True, True]
@@ -614,6 +662,7 @@ impl Wan21VaeDecoder {
                 &format!("decoder.upsamples.{idx}"),
                 in_ch,
                 out_ch,
+                pad_mode,
                 device,
             )?));
             idx += 1;
@@ -637,6 +686,7 @@ impl Wan21VaeDecoder {
                         weights,
                         &format!("decoder.upsamples.{idx}"),
                         dim,
+                        pad_mode,
                         device,
                     )?));
                 } else {
@@ -661,6 +711,7 @@ impl Wan21VaeDecoder {
             (3, 3, 3),
             (1, 1, 1),
             (1, 1, 1),
+            pad_mode,
             device,
         )?;
 
@@ -683,6 +734,20 @@ impl Wan21VaeDecoder {
     /// Input: `[B, 16, T, H, W]` BF16 latents (normalized).
     /// Output: `[B, 3, T*4, H*8, W*8]` BF16 RGB video frames clamped to [-1, 1].
     pub fn decode(&self, z: &Tensor) -> Result<Tensor> {
+        self.decode_with_mode(z, false)
+    }
+
+    /// Decode a single-frame latent to a single-frame image. Equivalent to
+    /// diffusers's `AutoencoderKLQwenImage.decode(latents)` when
+    /// `feat_cache is None`: the temporal doubling inside every upsample3d
+    /// block is skipped so `T_out == T_in`. Intended for QwenImage VAE use.
+    ///
+    /// Input: `[B, 16, 1, H, W]`. Output: `[B, 3, 1, H*8, W*8]`.
+    pub fn decode_image(&self, z: &Tensor) -> Result<Tensor> {
+        self.decode_with_mode(z, true)
+    }
+
+    fn decode_with_mode(&self, z: &Tensor, image_mode: bool) -> Result<Tensor> {
         // Unnormalize: z = z / (1/std) + mean = z * std + mean
         // But we store inv_std = 1/std, so: z = z / inv_std + mean
         // Python: z = z / scale[1] + scale[0]  where scale = [mean, 1/std]
@@ -701,7 +766,7 @@ impl Wan21VaeDecoder {
 
         // Upsamples
         for block in &self.upsamples {
-            x = block.forward(&x)?;
+            x = block.forward(&x, image_mode)?;
         }
 
         // Head: RMS_norm + SiLU + CausalConv3d
