@@ -78,6 +78,15 @@ fn main() -> anyhow::Result<()> {
     let num_steps: usize = env_usize("QWEN_STEPS", 50);
     let true_cfg_scale: f32 = env_f32("QWEN_CFG", 4.0);
     let seed: u64 = env_u64("QWEN_SEED", 42);
+    let noise_path: Option<String> = std::env::var("QWEN_NOISE_PATH").ok();
+    let dump_dir: Option<String> = std::env::var("QWEN_DUMP_DIR").ok();
+    if let Some(ref d) = dump_dir {
+        std::fs::create_dir_all(d).ok();
+        println!("  [dump] per-step tensors → {d}");
+    }
+    if let Some(ref p) = noise_path {
+        println!("  [noise] loading from {p} (RNG seed ignored)");
+    }
 
     let dit_shards_owned: Vec<String> = match std::env::var("QWEN_DIT_SHARDS") {
         Ok(s) => s.split(':').map(|p| p.to_string()).collect(),
@@ -200,60 +209,90 @@ fn main() -> anyhow::Result<()> {
         ));
     }
 
-    // Seeded Gaussian noise for the target latent.
-    let numel = IN_CHANNELS * h_latent_full * w_latent_full;
-    let noise_data: Vec<f32> = {
-        use rand::prelude::*;
-        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-        let mut v = Vec::with_capacity(numel);
-        for _ in 0..numel / 2 {
-            let u1: f32 = rng.gen::<f32>().max(1e-10);
-            let u2: f32 = rng.gen::<f32>();
-            let r = (-2.0 * u1.ln()).sqrt();
-            let theta = 2.0 * std::f32::consts::PI * u2;
-            v.push(r * theta.cos());
-            v.push(r * theta.sin());
+    // Seeded Gaussian noise for the target latent — or load from disk if
+    // `QWEN_NOISE_PATH` is set (for parity runs vs diffusers reference).
+    let mut latents = if let Some(np) = &noise_path {
+        let loaded = flame_core::serialization::load_file(
+            std::path::Path::new(np),
+            &device,
+        )?;
+        let t = loaded.get("noise_packed")
+            .ok_or_else(|| anyhow::anyhow!("noise file missing 'noise_packed' key"))?
+            .clone();
+        let d = t.shape().dims();
+        if d.len() != 3 || d[0] != 1 || d[1] != target_seq_len || d[2] != PACKED_CHANNELS {
+            return Err(anyhow::anyhow!(
+                "Bad 'noise_packed' shape {:?}, expected [1, {}, {}]",
+                d, target_seq_len, PACKED_CHANNELS
+            ));
         }
-        if numel % 2 == 1 {
-            let u1: f32 = rng.gen::<f32>().max(1e-10);
-            let u2: f32 = rng.gen::<f32>();
-            v.push((-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos());
-        }
-        v
-    };
+        ensure_bf16(t)?
+    } else {
+        let numel = IN_CHANNELS * h_latent_full * w_latent_full;
+        let noise_data: Vec<f32> = {
+            use rand::prelude::*;
+            let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+            let mut v = Vec::with_capacity(numel);
+            for _ in 0..numel / 2 {
+                let u1: f32 = rng.gen::<f32>().max(1e-10);
+                let u2: f32 = rng.gen::<f32>();
+                let r = (-2.0 * u1.ln()).sqrt();
+                let theta = 2.0 * std::f32::consts::PI * u2;
+                v.push(r * theta.cos());
+                v.push(r * theta.sin());
+            }
+            if numel % 2 == 1 {
+                let u1: f32 = rng.gen::<f32>().max(1e-10);
+                let u2: f32 = rng.gen::<f32>();
+                v.push((-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos());
+            }
+            v
+        };
 
-    // CPU-pack the noise into [1, target_seq_len, 64].
-    let mut packed = vec![0.0f32; target_seq_len * PACKED_CHANNELS];
-    for c in 0..IN_CHANNELS {
-        for hp in 0..h_patched {
-            for wp in 0..w_patched {
-                for dh in 0..PATCH_SIZE {
-                    for dw in 0..PATCH_SIZE {
-                        let src_h = hp * PATCH_SIZE + dh;
-                        let src_w = wp * PATCH_SIZE + dw;
-                        let src_idx = c * h_latent_full * w_latent_full + src_h * w_latent_full + src_w;
+        let mut packed = vec![0.0f32; target_seq_len * PACKED_CHANNELS];
+        for c in 0..IN_CHANNELS {
+            for hp in 0..h_patched {
+                for wp in 0..w_patched {
+                    for dh in 0..PATCH_SIZE {
+                        for dw in 0..PATCH_SIZE {
+                            let src_h = hp * PATCH_SIZE + dh;
+                            let src_w = wp * PATCH_SIZE + dw;
+                            let src_idx = c * h_latent_full * w_latent_full + src_h * w_latent_full + src_w;
 
-                        let dst_seq = hp * w_patched + wp;
-                        let dst_chan = c * PATCH_SIZE * PATCH_SIZE + dh * PATCH_SIZE + dw;
-                        packed[dst_seq * PACKED_CHANNELS + dst_chan] = noise_data[src_idx];
+                            let dst_seq = hp * w_patched + wp;
+                            let dst_chan = c * PATCH_SIZE * PATCH_SIZE + dh * PATCH_SIZE + dw;
+                            packed[dst_seq * PACKED_CHANNELS + dst_chan] = noise_data[src_idx];
+                        }
                     }
                 }
             }
         }
-    }
-    let mut latents = Tensor::from_f32_to_bf16(
-        packed,
-        Shape::from_dims(&[1, target_seq_len, PACKED_CHANNELS]),
-        device.clone(),
-    )?;
+        Tensor::from_f32_to_bf16(
+            packed,
+            Shape::from_dims(&[1, target_seq_len, PACKED_CHANNELS]),
+            device.clone(),
+        )?
+    };
     println!("  Packed noise (target): {:?}", latents.shape().dims());
 
-    // ── Sigma schedule (same exponential time shift as T2I) ──
-    let base_shift: f32 = 0.5;
-    let max_shift: f32 = 1.15;
-    let base_seq_len: f32 = 256.0;
-    let max_seq_len_shift: f32 = 4096.0;
-    let shift_terminal: f32 = 0.02;
+    // If dumping, emit the noise now so the diffusers reference can replay it.
+    if let Some(ref d) = dump_dir {
+        let mut tmap: HashMap<String, Tensor> = HashMap::new();
+        tmap.insert("noise_packed".to_string(), latents.clone());
+        flame_core::serialization::save_file(&tmap, &format!("{d}/noise.safetensors"))?;
+    }
+
+    // ── Sigma schedule (FlowMatchEulerDiscreteScheduler) ──
+    // Constants must match the model's scheduler/scheduler_config.json. For
+    // Qwen-Image-Edit-2511 the shipped config has max_shift=0.9 and
+    // max_image_seq_len=8192 (the T2I defaults of 1.15/4096 are a footgun —
+    // with target_seq_len=4096 they mis-estimate mu and systematically shift
+    // every step to a higher-noise regime, which weakens prompt-driven edits).
+    let base_shift: f32 = env_f32("QWEN_BASE_SHIFT", 0.5);
+    let max_shift: f32 = env_f32("QWEN_MAX_SHIFT", 0.9);
+    let base_seq_len: f32 = env_f32("QWEN_BASE_SEQ_LEN", 256.0);
+    let max_seq_len_shift: f32 = env_f32("QWEN_MAX_SEQ_LEN", 8192.0);
+    let shift_terminal: f32 = env_f32("QWEN_SHIFT_TERMINAL", 0.02);
 
     let m = (max_shift - base_shift) / (max_seq_len_shift - base_seq_len);
     let bb = base_shift - m * base_seq_len;
@@ -303,10 +342,13 @@ fn main() -> anyhow::Result<()> {
         let sigma_next = sigmas[step + 1];
         let dt = sigma_next - sigma_curr;
 
+        // If dumping, capture the input latents for this step BEFORE the forward.
+        let latents_in_snap = dump_dir.as_ref().map(|_| latents.clone());
+
         // Scoped block: every per-step temporary drops at `}` before the
         // next iteration's allocations. Same OOM-safety pattern as
         // qwenimage_gen.rs after the audit-fix pass.
-        let next_x = {
+        let (next_x, dump_snap) = {
             let t_vec = Tensor::from_vec(
                 vec![sigma_curr],
                 Shape::from_dims(&[1]),
@@ -320,14 +362,40 @@ fn main() -> anyhow::Result<()> {
             // step.
             let concat_input = Tensor::cat(&[&latents, &image_latents], 1)?;
 
-            // Diffusers' QwenImageEditPlusPipeline (and the Aug 2025 base)
-            // pass ONE timestep to the transformer; the model uses RoPE
-            // positions to distinguish target vs reference tokens, not
-            // separate timesteps. (`index_timestep_zero` in ComfyUI's
-            // FluxKontextMultiReferenceLatentMethod is a separate node, not
-            // what diffusers does.) Using single-temb here.
-            let cond_pred_full = dit.forward_edit(&concat_input, &cond, &t_vec, &regions)?;
-            let uncond_pred_full = dit.forward_edit(&concat_input, &uncond, &t_vec, &regions)?;
+            // Qwen-Image-Edit-2511's transformer config sets `zero_cond_t:
+            // true`. Diffusers implements this by doubling the timestep batch
+            // to `[t, 0]` and using per-token modulation selection via
+            // `modulate_index` — target tokens get t's modulation, reference
+            // tokens get 0's (clean conditioning). Our Rust equivalent
+            // materializes both tembs and routes through
+            // `forward_edit_with_ref_timestep` + `block_forward_per_region`.
+            //
+            // Prior handoff history note: a Claude session reverted this path
+            // after misreading ComfyUI's `index_timestep_zero` as unrelated to
+            // diffusers. Diffusers DOES implement it — just via the
+            // `zero_cond_t` + `modulate_index` mechanism rather than by
+            // splitting the temb at the call-site. See
+            // `transformer_qwenimage.py:900-906` and
+            // `QwenImageTransformerBlock.forward:677-679`.
+            //
+            // Tunable: `QWEN_T_REF` (default 0.0). The smallest non-zero step
+            // in the sigma schedule is `shift_terminal=0.02`; values between
+            // 0.0 and 0.02 relax the "clean reference" conditioning.
+            let t_ref_val: f32 = std::env::var("QWEN_T_REF")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+            let t_ref_vec = Tensor::from_vec(
+                vec![t_ref_val],
+                Shape::from_dims(&[1]),
+                device.clone(),
+            )?
+            .to_dtype(DType::BF16)?;
+
+            let cond_pred_full = dit.forward_edit_with_ref_timestep(
+                &concat_input, &cond, &t_vec, Some(&t_ref_vec), &regions,
+            )?;
+            let uncond_pred_full = dit.forward_edit_with_ref_timestep(
+                &concat_input, &uncond, &t_vec, Some(&t_ref_vec), &regions,
+            )?;
 
             // Defensive: forward_edit must return [B, target_seq_len + ref_seq_len, 64].
             // Catch any future shape regression before the narrow silently
@@ -364,9 +432,42 @@ fn main() -> anyhow::Result<()> {
 
             // Euler step on the target latents only.
             let step_tensor = noise_pred.mul_scalar(dt)?;
-            latents.add(&step_tensor)?
+            let out = latents.add(&step_tensor)?;
+
+            // Bundle up snapshots if dumping is active.
+            let snap = if dump_dir.is_some() {
+                Some((cond_pred_full.clone(), uncond_pred_full.clone(), noise_pred.clone()))
+            } else {
+                None
+            };
+            (out, snap)
         };
         latents = next_x;
+
+        if let (Some(d), Some((cond_full, uncond_full, pred_cfg))) =
+            (dump_dir.as_ref(), dump_snap)
+        {
+            let mut tmap: HashMap<String, Tensor> = HashMap::new();
+            if let Some(li) = latents_in_snap {
+                tmap.insert("latents_in".to_string(), li);
+            }
+            tmap.insert("cond_pred_full".to_string(), cond_full);
+            tmap.insert("uncond_pred_full".to_string(), uncond_full);
+            tmap.insert("noise_pred_cfg".to_string(), pred_cfg);
+            tmap.insert("latents_out".to_string(), latents.clone());
+            tmap.insert(
+                "sigma_curr".to_string(),
+                Tensor::from_vec(vec![sigma_curr], Shape::from_dims(&[1]), device.clone())?,
+            );
+            tmap.insert(
+                "sigma_next".to_string(),
+                Tensor::from_vec(vec![sigma_next], Shape::from_dims(&[1]), device.clone())?,
+            );
+            flame_core::serialization::save_file(
+                &tmap,
+                &format!("{d}/step_{:03}.safetensors", step),
+            )?;
+        }
 
         if (step + 1) % 5 == 0 || step == 0 || step + 1 == num_steps {
             println!(
