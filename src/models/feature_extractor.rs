@@ -167,23 +167,42 @@ fn norm_and_concat_per_token_rms_fast(
     }
     drop(output);
 
-    // Simpler: normalize each layer, collect, cat along dim 2
-    let mut normed_layers = Vec::with_capacity(l);
+    // Normalize each layer, then stack → reshape to produce LIGHTRICKS's exact
+    // flat layout.
+    //
+    // Lightricks does (feature_extractor.py:62-78):
+    //   encoded = torch.stack(hidden_states, dim=-1)   # [B, T, D, L]
+    //   normed  = encoded * rsqrt(mean(encoded**2, dim=2, keepdim=True) + eps)
+    //   normed  = normed.reshape(B, T, D * L)
+    //
+    // The [B, T, D, L] → [B, T, D*L] reshape flattens in (d-major, l-minor)
+    // order: index `d*L + l`. The 4096 × 188160 `aggregate_embed` weight is
+    // trained on exactly this order.
+    //
+    // A naive `cat([layer_0, layer_1, …], dim=1)` gives (l-major, d-minor) —
+    // same numbers, wrong permutation — and the projection spits out
+    // semantically scrambled features (symptoms: coherent but off-prompt
+    // outputs).
+    //
+    // To match Lightricks: stack normed layers on a NEW last dim → [B*T, D, L],
+    // then reshape to [B*T, D*L].
+    let mut normed_layers: Vec<Tensor> = Vec::with_capacity(l);
     for h in hidden_states {
         let h_2d = h.reshape(&[b * t, d])?;
         let sq = h_2d.mul(&h_2d)?;
         let var = sq.mean_dim(&[1], false)?; // [B*T]
         let inv_std = var.add_scalar(1e-6)?.rsqrt()?.unsqueeze(1)?; // [B*T, 1]
-        let normed = h_2d.mul(&inv_std.expand(&[b * t, d])?)?;
-        normed_layers.push(normed);
+        let normed = h_2d.mul(&inv_std.expand(&[b * t, d])?)?; // [B*T, D]
+        // Add a trailing layer dim so Tensor::stack produces [B*T, D, L].
+        normed_layers.push(normed.unsqueeze(2)?); // [B*T, D, 1]
     }
 
-    // Cat along dim 1: 49 × [B*T, D] → [B*T, D*49]
+    // Cat along the NEW last dim: 49 × [B*T, D, 1] → [B*T, D, L].
     let refs: Vec<&Tensor> = normed_layers.iter().collect();
-    let concatenated = Tensor::cat(&refs, 1)?; // [B*T, 188160]
+    let stacked = Tensor::cat(&refs, 2)?; // [B*T, D, L]
 
-    // Reshape to [B, T, D*L]
-    let concatenated = concatenated.reshape(&[b, t, flat_dim])?;
+    // Reshape to flat [B, T, D*L] — matches Lightricks's (d-major, l-minor).
+    let concatenated = stacked.reshape(&[b, t, flat_dim])?;
 
     // Apply attention mask: zero out padded positions
     let mask_3d = attention_mask.unsqueeze(2)?.expand(&[b, t, flat_dim])?;
