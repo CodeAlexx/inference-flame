@@ -192,3 +192,7 @@ path = "src/bin/acestep_gen.rs"
 [[bin]]
 name = "acestep_parity"
 path = "src/bin/acestep_parity.rs"
+
+[[bin]]
+name = "ltx2_neg_prompt_parity"
+path = "src/bin/ltx2_neg_prompt_parity.rs"

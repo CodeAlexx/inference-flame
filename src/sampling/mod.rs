@@ -1,6 +1,7 @@
 pub mod euler;
 pub mod schedules;
 pub mod ltx2_sampling;
+pub mod ltx2_guidance;
 pub mod klein_sampling;
 pub mod flux1_sampling;
 pub mod kandinsky5_sampling;

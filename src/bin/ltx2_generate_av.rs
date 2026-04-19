@@ -4,7 +4,7 @@
 //! 1. Run Gemma-3 → FeatureExtractor → video+audio embeddings
 //! 2. Load LTX-2 transformer (FP8 resident with audio weights)
 //! 3. Create video noise + audio noise
-//! 4. Denoise jointly with forward_audio_video
+//! 4. Denoise jointly with forward_audio_video, optionally with CFG + STG
 //! 5. Save video + audio latents → decode with Python VAE
 
 use inference_flame::models::lora_loader::LoraWeights;
@@ -12,7 +12,8 @@ use inference_flame::models::ltx2_model::{LTX2Config, LTX2StreamingModel};
 use inference_flame::models::gemma3_encoder::Gemma3Encoder;
 use inference_flame::models::feature_extractor;
 use inference_flame::sampling::ltx2_sampling::LTX2_DISTILLED_SIGMAS;
-use flame_core::{global_cuda_device, DType, Shape, Tensor};
+use inference_flame::sampling::ltx2_guidance::{cfg_star_rescale, stg_rescale};
+use flame_core::{global_cuda_device, Shape, Tensor};
 
 /// Parse `--lora PATH[:STRENGTH]`. Default strength is 1.0.
 fn parse_lora_arg(raw: &str) -> anyhow::Result<(String, f32)> {
@@ -45,6 +46,59 @@ fn collect_lora_args() -> anyhow::Result<Vec<(String, f32)>> {
     }
     Ok(out)
 }
+
+/// Read a single `--flag VALUE` or `--flag=VALUE` argument and parse it as T.
+fn get_arg<T: std::str::FromStr>(flag: &str) -> Option<T> {
+    let args: Vec<String> = std::env::args().collect();
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == flag {
+            return args.get(i + 1).and_then(|s| s.parse().ok());
+        } else if let Some(val) = args[i].strip_prefix(&format!("{flag}=")) {
+            return val.parse().ok();
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Check if a boolean-style flag (`--flag`) is present.
+fn has_flag(flag: &str) -> bool {
+    std::env::args().any(|a| a == flag)
+}
+
+/// Parse `--stg-blocks 11,25,35,39` into a Vec<usize>. Returns empty on absent.
+fn parse_stg_blocks() -> Vec<usize> {
+    let raw: Option<String> = get_arg("--stg-blocks");
+    let Some(s) = raw else { return Vec::new(); };
+    s.split(',')
+        .filter_map(|t| t.trim().parse::<usize>().ok())
+        .collect()
+}
+
+/// Read the negative-prompt text (`--neg "TEXT"` / `--neg=TEXT`).
+///
+/// `get_arg::<String>` doesn't work for strings containing spaces once you
+/// go through `&format!("{flag}=")` — it does, but the stock `.parse::<String>()`
+/// always succeeds so this is safe. We keep it as its own helper so the
+/// intent reads cleanly at the call site and to allow last-wins semantics.
+fn collect_neg_text() -> Option<String> {
+    let args: Vec<String> = std::env::args().collect();
+    let mut out: Option<String> = None;
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "--neg" {
+            out = args.get(i + 1).cloned();
+            i += 2;
+        } else if let Some(val) = args[i].strip_prefix("--neg=") {
+            out = Some(val.to_string());
+            i += 1;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
 use std::collections::HashMap;
 use std::time::Instant;
 
@@ -55,6 +109,15 @@ const GEMMA_ROOT: &str = "/home/alex/.serenity/models/text_encoders/gemma-3-12b-
 const LTX_CHECKPOINT: &str = "/home/alex/.serenity/models/checkpoints/ltx-2.3-22b-dev.safetensors";
 
 const OUTPUT_DIR: &str = "/home/alex/EriDiffusion/inference-flame/output";
+
+/// Lightricks-canonical default negative prompt.
+///
+/// Source: `/tmp/ltx-video/ltx_video/inference.py:351-354` (checked in by
+/// the LTX-Video authors). If this is edited, also update
+/// `scripts/ltx2_neg_prompt_ref.py` and `src/bin/ltx2_neg_prompt_parity.rs`
+/// — the parity bin compares this exact string byte-for-byte.
+const DEFAULT_NEGATIVE: &str =
+    "worst quality, inconsistent motion, blurry, jittery, distorted";
 
 // Generation params
 const PROMPT: &str = "A close-up frames a woman pressed flat against a cold metal locker in a dark storage bay, her face half-lit by a single flickering overhead light. Condensation drips down riveted steel walls as she holds her breath, eyes wide, listening. She whispers to herself in a trembling, barely audible voice, Think. Think. The airlock is two decks down. She swallows hard, closing her eyes as a slow, wet scraping sound passes on the other side of the wall. Her lips move again, voice cracking, It can hear you. It can hear your heartbeat. Stop shaking. The camera drifts slowly from her face down to her hands gripping a makeshift weapon, a sharpened length of pipe wrapped in electrical tape, knuckles white. A distant metallic clang echoes through the bay and her eyes snap open. She exhales in a shuddering whisper, Move now or die here, and pushes off the wall, the camera tracking low behind her as she crouches into the darkness between cargo containers. The ambient hum of the ship s failing life support drones beneath the silence.";
@@ -72,10 +135,36 @@ fn main() -> anyhow::Result<()> {
     env_logger::init();
     let t_total = Instant::now();
 
+    // Parse guidance knobs UP FRONT — stage 1 needs to know whether CFG is
+    // on so it can encode the negative prompt in the same pass as the
+    // positive (saves loading Gemma twice).
+    let cfg_scale: f32 = get_arg("--cfg").unwrap_or(1.0);
+    let stg_scale: f32 = get_arg("--stg").unwrap_or(0.0);
+    let stg_rescale_factor: f32 = get_arg("--stg-rescale").unwrap_or(0.7);
+    let cfg_star = has_flag("--cfg-star-rescale");
+    let stg_blocks = parse_stg_blocks();
+    let neg_text = collect_neg_text().unwrap_or_else(|| DEFAULT_NEGATIVE.to_string());
+
+    let do_cfg = cfg_scale > 1.0;
+    let do_stg = stg_scale > 0.0 && !stg_blocks.is_empty();
+
     println!("============================================================");
     println!("LTX-2.3 Audio+Video Generation — Pure Rust");
     println!("============================================================");
     println!("  {}×{}, {} frames, {} steps", WIDTH, HEIGHT, NUM_FRAMES, NUM_STEPS);
+    println!("  cfg={:.2} ({})  stg={:.2} ({})  cfg_star={}",
+        cfg_scale, if do_cfg { "on" } else { "off" },
+        stg_scale, if do_stg { "on" } else { "off" },
+        cfg_star);
+    if do_cfg {
+        // Truncate the preview — some negatives can be paragraph-length.
+        let preview = if neg_text.len() > 120 {
+            format!("{}...", &neg_text[..120])
+        } else {
+            neg_text.clone()
+        };
+        println!("  neg_prompt = {:?}", preview);
+    }
 
     let device = global_cuda_device();
 
@@ -113,20 +202,20 @@ fn main() -> anyhow::Result<()> {
     let shard_refs: Vec<&str> = shards.iter().map(|s| s.as_str()).collect();
 
     // Tokenize (simple: <bos> + text tokens, left-padded to 256)
-    println!("  Tokenizing...");
+    println!("  Tokenizing (positive)...");
     let (input_ids, attention_mask) = simple_tokenize(PROMPT, 256)?;
     let real_count = attention_mask.iter().filter(|&&m| m != 0).count();
     println!("  {} tokens ({} real)", input_ids.len(), real_count);
 
-    // Load and run Gemma
+    // Load and run Gemma (positive)
     println!("  Loading Gemma-3...");
     let mut encoder = Gemma3Encoder::load(&shard_refs, &device, input_ids.len())?;
-    println!("  Running Gemma forward...");
+    println!("  Running Gemma forward (positive)...");
     let (all_hidden, mask_out) = encoder.encode(&input_ids, &attention_mask)?;
     println!("  Gemma done: {} hidden states in {:.1}s", all_hidden.len(), t0.elapsed().as_secs_f32());
 
-    // Feature extraction
-    println!("  Loading aggregate_embed...");
+    // Feature extraction — load projection weights once (reused for neg).
+    println!("  Loading aggregate_embed (video, 4096) + (audio, 2048)...");
     let agg_weights = flame_core::serialization::load_file_filtered(
         std::path::Path::new(LTX_CHECKPOINT),
         &device,
@@ -135,6 +224,15 @@ fn main() -> anyhow::Result<()> {
     let agg_w = agg_weights.get("text_embedding_projection.video_aggregate_embed.weight")
         .ok_or_else(|| anyhow::anyhow!("Missing video_aggregate_embed.weight"))?;
     let agg_b = agg_weights.get("text_embedding_projection.video_aggregate_embed.bias");
+
+    let audio_agg_weights = flame_core::serialization::load_file_filtered(
+        std::path::Path::new(LTX_CHECKPOINT),
+        &device,
+        |key| key.starts_with("text_embedding_projection.audio_aggregate_embed"),
+    )?;
+    let audio_agg_w = audio_agg_weights.get("text_embedding_projection.audio_aggregate_embed.weight")
+        .ok_or_else(|| anyhow::anyhow!("Missing audio_aggregate_embed.weight"))?;
+    let audio_agg_b = audio_agg_weights.get("text_embedding_projection.audio_aggregate_embed.bias");
 
     println!("  Running video feature extractor (→ 4096)...");
     let video_context = feature_extractor::feature_extract_and_project(
@@ -146,17 +244,6 @@ fn main() -> anyhow::Result<()> {
     )?;
     println!("  Video context: {:?}", video_context.dims());
 
-    // Audio feature extraction: same Gemma hidden states → audio_aggregate_embed → 2048
-    println!("  Loading audio_aggregate_embed...");
-    let audio_agg_weights = flame_core::serialization::load_file_filtered(
-        std::path::Path::new(LTX_CHECKPOINT),
-        &device,
-        |key| key.starts_with("text_embedding_projection.audio_aggregate_embed"),
-    )?;
-    let audio_agg_w = audio_agg_weights.get("text_embedding_projection.audio_aggregate_embed.weight")
-        .ok_or_else(|| anyhow::anyhow!("Missing audio_aggregate_embed.weight"))?;
-    let audio_agg_b = audio_agg_weights.get("text_embedding_projection.audio_aggregate_embed.bias");
-
     println!("  Running audio feature extractor (→ 2048)...");
     let audio_context = feature_extractor::feature_extract_and_project(
         &all_hidden,
@@ -167,12 +254,52 @@ fn main() -> anyhow::Result<()> {
     )?;
     println!("  Audio context: {:?}", audio_context.dims());
 
+    // Drop positive hidden-states / mask before the negative forward to
+    // hold peak VRAM steady — Gemma's per-layer [1, 256, 3840] stack is
+    // reconstructed when encode() is called again.
+    drop(all_hidden);
+    drop(mask_out);
+
+    // ----- Negative prompt (only when CFG will be used) -----
+    //
+    // Lightricks always encodes the negative (pipeline_ltx_video.py:1024-1040)
+    // but only USES it in the CFG combination when guidance_scale > 1
+    // (pipeline_ltx_video.py:1116). We only spend the cycles when we need
+    // them. Both video_context_neg (4096) and audio_context_neg (2048)
+    // are produced so the AV forward has a proper uncond pair —
+    // "uncond = zeros" for audio silently degrades AV coherence.
+    let (neg_video_context_from_text, neg_audio_context_from_text) = if do_cfg {
+        println!("  Tokenizing (negative)...");
+        let (neg_ids, neg_mask) = simple_tokenize(&neg_text, 256)?;
+        let neg_real = neg_mask.iter().filter(|&&m| m != 0).count();
+        println!("  {} tokens ({} real)", neg_ids.len(), neg_real);
+
+        println!("  Running Gemma forward (negative)...");
+        let (neg_hidden, neg_mask_out) = encoder.encode(&neg_ids, &neg_mask)?;
+
+        println!("  Running video feature extractor on negative (→ 4096)...");
+        let v_neg = feature_extractor::feature_extract_and_project(
+            &neg_hidden, &neg_mask_out, agg_w, agg_b, 4096,
+        )?;
+        println!("  Negative video context: {:?}", v_neg.dims());
+
+        println!("  Running audio feature extractor on negative (→ 2048)...");
+        let a_neg = feature_extractor::feature_extract_and_project(
+            &neg_hidden, &neg_mask_out, audio_agg_w, audio_agg_b, 2048,
+        )?;
+        println!("  Negative audio context: {:?}", a_neg.dims());
+
+        drop(neg_hidden);
+        drop(neg_mask_out);
+        (Some(v_neg), Some(a_neg))
+    } else {
+        (None, None)
+    };
+
     // Free Gemma + feature extraction to reclaim ALL VRAM for DiT
     drop(encoder);
-    drop(all_hidden);
     drop(agg_weights);
     drop(audio_agg_weights);
-    drop(mask_out);
     // Force CUDA memory pool to release cached allocations
     let _ = device.synchronize();
     // Trim the CUDA memory pool to free cached blocks
@@ -252,9 +379,57 @@ fn main() -> anyhow::Result<()> {
     println!("  Sigmas: {:?}", sigmas);
 
     // ========================================
+    // Guidance summary (flags already parsed at startup)
+    // ========================================
+    let forwards_per_step = 1 + if do_cfg { 1 } else { 0 } + if do_stg { 1 } else { 0 };
+    println!("\nGuidance: cfg={:.2} ({}) stg={:.2} ({}) blocks={:?} cfg_star={} stg_rescale={:.2}",
+        cfg_scale, if do_cfg { "on" } else { "off" },
+        stg_scale, if do_stg { "on" } else { "off" },
+        stg_blocks, cfg_star, stg_rescale_factor);
+    println!("  → {} forward(s) per denoise step", forwards_per_step);
+
+    // Negative-prompt contexts:
+    //   1. Prefer `--neg-video-embeddings PATH` / `--neg-audio-embeddings PATH`
+    //      (pre-cached tensors in the context dim). Useful for iterating
+    //      on LoRAs without re-running Gemma each time.
+    //   2. Otherwise use the video/audio contexts encoded from `--neg TEXT`
+    //      (or the Lightricks-canonical default) in stage 1.
+    //   3. Zeros fallback is explicitly DISABLED — audio-zero-uncond was
+    //      the session-12 AV-coherence regression; reaching this branch
+    //      with CFG on means the negative encoder silently skipped audio
+    //      and is a bug.
+    let (neg_video_context, neg_audio_context) = if do_cfg {
+        let nvc_path: Option<String> = get_arg("--neg-video-embeddings");
+        let nac_path: Option<String> = get_arg("--neg-audio-embeddings");
+
+        let nvc = if let Some(p) = nvc_path {
+            println!("  Loading neg video embeddings from {p}");
+            let m = flame_core::serialization::load_file(std::path::Path::new(&p), &device)?;
+            m.values().next().cloned().ok_or_else(||
+                anyhow::anyhow!("no tensors in {p}"))?
+        } else {
+            neg_video_context_from_text.clone().ok_or_else(||
+                anyhow::anyhow!("CFG enabled but no neg video context was encoded — this is a bug"))?
+        };
+        let nac = if let Some(p) = nac_path {
+            println!("  Loading neg audio embeddings from {p}");
+            let m = flame_core::serialization::load_file(std::path::Path::new(&p), &device)?;
+            m.values().next().cloned().ok_or_else(||
+                anyhow::anyhow!("no tensors in {p}"))?
+        } else {
+            neg_audio_context_from_text.clone().ok_or_else(||
+                anyhow::anyhow!("CFG enabled but no neg audio context was encoded — this is a bug"))?
+        };
+        (Some(nvc), Some(nac))
+    } else {
+        (None, None)
+    };
+
+    // ========================================
     // Stage 4: Denoise (audio + video jointly)
     // ========================================
-    println!("\n--- Stage 4: Denoise ({} steps, AV joint) ---", NUM_STEPS);
+    println!("\n--- Stage 4: Denoise ({} steps, AV joint, {} fwd/step) ---",
+        NUM_STEPS, forwards_per_step);
     let t0 = Instant::now();
     let mut video_x = video_noise;
     let mut audio_x = audio_noise;
@@ -268,13 +443,67 @@ fn main() -> anyhow::Result<()> {
             vec![sigma], Shape::from_dims(&[1]), device.clone(),
         )?;
 
-        // Joint AV forward — no CFG for distilled model
-        let (video_vel, audio_vel) = model.forward_audio_video(
+        // -------- Positive (cond) forward --------
+        let (video_cond, audio_cond) = model.forward_audio_video(
             &video_x, &audio_x, &sigma_t,
             &video_context, &audio_context,
             FRAME_RATE,
-            None, None,  // attention masks: None = pre-projected embeddings
+            None, None,
         )?;
+
+        // -------- Optional CFG uncond forward --------
+        let (video_vel, audio_vel) = if do_cfg {
+            let nvc = neg_video_context.as_ref().unwrap();
+            let nac = neg_audio_context.as_ref().unwrap();
+            let (mut video_uncond, mut audio_uncond) = model.forward_audio_video(
+                &video_x, &audio_x, &sigma_t,
+                nvc, nac,
+                FRAME_RATE,
+                None, None,
+            )?;
+            if cfg_star {
+                video_uncond = cfg_star_rescale(&video_cond, &video_uncond)?;
+                audio_uncond = cfg_star_rescale(&audio_cond, &audio_uncond)?;
+            }
+            // noise_pred = uncond + cfg_scale * (cond - uncond)
+            let v_guided = video_uncond.add(
+                &video_cond.sub(&video_uncond)?.mul_scalar(cfg_scale)?,
+            )?;
+            let a_guided = audio_uncond.add(
+                &audio_cond.sub(&audio_uncond)?.mul_scalar(cfg_scale)?,
+            )?;
+            (v_guided, a_guided)
+        } else {
+            (video_cond.clone(), audio_cond.clone())
+        };
+
+        // -------- Optional STG perturb forward --------
+        let (video_vel, audio_vel) = if do_stg {
+            let (video_pert, audio_pert) = model.forward_audio_video_with_stg(
+                &video_x, &audio_x, &sigma_t,
+                &video_context, &audio_context,
+                FRAME_RATE,
+                None, None,
+                Some(&stg_blocks),
+            )?;
+            // noise_pred += stg_scale * (cond - perturbed)
+            let v_out = video_vel.add(
+                &video_cond.sub(&video_pert)?.mul_scalar(stg_scale)?,
+            )?;
+            let a_out = audio_vel.add(
+                &audio_cond.sub(&audio_pert)?.mul_scalar(stg_scale)?,
+            )?;
+            // STG std-rescale if requested
+            if stg_rescale_factor != 1.0 {
+                let v_resc = stg_rescale(&video_cond, &v_out, stg_rescale_factor)?;
+                let a_resc = stg_rescale(&audio_cond, &a_out, stg_rescale_factor)?;
+                (v_resc, a_resc)
+            } else {
+                (v_out, a_out)
+            }
+        } else {
+            (video_vel, audio_vel)
+        };
 
         // Euler step for video
         if sigma_next == 0.0 {

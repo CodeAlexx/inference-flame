@@ -705,6 +705,33 @@ impl LTX2Attention {
         query_rope: Option<(&Tensor, &Tensor)>,
         key_rope: Option<(&Tensor, &Tensor)>,
     ) -> Result<Tensor> {
+        self.forward_with_skip(
+            hidden_states, encoder_hidden_states, attention_mask,
+            query_rope, key_rope, None,
+        )
+    }
+
+    /// Forward with optional STG-AttentionValues skip scalar.
+    ///
+    /// When `skip_scalar == Some(0.0)`, the attention output is replaced by
+    /// the V projection (pre-`to_out`, pre-heads-reshape). This matches
+    /// Lightricks's `SkipLayerStrategy.AttentionValues` at
+    /// attention.py:1078-1084:
+    ///   `hidden_states = attn_a * mask + value_for_stg * (1 - mask)`
+    ///
+    /// When `skip_scalar == Some(1.0)` or `None`, behaves identically to
+    /// `forward`. Per-head gating (if present) is still applied to the
+    /// blended output, matching upstream where the `to_gate_logits` path
+    /// runs after the skip-blend.
+    pub fn forward_with_skip(
+        &self,
+        hidden_states: &Tensor,
+        encoder_hidden_states: Option<&Tensor>,
+        attention_mask: Option<&Tensor>,
+        query_rope: Option<(&Tensor, &Tensor)>,
+        key_rope: Option<(&Tensor, &Tensor)>,
+        skip_scalar: Option<f32>,
+    ) -> Result<Tensor> {
         let prof = std::env::var("LTX2_ATTN_PROF").is_ok();
         let dev = hidden_states.device().clone();
         let mut t = std::time::Instant::now();
@@ -721,6 +748,11 @@ impl LTX2Attention {
         let k = linear3d(kv_input, &self.to_k_weight, Some(&self.to_k_bias))?;
         let v = linear3d(kv_input, &self.to_v_weight, Some(&self.to_v_bias))?;
         tick("qkv", &mut t, &mut phases);
+
+        // Stash the V projection in post-linear layout for STG-AV — matches
+        // Lightricks's `value_for_stg = value` BEFORE the view-to-heads reshape
+        // (attention.py:1014-1015).
+        let value_for_stg = if skip_scalar.is_some() { Some(v.clone()) } else { None };
 
         // Fused RMSNorm across heads on Q and K
         let q = rms_norm(&q, Some(&self.norm_q_weight), self.eps)?;
@@ -761,6 +793,27 @@ impl LTX2Attention {
         // silently returned wrong data for gated LTX-2 blocks).
         let inner_dim = self.num_heads * self.head_dim;
         let attn_out = attn_out.permute(&[0, 2, 1, 3])?.reshape(&[b, s_q, inner_dim])?;
+
+        // STG-AttentionValues blend: hidden_states_a = attn*mask + v*(1-mask).
+        // When mask == 1.0 this is a no-op; when mask == 0.0 we use V.
+        // `value_for_stg` has shape [B, S_kv, inner_dim]. For self-attention
+        // `S_kv == S_q`; for cross-attention S_kv can differ.  Lightricks's
+        // code only activates STG on self-attention paths where S_kv == S_q
+        // (attention.py:1014-1084 runs the full blend path which requires
+        // matched lengths — they don't gate STG on attn2 in dev configs).
+        // We guard with the shape check and fall back to no-op on mismatch.
+        let attn_out = match (skip_scalar, value_for_stg) {
+            (Some(m), Some(vfs)) if s_q == s_kv => {
+                // Scalar blend: attn * m + vfs * (1 - m)
+                attn_out.mul_scalar(m)?.add(&vfs.mul_scalar(1.0 - m)?)?
+            }
+            (Some(_), Some(_)) => {
+                // Cross-attention shape mismatch — STG-AV doesn't apply to
+                // cross-attn in Lightricks's reference pipeline. No-op.
+                attn_out
+            }
+            _ => attn_out,
+        };
 
         // Apply per-head gating if present (ComfyUI LTX-2.3)
         let attn_out = if let (Some(gate_w), Some(gate_b)) =
@@ -852,6 +905,28 @@ impl LTX2TransformerBlock {
         encoder_attention_mask: Option<&Tensor>,
         prompt_timestep: Option<&Tensor>, // [B, seq, 2*dim] for cross-attn KV modulation
     ) -> Result<Tensor> {
+        self.forward_video_only_with_skip(
+            hidden_states, encoder_hidden_states, temb,
+            video_rotary_emb, encoder_attention_mask, prompt_timestep,
+            None,
+        )
+    }
+
+    /// Video-only forward with optional STG-AttentionValues skip scalar for
+    /// this layer. `skip_scalar == Some(0.0)` activates the skip (attention
+    /// output is replaced by the V projection on attn1 self-attn only —
+    /// cross-attn shape mismatches skip STG naturally per Lightricks).
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_video_only_with_skip(
+        &self,
+        hidden_states: &Tensor,
+        encoder_hidden_states: &Tensor,
+        temb: &Tensor,
+        video_rotary_emb: Option<(&Tensor, &Tensor)>,
+        encoder_attention_mask: Option<&Tensor>,
+        prompt_timestep: Option<&Tensor>,
+        skip_scalar: Option<f32>,
+    ) -> Result<Tensor> {
         let b = hidden_states.shape().dims()[0];
         let dim = hidden_states.shape().dims()[2];
         let num_ada_params = self.scale_shift_table.shape().dims()[0];
@@ -896,7 +971,9 @@ impl LTX2TransformerBlock {
         };
         if probe_substeps { probe("post-norm1+modulate", &mod_h); }
         let t_adaln = t0.elapsed().as_millis();
-        let attn_out = self.attn1.forward(&mod_h, None, None, video_rotary_emb, None)?;
+        let attn_out = self.attn1.forward_with_skip(
+            &mod_h, None, None, video_rotary_emb, None, skip_scalar,
+        )?;
         if probe_substeps { probe("post-attn1 raw", &attn_out); }
         let t_sa = t0.elapsed().as_millis() - t_adaln;
         let mut hs = fused_residual_gate(hidden_states, &attn_out, &gate_msa)?;
@@ -1007,6 +1084,50 @@ impl LTX2TransformerBlock {
         video_prompt_timestep: Option<&Tensor>, // [B, text_seq, 2*video_dim]
         audio_prompt_timestep: Option<&Tensor>, // [B, audio_text_seq, 2*audio_dim]
     ) -> Result<(Tensor, Tensor)> {
+        self.forward_with_skip(
+            hidden_states, audio_hidden_states,
+            encoder_hidden_states, audio_encoder_hidden_states,
+            temb, temb_audio, temb_ca_scale_shift, temb_ca_audio_scale_shift,
+            temb_ca_gate, temb_ca_audio_gate,
+            video_rotary_emb, audio_rotary_emb,
+            ca_video_rotary_emb, ca_audio_rotary_emb,
+            encoder_attention_mask, audio_encoder_attention_mask,
+            video_prompt_timestep, audio_prompt_timestep,
+            None,
+        )
+    }
+
+    /// Block forward with optional STG-AV skip scalar for this layer. When
+    /// `skip_scalar == Some(0.0)`, the video self-attention (attn1) AND audio
+    /// self-attention (audio_attn1) outputs are replaced by their V
+    /// projections. Cross-attentions (attn2, audio_attn2) get the skip scalar
+    /// passed through too, but the self-attention shape guard in
+    /// `LTX2Attention::forward_with_skip` makes it a no-op on cross-attn
+    /// (S_q != S_kv). A2V / V2A paths are never skipped — they are the
+    /// cross-modal coupling and zeroing them would destroy the AV signal.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with_skip(
+        &self,
+        hidden_states: &Tensor,
+        audio_hidden_states: &Tensor,
+        encoder_hidden_states: &Tensor,
+        audio_encoder_hidden_states: &Tensor,
+        temb: &Tensor,
+        temb_audio: &Tensor,
+        temb_ca_scale_shift: &Tensor,
+        temb_ca_audio_scale_shift: &Tensor,
+        temb_ca_gate: &Tensor,
+        temb_ca_audio_gate: &Tensor,
+        video_rotary_emb: Option<(&Tensor, &Tensor)>,
+        audio_rotary_emb: Option<(&Tensor, &Tensor)>,
+        ca_video_rotary_emb: Option<(&Tensor, &Tensor)>,
+        ca_audio_rotary_emb: Option<(&Tensor, &Tensor)>,
+        encoder_attention_mask: Option<&Tensor>,
+        audio_encoder_attention_mask: Option<&Tensor>,
+        video_prompt_timestep: Option<&Tensor>,
+        audio_prompt_timestep: Option<&Tensor>,
+        skip_scalar: Option<f32>,
+    ) -> Result<(Tensor, Tensor)> {
         let b = hidden_states.shape().dims()[0];
         let video_dim = hidden_states.shape().dims()[2];
         let audio_dim = audio_hidden_states.shape().dims()[2];
@@ -1060,7 +1181,9 @@ impl LTX2TransformerBlock {
         if dump_intermediates {
             intermediate_dump.insert("dump_mod_h".into(), mod_h.clone());
         }
-        let attn_out = self.attn1.forward(&mod_h, None, None, video_rotary_emb, None)?;
+        let attn_out = self.attn1.forward_with_skip(
+            &mod_h, None, None, video_rotary_emb, None, skip_scalar,
+        )?;
         if dump_intermediates {
             intermediate_dump.insert("dump_vsa_attn_out".into(), attn_out.clone());
         }
@@ -1081,6 +1204,7 @@ impl LTX2TransformerBlock {
             fused_modulate(&norm_a, &a_scale_msa, &a_shift_msa)?
         };
         let attn_a_out = if dump_intermediates {
+            // Dump path doesn't support skip; skip during diagnostics is a no-op.
             self.audio_attn1.forward_dump(
                 &mod_a, None, None,
                 audio_rotary_emb, None,
@@ -1088,7 +1212,9 @@ impl LTX2TransformerBlock {
                 "dump_asa",
             )?
         } else {
-            self.audio_attn1.forward(&mod_a, None, None, audio_rotary_emb, None)?
+            self.audio_attn1.forward_with_skip(
+                &mod_a, None, None, audio_rotary_emb, None, skip_scalar,
+            )?
         };
         if dump_intermediates {
             intermediate_dump.insert("dump_asa_attn_out".into(), attn_a_out.clone());
@@ -4036,6 +4162,35 @@ impl LTX2StreamingModel {
         encoder_attention_mask: Option<&Tensor>,        // [B, 1, 1, seq] additive mask (video text)
         audio_encoder_attention_mask: Option<&Tensor>,  // [B, 1, 1, seq] additive mask (audio text)
     ) -> Result<(Tensor, Tensor)> {
+        self.forward_audio_video_with_stg(
+            x, audio_x, timestep, context, audio_context, frame_rate,
+            encoder_attention_mask, audio_encoder_attention_mask, None,
+        )
+    }
+
+    /// `forward_audio_video` with an optional STG skip-block list for this
+    /// forward pass. When `skip_block_list == Some(&[...])`, every transformer
+    /// block whose index appears in the list has its video+audio
+    /// self-attention output replaced by the V projection
+    /// (SkipLayerStrategy::AttentionValues). This is what STG's "perturb"
+    /// forward does in Lightricks's guidance loop.
+    ///
+    /// This is the STG "perturb" forward — callers should run it with the
+    /// positive-prompt conditioning and COMBINE with the normal
+    /// `forward_audio_video` output using `stg_scale * (pos - perturbed)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_audio_video_with_stg(
+        &mut self,
+        x: &Tensor,
+        audio_x: &Tensor,
+        timestep: &Tensor,
+        context: &Tensor,
+        audio_context: &Tensor,
+        frame_rate: f32,
+        encoder_attention_mask: Option<&Tensor>,
+        audio_encoder_attention_mask: Option<&Tensor>,
+        skip_block_list: Option<&[usize]>,
+    ) -> Result<(Tensor, Tensor)> {
         // Verify audio globals are loaded
         let audio_proj_in_w = self.audio_proj_in_weight.as_ref()
             .ok_or_else(|| flame_core::Error::InvalidInput("Audio globals not loaded".into()))?;
@@ -4345,7 +4500,9 @@ impl LTX2StreamingModel {
                 super::fp8_quant::quantize_block_weights_inplace(&mut block_weights, i)?;
 
                 let block = Self::load_block_from_weights_pretransposed(&config_clone, i, block_weights)?;
-                let (new_hs, new_ahs) = block.forward(
+                let skip_scalar = skip_block_list
+                    .and_then(|list| if list.contains(&i) { Some(0.0f32) } else { None });
+                let (new_hs, new_ahs) = block.forward_with_skip(
                     &hs, &ahs,
                     &enc_hs, &audio_enc_hs,
                     &v_timestep, &a_timestep,
@@ -4358,6 +4515,7 @@ impl LTX2StreamingModel {
                     None, None,
                     video_prompt_ts.as_ref(),
                     audio_prompt_ts.as_ref(),
+                    skip_scalar,
                 )?;
                 hs = new_hs;
                 ahs = new_ahs;
@@ -4452,7 +4610,9 @@ impl LTX2StreamingModel {
                     }
                 }
 
-                let (new_hs, new_ahs) = block.forward(
+                let skip_scalar = skip_block_list
+                    .and_then(|list| if list.contains(&i) { Some(0.0f32) } else { None });
+                let (new_hs, new_ahs) = block.forward_with_skip(
                     &hs, &ahs,
                     &enc_hs, &audio_enc_hs,
                     &v_timestep, &a_timestep,
@@ -4465,6 +4625,7 @@ impl LTX2StreamingModel {
                     None, None,
                     video_prompt_ts.as_ref(),
                     audio_prompt_ts.as_ref(),
+                    skip_scalar,
                 )?;
                 if prof { let _ = device.synchronize(); }
                 let t_after_forward = t_block.elapsed().as_millis();

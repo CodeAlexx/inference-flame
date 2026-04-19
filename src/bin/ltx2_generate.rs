@@ -1,28 +1,58 @@
 //! LTX-2.3 video generation — pure Rust, with CFG.
 //!
 //! Pipeline:
-//! 1. Load cached Gemma text embeddings (4096-dim, pre-processed)
-//! 2. Load LTX-2 transformer via BlockOffloader
-//! 3. Create noise + sigma schedule (dev model)
-//! 4. Denoise with CFG: two forward passes per step (uncond + cond)
-//! 5. Save denoised latents → decode with Python VAE
+//! 1. Load cached positive text embeddings (4096-dim video_context).
+//! 2. If CFG is enabled (`--cfg SCALE` with SCALE > 1):
+//!    a. Load Gemma-3 + projection weights
+//!    b. Encode the negative prompt to a 4096-dim video_context
+//!    c. Drop Gemma to reclaim VRAM for the DiT
+//! 3. Load LTX-2 transformer via BlockOffloader / FP8 resident
+//! 4. Create noise + sigma schedule (distilled or dev)
+//! 5. Denoise; when CFG is on, two forward passes per step (uncond + cond)
+//! 6. Save denoised latents → decode with Python VAE
 //!
-//! LoRA: pass `--lora PATH[:STRENGTH]` one or more times. Example:
-//!   ltx2_generate --lora /path/to/distilled.safetensors:0.9
+//! Flags:
+//!   --lora PATH[:STRENGTH]         attach one or more LoRAs (fusion path)
+//!   --cfg SCALE                    override the default guidance scale
+//!                                    (default 1.0, distilled)
+//!   --neg "TEXT"                   negative prompt text (default:
+//!                                    Lightricks canonical). Requires
+//!                                    running Gemma-3 in-process.
+//!   --neg-embeds PATH              pre-computed neg embedding file
+//!                                    (tensor key: any; first value used)
+//!                                    — overrides `--neg TEXT`.
+//!
+//! When CFG is on AND `--neg-embeds` is NOT given, this binary runs the
+//! same Gemma-3 + FeatureExtractor pipeline as `ltx2_generate_av` (just
+//! the video half — audio context is only needed by the AV binary).
 
+use inference_flame::models::gemma3_encoder::Gemma3Encoder;
+use inference_flame::models::feature_extractor;
 use inference_flame::models::lora_loader::LoraWeights;
 use inference_flame::models::ltx2_model::{LTX2Config, LTX2StreamingModel};
 use inference_flame::sampling::ltx2_sampling::{build_dev_sigma_schedule, LTX2_DISTILLED_SIGMAS};
-use flame_core::{global_cuda_device, DType, Shape, Tensor};
+use flame_core::{global_cuda_device, Shape, Tensor};
 use std::time::Instant;
 
 // Use dev-fp8 for testing FP8 resident path
 const MODEL_PATH: &str =
     "/home/alex/.serenity/models/checkpoints/ltx-2.3-22b-dev-fp8.safetensors";
+const LTX_CHECKPOINT_FULL: &str =
+    "/home/alex/.serenity/models/checkpoints/ltx-2.3-22b-dev.safetensors";
 const EMBEDDINGS_PATH: &str =
     "/home/alex/EriDiffusion/inference-flame/cached_ltx2_embeddings.safetensors";
 const OUTPUT_PATH: &str =
     "/home/alex/EriDiffusion/inference-flame/output/ltx2_denoised_latents.safetensors";
+const GEMMA_ROOT: &str =
+    "/home/alex/.serenity/models/text_encoders/gemma-3-12b-it-standalone";
+
+/// Lightricks-canonical default negative prompt.
+///
+/// Source: `/tmp/ltx-video/ltx_video/inference.py:351-354` (checked in by
+/// the LTX-Video authors). If this is edited, also update
+/// `scripts/ltx2_neg_prompt_ref.py` and `src/bin/ltx2_neg_prompt_parity.rs`.
+const DEFAULT_NEGATIVE: &str =
+    "worst quality, inconsistent motion, blurry, jittery, distorted";
 
 const NUM_FRAMES: usize = 9;
 const WIDTH: usize = 480;
@@ -30,8 +60,8 @@ const HEIGHT: usize = 288;
 const SEED: u64 = 42;
 const FRAME_RATE: f32 = 25.0;
 const LATENT_CHANNELS: usize = 128;
-const GUIDANCE_SCALE: f32 = 1.0; // Distilled: no CFG needed
-const NUM_STEPS: usize = 8;     // Distilled fixed steps
+const DEFAULT_GUIDANCE_SCALE: f32 = 1.0; // Distilled default: no CFG
+const NUM_STEPS: usize = 8;              // Distilled fixed steps
 
 /// Parse a single `--lora` value of the form `PATH[:STRENGTH]`.
 /// Default strength is 1.0 when omitted. Supports paths with no colon
@@ -70,14 +100,173 @@ fn collect_lora_args() -> anyhow::Result<Vec<(String, f32)>> {
     Ok(out)
 }
 
+/// Read a single `--flag VALUE` / `--flag=VALUE`, parse as T, last-wins.
+fn get_arg<T: std::str::FromStr>(flag: &str) -> Option<T> {
+    let args: Vec<String> = std::env::args().collect();
+    let mut out: Option<T> = None;
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == flag {
+            if let Some(v) = args.get(i + 1).and_then(|s| s.parse().ok()) {
+                out = Some(v);
+            }
+            i += 2;
+        } else if let Some(val) = args[i].strip_prefix(&format!("{flag}=")) {
+            if let Ok(v) = val.parse() {
+                out = Some(v);
+            }
+            i += 1;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Read `--neg TEXT` / `--neg=TEXT`, returning the raw string if present.
+fn collect_neg_text() -> Option<String> {
+    let args: Vec<String> = std::env::args().collect();
+    let mut out: Option<String> = None;
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "--neg" {
+            out = args.get(i + 1).cloned();
+            i += 2;
+        } else if let Some(val) = args[i].strip_prefix("--neg=") {
+            out = Some(val.to_string());
+            i += 1;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Tokenize via the HF `tokenizers` crate. Matches Python reference:
+/// add_special_tokens=True → BOS=2 prepended; right-truncate to max_len;
+/// left-pad with id 0; attention_mask 0 for pad, 1 for real.
+fn simple_tokenize(text: &str, max_len: usize) -> anyhow::Result<(Vec<i32>, Vec<i32>)> {
+    let tok_path = format!("{GEMMA_ROOT}/tokenizer.json");
+    let tokenizer = tokenizers::Tokenizer::from_file(&tok_path)
+        .map_err(|e| anyhow::anyhow!("Tokenizer load ({tok_path}): {e}"))?;
+    let encoding = tokenizer
+        .encode(text, true)
+        .map_err(|e| anyhow::anyhow!("Tokenizer encode: {e}"))?;
+    let raw_ids: &[u32] = encoding.get_ids();
+
+    let ids: Vec<u32> = if raw_ids.len() > max_len {
+        eprintln!(
+            "  [tokenize] prompt encoded to {} tokens, truncating to {}",
+            raw_ids.len(),
+            max_len
+        );
+        raw_ids[..max_len].to_vec()
+    } else {
+        raw_ids.to_vec()
+    };
+
+    let real_len = ids.len();
+    let pad = max_len - real_len;
+    let mut input_ids: Vec<i32> = vec![0i32; pad];
+    input_ids.extend(ids.iter().map(|&id| id as i32));
+    let mut attention_mask: Vec<i32> = vec![0i32; pad];
+    attention_mask.extend(std::iter::repeat(1i32).take(real_len));
+    debug_assert_eq!(input_ids.len(), max_len);
+    debug_assert_eq!(attention_mask.len(), max_len);
+    Ok((input_ids, attention_mask))
+}
+
+/// Trim the CUDA memory pool to free cached blocks — mirrors the AV bin.
+fn trim_cuda_pool(device: &std::sync::Arc<flame_core::CudaDevice>) {
+    let _ = device.synchronize();
+    unsafe {
+        extern "C" {
+            fn cudaMemPoolTrimTo(pool: *mut std::ffi::c_void, min_bytes: usize) -> i32;
+            fn cudaDeviceGetDefaultMemPool(pool: *mut *mut std::ffi::c_void, device: i32) -> i32;
+        }
+        let mut pool: *mut std::ffi::c_void = std::ptr::null_mut();
+        let _ = cudaDeviceGetDefaultMemPool(&mut pool, 0);
+        if !pool.is_null() {
+            let _ = cudaMemPoolTrimTo(pool, 0);
+        }
+    }
+}
+
+/// Run Gemma-3 → video_aggregate_embed on a single prompt string.
+/// Returns a `[1, seq, 4096]` BF16 tensor.
+fn encode_video_context(
+    text: &str,
+    device: &std::sync::Arc<flame_core::CudaDevice>,
+) -> anyhow::Result<Tensor> {
+    let mut shards: Vec<String> = Vec::new();
+    for i in 1..=5 {
+        let path = format!("{GEMMA_ROOT}/model-{i:05}-of-00005.safetensors");
+        if std::path::Path::new(&path).exists() {
+            shards.push(path);
+        }
+    }
+    let shard_refs: Vec<&str> = shards.iter().map(|s| s.as_str()).collect();
+
+    let (input_ids, attention_mask) = simple_tokenize(text, 256)?;
+    let real_count = attention_mask.iter().filter(|&&m| m != 0).count();
+    println!("  tokens: {} (real: {})", input_ids.len(), real_count);
+
+    println!("  Loading Gemma-3...");
+    let mut encoder = Gemma3Encoder::load(&shard_refs, device, input_ids.len())?;
+    println!("  Gemma forward...");
+    let (all_hidden, mask_out) = encoder.encode(&input_ids, &attention_mask)?;
+
+    println!("  Loading video_aggregate_embed...");
+    let agg_weights = flame_core::serialization::load_file_filtered(
+        std::path::Path::new(LTX_CHECKPOINT_FULL),
+        device,
+        |key| key.starts_with("text_embedding_projection.video_aggregate_embed"),
+    )?;
+    let agg_w = agg_weights.get("text_embedding_projection.video_aggregate_embed.weight")
+        .ok_or_else(|| anyhow::anyhow!("Missing video_aggregate_embed.weight"))?;
+    let agg_b = agg_weights.get("text_embedding_projection.video_aggregate_embed.bias");
+
+    println!("  Video feature extractor (→ 4096)...");
+    let ctx = feature_extractor::feature_extract_and_project(
+        &all_hidden, &mask_out, agg_w, agg_b, 4096,
+    )?;
+
+    drop(all_hidden);
+    drop(mask_out);
+    drop(encoder);
+    drop(agg_weights);
+    trim_cuda_pool(device);
+    Ok(ctx)
+}
+
 fn main() -> anyhow::Result<()> {
     env_logger::init();
     let t_total = Instant::now();
 
+    // Parse guidance flags early.
+    let cfg_scale: f32 = get_arg("--cfg").unwrap_or(DEFAULT_GUIDANCE_SCALE);
+    let do_cfg = cfg_scale > 1.0;
+    let neg_text = collect_neg_text().unwrap_or_else(|| DEFAULT_NEGATIVE.to_string());
+    let neg_embeds_path: Option<String> = get_arg("--neg-embeds");
+
     println!("============================================================");
     println!("LTX-2.3 Video Generation — Pure Rust + CFG");
     println!("============================================================");
-    println!("  {}×{}, {} frames, {} steps, cfg={}", WIDTH, HEIGHT, NUM_FRAMES, NUM_STEPS, GUIDANCE_SCALE);
+    println!("  {}×{}, {} frames, {} steps, cfg={:.2} ({})",
+        WIDTH, HEIGHT, NUM_FRAMES, NUM_STEPS,
+        cfg_scale, if do_cfg { "on" } else { "off" });
+    if do_cfg {
+        if let Some(p) = &neg_embeds_path {
+            println!("  neg source: embeds file {p}");
+        } else {
+            let preview = if neg_text.len() > 120 {
+                format!("{}...", &neg_text[..120])
+            } else {
+                neg_text.clone()
+            };
+            println!("  neg source: encoded via Gemma-3 from {:?}", preview);
+        }
+    }
 
     let device = global_cuda_device();
 
@@ -95,21 +284,57 @@ fn main() -> anyhow::Result<()> {
     println!("  Latent: [{}, {}, {}, {}] = {} tokens",
              LATENT_CHANNELS, latent_f, latent_h, latent_w, num_tokens);
 
-    // Stage 1: Load embeddings (positive + create negative)
-    println!("\n--- Stage 1: Load embeddings ---");
+    // Stage 1: Load positive embeddings (cached)
+    println!("\n--- Stage 1: Load positive embeddings ---");
     let cached = flame_core::serialization::load_file(
         std::path::Path::new(EMBEDDINGS_PATH), &device,
     )?;
     let text_cond = cached.get("text_hidden")
-        .ok_or_else(|| anyhow::anyhow!("Missing text_hidden"))?;
+        .ok_or_else(|| anyhow::anyhow!("Missing text_hidden"))?
+        .clone();
     println!("  Conditional: {:?} {:?}", text_cond.dims(), text_cond.dtype());
+    drop(cached); // release the rest of the cache map
 
-    // Negative/unconditional embedding: zeros works reliably.
-    // NOTE: official empty-string embedding produces near-black output at low step counts
-    // because pos and neg embeddings are too similar after connector normalization.
-    // TODO: investigate proper negative embedding with 10+ steps.
-    let text_uncond = Tensor::zeros_dtype(text_cond.shape().clone(), DType::BF16, device.clone())?;
-    println!("  Unconditional: zeros {:?}", text_uncond.dims());
+    // Stage 1b: Negative embeddings.
+    //   1. `--neg-embeds PATH` — load it; wins over everything.
+    //   2. CFG on: encode `--neg TEXT` (or DEFAULT_NEGATIVE) via Gemma-3
+    //      + video_aggregate_embed. Drops Gemma before stage 2.
+    //   3. CFG off: no negative needed.
+    //
+    // The previous zeros-fallback produced near-black outputs at low step
+    // counts (the "uncond = zeros" failure mode from session-12). We
+    // never go back there.
+    let text_uncond: Option<Tensor> = if do_cfg {
+        let t0 = Instant::now();
+        let ctx = if let Some(p) = &neg_embeds_path {
+            println!("\n--- Stage 1b: Load cached negative embeddings ---");
+            let m = flame_core::serialization::load_file(std::path::Path::new(p), &device)?;
+            // Look for standard keys first, then fall back to first tensor.
+            let picked = m.get("text_hidden")
+                .or_else(|| m.get("video_context_neg"))
+                .or_else(|| m.values().next())
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("no tensors in {p}"))?;
+            if picked.dims() != text_cond.dims() {
+                return Err(anyhow::anyhow!(
+                    "neg embeds shape {:?} != positive shape {:?}",
+                    picked.dims(), text_cond.dims()));
+            }
+            picked
+        } else {
+            println!("\n--- Stage 1b: Encode negative prompt ---");
+            let ctx = encode_video_context(&neg_text, &device)?;
+            if ctx.dims() != text_cond.dims() {
+                eprintln!("  WARN: encoded neg {:?} vs positive {:?} differ — probably a seq-len mismatch",
+                    ctx.dims(), text_cond.dims());
+            }
+            ctx
+        };
+        println!("  Unconditional: {:?} ({:.1}s)", ctx.dims(), t0.elapsed().as_secs_f32());
+        Some(ctx)
+    } else {
+        None
+    };
 
     // Stage 2: Load transformer
     println!("\n--- Stage 2: Load transformer ---");
@@ -169,7 +394,7 @@ fn main() -> anyhow::Result<()> {
         Shape::from_dims(&[1, LATENT_CHANNELS, latent_f, latent_h, latent_w]),
         device.clone(),
     )?;
-    let sigmas = if GUIDANCE_SCALE <= 1.0 {
+    let sigmas = if !do_cfg {
         // Distilled: use fixed sigma schedule
         LTX2_DISTILLED_SIGMAS.to_vec()
     } else {
@@ -179,7 +404,7 @@ fn main() -> anyhow::Result<()> {
     println!("  Sigmas: {:?}", sigmas);
 
     // Stage 4: Denoise with CFG
-    println!("\n--- Stage 4: Denoise ({} steps, CFG={}) ---", NUM_STEPS, GUIDANCE_SCALE);
+    println!("\n--- Stage 4: Denoise ({} steps, CFG={:.2}) ---", NUM_STEPS, cfg_scale);
     let t0 = Instant::now();
     let mut x = noise;
 
@@ -192,19 +417,20 @@ fn main() -> anyhow::Result<()> {
             vec![sigma], Shape::from_dims(&[1]), device.clone(),
         )?;
 
-        let velocity = if GUIDANCE_SCALE > 1.0 {
+        let velocity = if do_cfg {
             // CFG: two forward passes
+            let uncond = text_uncond.as_ref().expect("text_uncond must be set when CFG is on");
             let velocity_uncond = model.forward_video_only(
-                &x, &sigma_t, &text_uncond, FRAME_RATE, None,
+                &x, &sigma_t, uncond, FRAME_RATE, None,
             )?;
             let velocity_cond = model.forward_video_only(
-                &x, &sigma_t, text_cond, FRAME_RATE, None,
+                &x, &sigma_t, &text_cond, FRAME_RATE, None,
             )?;
             let delta = velocity_cond.sub(&velocity_uncond)?;
-            velocity_uncond.add(&delta.mul_scalar(GUIDANCE_SCALE)?)?
+            velocity_uncond.add(&delta.mul_scalar(cfg_scale)?)?
         } else {
             // No CFG: single forward pass (distilled model)
-            model.forward_video_only(&x, &sigma_t, text_cond, FRAME_RATE, None)?
+            model.forward_video_only(&x, &sigma_t, &text_cond, FRAME_RATE, None)?
         };
 
         // Euler step
