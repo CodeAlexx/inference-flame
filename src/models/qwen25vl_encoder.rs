@@ -9,7 +9,8 @@
 //!   - head_dim=128, intermediate_size=18944
 //!   - SwiGLU MLP: gate_proj + up_proj -> SiLU(gate) * up -> down_proj
 //!   - RMSNorm (eps=1e-6), RoPE (theta=1e6)
-//!   - Q and K projections have biases; V and O do NOT
+//!   - Q, K, and V projections ALL have biases (`attention_bias=True`);
+//!     only `o_proj` is bias-free.
 //!   - No QK norm (unlike Qwen3)
 //!
 //! All BF16, F32 only for RoPE angles and normalization internals.
@@ -191,18 +192,38 @@ impl Qwen25VLEncoder {
     // RoPE — 1D causal (single sequence position)
     // -----------------------------------------------------------------------
 
-    /// Build 1D RoPE cos/sin tables for causal attention.
+    /// Build 1D RoPE cos/sin tables for a padded Qwen2.5-VL input.
+    ///
+    /// HF constructs position_ids for text-only prompts via
+    /// `Qwen2_5_VLModel.get_rope_index`:
+    ///   `position_ids = cumsum(attention_mask) - 1`
+    ///   `position_ids.masked_fill_(attention_mask == 0, 1)`
+    /// so real tokens map to `[0, 1, ..., real_len-1]` and every pad token
+    /// gets dummy position 1. This diverges from a naive sequential
+    /// `arange(seq_len)` once padding is present — using sequential IDs
+    /// at pad positions gives those positions *different* K/V values than
+    /// HF, and although the causal+pad mask normally keeps real-token
+    /// outputs intact, any path that touches pad positions (or any parity
+    /// metric that averages over the full sequence) will disagree.
     ///
     /// Returns (cos, sin), each shaped `[1, 1, seq_len, head_dim / 2]` in BF16.
     fn build_rope_cache(
         seq_len: usize,
+        real_len: usize,
         head_dim: usize,
         theta: f64,
         device: &Arc<CudaDevice>,
     ) -> Result<(Tensor, Tensor)> {
         let half = head_dim / 2;
 
-        let pos = Tensor::arange(0.0, seq_len as f32, 1.0, device.clone())?;
+        let positions: Vec<f32> = (0..seq_len)
+            .map(|i| if i < real_len { i as f32 } else { 1.0 })
+            .collect();
+        let pos = Tensor::from_vec(
+            positions,
+            Shape::from_dims(&[seq_len]),
+            device.clone(),
+        )?;
 
         let freq_idx = Tensor::arange(0.0, head_dim as f32, 2.0, device.clone())?;
         let log_theta = (theta as f32).ln();
@@ -261,9 +282,16 @@ impl Qwen25VLEncoder {
     // Causal mask
     // -----------------------------------------------------------------------
 
-    /// Build a combined causal + padding mask `[1, 1, seq_len, seq_len]` in BF16.
+    /// Build a combined causal + padding mask `[1, 1, seq_len, seq_len]`
+    /// in BF16. **Multiplicative / boolean** convention, matching flame's
+    /// SDPA (`crate::sdpa::forward_bf16_fallback`): the kernel internally
+    /// computes `scores += (1.0 - mask) * -1e9`, so `mask = 1.0` is
+    /// allowed and `mask = 0.0` is blocked. A float additive mask would
+    /// be interpreted inside-out.
     ///
-    /// `real_len`: number of real (non-pad) tokens at the start of the sequence.
+    /// `real_len`: number of real (non-pad) tokens at the start of the
+    /// sequence. Attention from any query row `i` to key column `j` is
+    /// allowed iff `j <= i && j < real_len` (causal + padding combined).
     fn build_causal_mask(
         seq_len: usize,
         real_len: usize,
@@ -329,16 +357,17 @@ impl Qwen25VLEncoder {
         let norm_w = self.w(&format!("{prefix}.input_layernorm.weight"))?;
         let normed = Self::rms_norm(hidden, norm_w, cfg.rms_norm_eps)?;
 
-        // 2. Q, K, V projections — Q and K have biases, V does not
+        // 2. Q, K, V projections — all three have biases in Qwen2.5-VL
         let q_w = self.w(&format!("{prefix}.self_attn.q_proj.weight"))?;
         let q_b = self.w(&format!("{prefix}.self_attn.q_proj.bias"))?;
         let k_w = self.w(&format!("{prefix}.self_attn.k_proj.weight"))?;
         let k_b = self.w(&format!("{prefix}.self_attn.k_proj.bias"))?;
         let v_w = self.w(&format!("{prefix}.self_attn.v_proj.weight"))?;
+        let v_b = self.w(&format!("{prefix}.self_attn.v_proj.bias"))?;
 
         let q = Self::linear_bias(&normed, q_w, q_b)?;
         let k = Self::linear_bias(&normed, k_w, k_b)?;
-        let v = Self::linear(&normed, v_w)?;
+        let v = Self::linear_bias(&normed, v_w, v_b)?;
 
         // 3. Reshape to [B, seq, heads, head_dim], permute to [B, heads, seq, head_dim]
         let q = q.reshape(&[b, n, h, d])?.permute(&[0, 2, 1, 3])?;
@@ -413,6 +442,164 @@ impl Qwen25VLEncoder {
     // Full forward pass
     // -----------------------------------------------------------------------
 
+    /// Full forward + capture of (embedding, per-layer outputs, final
+    /// hidden). Used by `bin/qwen25vl_parity` to locate where a
+    /// parity-test divergence starts. `max_layer` is inclusive; pass
+    /// `usize::MAX` for "all layers".
+    pub fn encode_with_intermediates(
+        &self,
+        token_ids: &[i32],
+    ) -> Result<(Tensor, Vec<Tensor>, Tensor)> {
+        let cfg = &self.config;
+        let seq_len = token_ids.len();
+        let pad_id = 151643i32;
+        let real_len = token_ids
+            .iter()
+            .position(|&id| id == pad_id)
+            .unwrap_or(seq_len);
+
+        let hidden = self.embed_tokens(token_ids)?;
+        let embed = hidden.clone();
+
+        let (pe_cos, pe_sin) =
+            Self::build_rope_cache(seq_len, real_len, cfg.head_dim, cfg.rope_theta, &self.device)?;
+        let attn_mask = Self::build_causal_mask(seq_len, real_len, &self.device)?;
+
+        let mut x = hidden;
+        let mut layer_outs = Vec::with_capacity(cfg.num_layers);
+        for i in 0..cfg.num_layers {
+            x = self.layer_forward(i, &x, &pe_cos, &pe_sin, &attn_mask)?;
+            layer_outs.push(x.clone());
+        }
+        let final_norm_w = self.w("model.norm.weight")?;
+        let final_hidden = Self::rms_norm(&x, final_norm_w, cfg.rms_norm_eps)?;
+        Ok((embed, layer_outs, final_hidden))
+    }
+
+    /// Dump every substep of layer 0 into a `HashMap` keyed by stage
+    /// name. Used by `bin/qwen25vl_layer0_parity` to locate the first
+    /// diverging op when the layer-0 output is wrong.
+    ///
+    /// Keys (in execution order):
+    ///   `embed_out`       `[1, N, H]`
+    ///   `normed_input`    `[1, N, H]`   (after `input_layernorm`)
+    ///   `q_raw`, `k_raw`, `v_raw`       post-projection, pre-reshape, with bias
+    ///   `q_heads`, `k_heads`, `v_heads` after `[B,N,h*d] -> [B,h,N,d]`
+    ///   `q_roped`, `k_roped`            after `apply_rope`
+    ///   `k_repeated`, `v_repeated`      after `repeat_kv(n_rep)`
+    ///   `attn_sdpa`       `[1, H_q, N, D]`  after flame_sdpa
+    ///   `attn_merge`      `[1, N, H]`       after permute + merge heads
+    ///   `attn_o_out`      `[1, N, H]`       after o_proj
+    ///   `after_attn`      `[1, N, H]`       after residual add (= first block output)
+    ///   `normed_post`     `[1, N, H]`       after `post_attention_layernorm`
+    ///   `gate_raw`, `up_raw`            MLP projections
+    ///   `mlp_pre_down`    `silu(gate) * up`
+    ///   `mlp_out`         after `down_proj`
+    ///   `layer_0_out`     `[1, N, H]`       after MLP residual add
+    pub fn layer0_substep_probe(
+        &self,
+        token_ids: &[i32],
+    ) -> Result<HashMap<String, Tensor>> {
+        let cfg = &self.config;
+        let seq_len = token_ids.len();
+        let pad_id = 151643i32;
+        let real_len = token_ids
+            .iter()
+            .position(|&id| id == pad_id)
+            .unwrap_or(seq_len);
+
+        let hidden = self.embed_tokens(token_ids)?;
+        let (pe_cos, pe_sin) =
+            Self::build_rope_cache(seq_len, real_len, cfg.head_dim, cfg.rope_theta, &self.device)?;
+        let attn_mask = Self::build_causal_mask(seq_len, real_len, &self.device)?;
+
+        let mut out: HashMap<String, Tensor> = HashMap::new();
+        out.insert("embed_out".into(), hidden.clone());
+
+        let h = cfg.num_heads;
+        let h_kv = cfg.num_kv_heads;
+        let d = cfg.head_dim;
+        let n_rep = h / h_kv;
+        let dims = hidden.shape().dims().to_vec();
+        let b = dims[0];
+        let n = dims[1];
+        let prefix = "model.layers.0";
+
+        // --- Self-attention ---
+        let norm_w = self.w(&format!("{prefix}.input_layernorm.weight"))?;
+        let normed = Self::rms_norm(&hidden, norm_w, cfg.rms_norm_eps)?;
+        out.insert("normed_input".into(), normed.clone());
+
+        let q_w = self.w(&format!("{prefix}.self_attn.q_proj.weight"))?;
+        let q_b = self.w(&format!("{prefix}.self_attn.q_proj.bias"))?;
+        let k_w = self.w(&format!("{prefix}.self_attn.k_proj.weight"))?;
+        let k_b = self.w(&format!("{prefix}.self_attn.k_proj.bias"))?;
+        let v_w = self.w(&format!("{prefix}.self_attn.v_proj.weight"))?;
+        let v_b = self.w(&format!("{prefix}.self_attn.v_proj.bias"))?;
+
+        let q_raw = Self::linear_bias(&normed, q_w, q_b)?;
+        let k_raw = Self::linear_bias(&normed, k_w, k_b)?;
+        let v_raw = Self::linear_bias(&normed, v_w, v_b)?;
+        out.insert("q_raw".into(), q_raw.clone());
+        out.insert("k_raw".into(), k_raw.clone());
+        out.insert("v_raw".into(), v_raw.clone());
+
+        let q_heads = q_raw.reshape(&[b, n, h, d])?.permute(&[0, 2, 1, 3])?;
+        let k_heads = k_raw.reshape(&[b, n, h_kv, d])?.permute(&[0, 2, 1, 3])?;
+        let v_heads = v_raw.reshape(&[b, n, h_kv, d])?.permute(&[0, 2, 1, 3])?;
+        out.insert("q_heads".into(), q_heads.clone());
+        out.insert("k_heads".into(), k_heads.clone());
+        out.insert("v_heads".into(), v_heads.clone());
+
+        let q_roped = Self::apply_rope(&q_heads, &pe_cos, &pe_sin)?;
+        let k_roped = Self::apply_rope(&k_heads, &pe_cos, &pe_sin)?;
+        out.insert("q_roped".into(), q_roped.clone());
+        out.insert("k_roped".into(), k_roped.clone());
+
+        let k_rep = Self::repeat_kv(&k_roped, n_rep)?;
+        let v_rep = Self::repeat_kv(&v_heads, n_rep)?;
+        out.insert("k_repeated".into(), k_rep.clone());
+        out.insert("v_repeated".into(), v_rep.clone());
+
+        let attn_sdpa = flame_sdpa(&q_roped, &k_rep, &v_rep, Some(&attn_mask))?;
+        out.insert("attn_sdpa".into(), attn_sdpa.clone());
+
+        let attn_merge = attn_sdpa.permute(&[0, 2, 1, 3])?.reshape(&[b, n, h * d])?;
+        out.insert("attn_merge".into(), attn_merge.clone());
+
+        let o_w = self.w(&format!("{prefix}.self_attn.o_proj.weight"))?;
+        let attn_o_out = Self::linear(&attn_merge, o_w)?;
+        out.insert("attn_o_out".into(), attn_o_out.clone());
+
+        let after_attn = hidden.add(&attn_o_out)?;
+        out.insert("after_attn".into(), after_attn.clone());
+
+        // --- MLP ---
+        let post_norm_w = self.w(&format!("{prefix}.post_attention_layernorm.weight"))?;
+        let normed2 = Self::rms_norm(&after_attn, post_norm_w, cfg.rms_norm_eps)?;
+        out.insert("normed_post".into(), normed2.clone());
+
+        let gate_w = self.w(&format!("{prefix}.mlp.gate_proj.weight"))?;
+        let up_w = self.w(&format!("{prefix}.mlp.up_proj.weight"))?;
+        let down_w = self.w(&format!("{prefix}.mlp.down_proj.weight"))?;
+
+        let gate_raw = Self::linear(&normed2, gate_w)?;
+        let up_raw = Self::linear(&normed2, up_w)?;
+        out.insert("gate_raw".into(), gate_raw.clone());
+        out.insert("up_raw".into(), up_raw.clone());
+
+        let mlp_pre_down = gate_raw.silu()?.mul(&up_raw)?;
+        out.insert("mlp_pre_down".into(), mlp_pre_down.clone());
+
+        let mlp_out = Self::linear(&mlp_pre_down, down_w)?;
+        out.insert("mlp_out".into(), mlp_out.clone());
+
+        let layer_0 = after_attn.add(&mlp_out)?;
+        out.insert("layer_0_out".into(), layer_0);
+
+        Ok(out)
+    }
+
     /// Run forward pass and return the last hidden state.
     ///
     /// # Returns
@@ -436,7 +623,7 @@ impl Qwen25VLEncoder {
 
         // 2. Build RoPE cache for seq_len
         let (pe_cos, pe_sin) =
-            Self::build_rope_cache(seq_len, cfg.head_dim, cfg.rope_theta, &self.device)?;
+            Self::build_rope_cache(seq_len, real_len, cfg.head_dim, cfg.rope_theta, &self.device)?;
 
         // Build causal + padding mask
         let attn_mask = Self::build_causal_mask(seq_len, real_len, &self.device)?;
@@ -487,6 +674,7 @@ pub fn expected_weight_keys(num_layers: usize) -> Vec<String> {
             format!("{p}.self_attn.k_proj.weight"),
             format!("{p}.self_attn.k_proj.bias"),
             format!("{p}.self_attn.v_proj.weight"),
+            format!("{p}.self_attn.v_proj.bias"),
             format!("{p}.self_attn.o_proj.weight"),
             format!("{p}.mlp.gate_proj.weight"),
             format!("{p}.mlp.up_proj.weight"),
@@ -535,17 +723,19 @@ mod tests {
     #[test]
     fn test_expected_weight_keys_count() {
         let keys = expected_weight_keys(28);
-        // 1 (embed) + 28 * 11 (per-layer: 6 weights + 2 biases + 3 mlp) + 1 (final norm) = 310
-        assert_eq!(keys.len(), 1 + 28 * 11 + 1);
+        // 1 (embed) + 28 * 12 (per-layer: 4 attn weights + 3 qkv biases +
+        // 2 layernorm + 3 mlp) + 1 (final norm) = 338
+        assert_eq!(keys.len(), 1 + 28 * 12 + 1);
     }
 
     #[test]
     fn test_expected_weight_keys_has_biases() {
         let keys = expected_weight_keys(28);
+        // Qwen2.5-VL has `attention_bias=True` — Q, K, V all have biases.
         assert!(keys.contains(&"model.layers.0.self_attn.q_proj.bias".to_string()));
         assert!(keys.contains(&"model.layers.0.self_attn.k_proj.bias".to_string()));
-        // V and O should NOT have biases
-        assert!(!keys.contains(&"model.layers.0.self_attn.v_proj.bias".to_string()));
+        assert!(keys.contains(&"model.layers.0.self_attn.v_proj.bias".to_string()));
+        // o_proj alone is bias-free.
         assert!(!keys.contains(&"model.layers.0.self_attn.o_proj.bias".to_string()));
     }
 
