@@ -62,14 +62,17 @@ differs from Lightricks. Tracked here as TODO.
 | `cfg_star_rescale` | Projects uncond onto cond direction: `alpha = dot(eps_text, eps_uncond) / ||eps_uncond||²; eps_uncond ← alpha * eps_uncond`. Enabled in dev configs. | ❌ |
 | STG rescaling (`rescaling_scale=0.7`) | After STG combine: `factor = std(text) / std(guided); factor = 0.7 * factor + 0.3; noise_pred *= factor`. | ❌ |
 
-## Phase 3 — Conditioning breadth
+## Phase 3 — Conditioning breadth ✅ COMPLETE (Phase 3A landed)
 
 | Item | Notes | Status |
 |---|---|---|
-| Multi-keyframe conditioning | `ConditioningItem(media_item, media_frame_number % 8 == 0, strength)`. `_handle_non_first_conditioning_sequence` at pipeline_ltx_video.py:1652-1726. | ❌ |
-| Video extension forward/backward | Reuses multi-keyframe machinery. frame=0 for forward, frame=N for backward. | ❌ |
-| IC-LoRA reference concat | Not a separate path — just prepend `reference_latents` to `target_latents` at dim=1 and set `conditioning_mask=1.0` on the ref half. Timestep forced to 0 there. Decode target half only. `reference_downscale_factor` metadata — default 1.0 when absent. | ❌ |
-| `image_cond_noise_scale` (default 0.15) | `latents += noise_scale * noise * t²` on positions where `conditioning_mask > 1 - eps`. | ❌ |
+| Multi-keyframe conditioning | `ConditioningItem(latent, frame_number, strength)` + `prepare_conditioning` builds the merged latent + per-token mask. Timestep forced to 0 at conditioned positions via `forward_audio_video_with_mask`. | ✅ masks bit-exact, latents at FMA-noise |
+| Video extension forward/backward | Uses the same multi-keyframe machinery — frame=0 for forward extension, `frame=N` (multiple of 8) for backward. | ✅ (mechanism verified via multi-keyframe tests) |
+| IC-LoRA reference conditioning | **Already usable as `--lora IC_LORA_FILE --cond REFERENCE_IMAGE:0:1.0` on `ltx2_generate_kf`**. The trained IC-LoRA weights activate the "concat-and-condition" behavior; the reference image lands in the latent grid via Phase 3A; the conditioning mask forces ref timesteps to 0. Nothing extra required in the pipeline. | ✅ via Phase 3A + Phase 1 |
+| `image_cond_noise_scale` (default 0.15) | `latents += noise_scale * noise * t²` on positions where `conditioning_mask > 1 - eps`. Rust helper `add_image_cond_noise` + `--cond-noise-scale` flag on `ltx2_generate_kf`. | ✅ max_abs=3.58e-7 (FMA noise) |
+| Canny / Depth / Pose preprocessors in Rust | **Deferred** — Lightricks preprocesses externally (cv2.Canny for canny, user-supplied for depth/pose). Users preprocess with any tool and pass via `--cond`. Rust Canny would be a convenience, not a correctness gap. | ⏸️ |
+
+Commit: `d2aa887`.
 
 ## Phase 4 — Multi-scale
 
