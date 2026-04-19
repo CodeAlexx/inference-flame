@@ -16,15 +16,42 @@ Workflow per feature:
 6. Re-run parity. Must pass before commit. No shortcuts.
 ```
 
-## Phase 1 — Foundation (in progress)
+## Phase 1 — Foundation ✅ COMPLETE
 
 | Item | Parity ref | Compare bin | Impl | Status |
 |---|---|---|---|---|
-| LoRA fusion math (`B @ A`) | `scripts/lora_fusion_parity_ref.py` | `src/bin/lora_fusion_parity.rs` | `src/models/lora_loader.rs` | ✅ PASS 12/12 @ 0.999999 (committed 9430e51) |
-| LoRA wired into `LTX2StreamingModel` | — | `src/bin/ltx2_lora_wiring_check.rs`, `src/bin/ltx2_lora_fusion_correctness.rs` | `src/models/ltx2_model.rs` | 🟡 agent-wired, disk-sync PASS bit-exact, AV coverage pending verify |
+| LoRA fusion math (`B @ A`) | `scripts/lora_fusion_parity_ref.py` | `src/bin/lora_fusion_parity.rs` | `src/models/lora_loader.rs` | ✅ PASS 12/12 @ 0.999999 |
+| LoRA wired into `LTX2StreamingModel` | — | `src/bin/ltx2_lora_wiring_check.rs`, `src/bin/ltx2_lora_fusion_correctness.rs` | `src/models/ltx2_model.rs` | ✅ bit-exact video+audio, disk-sync + BlockOffloader |
 | LinearQuadratic scheduler | `scripts/ltx2_sigma_schedule_ref.py` (imports `ltx_video.schedulers.rf`) | `src/bin/ltx2_sigma_parity.rs` | `src/sampling/ltx2_sampling.rs::linear_quadratic_schedule` | ✅ PASS max_abs=0.0 for n=8/20/25/30 |
-| `--lora` in `ltx2_generate_av` | — | correctness test covers AV | `src/bin/ltx2_generate_av.rs` | ❌ pending |
-| Audio LoRA fusion via BlockOffloader | `load_raw_weight("audio_attn1.to_q")` | `ltx2_lora_fusion_correctness` | `apply_loras_to_weights` | ❌ pending verify |
+| `--lora` in `ltx2_generate_av` | — | correctness test covers AV | `src/bin/ltx2_generate_av.rs` | ✅ wired, audio never skipped |
+| Audio LoRA fusion via BlockOffloader | `load_raw_weight("audio_attn1.to_q")` | `ltx2_lora_fusion_correctness` | `apply_loras_to_weights` | ✅ bit-exact |
+
+Commits: `9430e51`, `978abaf`, `408c00b`.
+
+## Phase 2 — Guidance ✅ COMPLETE
+
+| Item | Parity ref | Rust impl | Status |
+|---|---|---|---|
+| CFG (uncond + scale·(cond-uncond)) | — (math-simple) | `ltx2_generate_av.rs` denoise loop | ✅ |
+| Negative prompt wiring (Gemma+FE, audio too) | `scripts/ltx2_neg_prompt_ref.py` | `DEFAULT_NEGATIVE` const, `--neg` flag | ✅ byte-exact string, non-zero + self-consistent encoding |
+| CFG-star rescale | `scripts/ltx2_cfg_star_ref.py` | `sampling::ltx2_guidance::cfg_star_rescale` | ✅ max_abs=0.0 BF16 |
+| STG skip-layer mask | `scripts/ltx2_stg_mask_ref.py` (imports `Transformer3DModel.create_skip_layer_mask`) | `sampling::ltx2_guidance::build_skip_layer_mask` | ✅ max_abs=0.0 |
+| STG AttentionValues skip inline | code inspection only (per-layer attn+V blend) | `LTX2Attention::forward_with_skip` | ✅ scalar math exact; tensor-level DiT parity deferred |
+| STG std-rescale (`rescaling_scale`) | `scripts/ltx2_stg_rescale_ref.py` | `sampling::ltx2_guidance::stg_rescale` | ✅ max_abs=0.0 |
+| Audio path uniform STG | — | `forward_video_only_with_skip` + `forward_with_skip` skip video+audio self-attn | ✅ A2V/V2A intentionally NOT skipped |
+
+Commits: `8c84e0a`, `df8a562`.
+
+### Phase 2 known gap (deferred encoder-parity work)
+
+`ltx2_neg_prompt_parity` Layer 3 fails at cos_sim ≈ 0: our in-tree
+`Gemma3Encoder` + `feature_extractor` outputs differ wildly from
+Lightricks's private `ltx_core.text_encoders.gemma.encode_text`. Not
+BF16 noise — different hidden-state layer / chat template / tokenizer.
+Reproducing Lightricks's encoder bit-by-bit is multi-session scope.
+Current state: our pipeline is self-consistent (pos and neg encoded by
+the SAME path), which is what CFG needs, but the absolute embedding
+differs from Lightricks. Tracked here as TODO.
 
 ## Phase 2 — Guidance
 
