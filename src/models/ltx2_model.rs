@@ -4191,6 +4191,57 @@ impl LTX2StreamingModel {
         audio_encoder_attention_mask: Option<&Tensor>,
         skip_block_list: Option<&[usize]>,
     ) -> Result<(Tensor, Tensor)> {
+        self.forward_audio_video_inner(
+            x, audio_x, timestep, context, audio_context, frame_rate,
+            encoder_attention_mask, audio_encoder_attention_mask,
+            skip_block_list, /*video_conditioning_mask=*/ None,
+        )
+    }
+
+    /// Same as [`Self::forward_audio_video_with_stg`] but threads a per-video-token
+    /// conditioning mask through the timestep embedding — Lightricks's I2V /
+    /// multi-keyframe mechanism (pipeline_ltx_video.py:1222: forced timestep
+    /// of 0 at positions where `conditioning_mask > 1 - eps`).
+    ///
+    /// `video_conditioning_mask`: `[B, num_video_tokens]` in `[0, 1]`.
+    /// We zero the VIDEO timestep at conditioned positions via
+    /// `ts_expanded *= (1 - mask)`. Audio is NOT masked — audio is never
+    /// conditioned on visual reference frames in the Lightricks pipeline.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_audio_video_with_mask(
+        &mut self,
+        x: &Tensor,
+        audio_x: &Tensor,
+        timestep: &Tensor,
+        context: &Tensor,
+        audio_context: &Tensor,
+        frame_rate: f32,
+        encoder_attention_mask: Option<&Tensor>,
+        audio_encoder_attention_mask: Option<&Tensor>,
+        skip_block_list: Option<&[usize]>,
+        video_conditioning_mask: Option<&Tensor>,
+    ) -> Result<(Tensor, Tensor)> {
+        self.forward_audio_video_inner(
+            x, audio_x, timestep, context, audio_context, frame_rate,
+            encoder_attention_mask, audio_encoder_attention_mask,
+            skip_block_list, video_conditioning_mask,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_audio_video_inner(
+        &mut self,
+        x: &Tensor,
+        audio_x: &Tensor,
+        timestep: &Tensor,
+        context: &Tensor,
+        audio_context: &Tensor,
+        frame_rate: f32,
+        encoder_attention_mask: Option<&Tensor>,
+        audio_encoder_attention_mask: Option<&Tensor>,
+        skip_block_list: Option<&[usize]>,
+        video_conditioning_mask: Option<&Tensor>,
+    ) -> Result<(Tensor, Tensor)> {
         // Verify audio globals are loaded
         let audio_proj_in_w = self.audio_proj_in_weight.as_ref()
             .ok_or_else(|| flame_core::Error::InvalidInput("Audio globals not loaded".into()))?;
@@ -4305,6 +4356,29 @@ impl LTX2StreamingModel {
         // 5. Timestep embeddings
         let num_mod_params = self.time_embed.num_mod_params;
         let ts_expanded = timestep.unsqueeze(1)?.expand(&[batch_size, num_video_tokens])?;
+        // Multi-keyframe / I2V: zero the timestep at conditioned positions so
+        // the model sees sigma=0 there. Mirrors the single-forward path in
+        // `forward_video_only_inner` (this file, ~:3944) and Lightricks's
+        // pipeline_ltx_video.py:1222 `min(t, (1-cond_mask)*1000)` form.
+        let ts_expanded = if let Some(mask) = video_conditioning_mask {
+            let mdims = mask.shape().dims();
+            if mdims.len() != 2 || mdims[0] != batch_size || mdims[1] != num_video_tokens {
+                return Err(flame_core::Error::InvalidInput(format!(
+                    "video_conditioning_mask must be [B={batch_size}, num_video_tokens={num_video_tokens}], got {:?}",
+                    mdims
+                )));
+            }
+            let inv_mask = if mask.dtype() == ts_expanded.dtype() {
+                mask.mul_scalar(-1.0)?.add_scalar(1.0)?
+            } else {
+                mask.to_dtype(ts_expanded.dtype())?
+                    .mul_scalar(-1.0)?
+                    .add_scalar(1.0)?
+            };
+            ts_expanded.mul(&inv_mask)?
+        } else {
+            ts_expanded
+        };
         let ts_scaled = ts_expanded.mul_scalar(self.config.timestep_scale_multiplier as f32)?;
         let ts_flat = ts_scaled.reshape(&[batch_size * num_video_tokens])?;
         let (v_timestep, v_embedded) = self.time_embed.forward(&ts_flat)?;
