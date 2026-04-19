@@ -12,7 +12,7 @@ use flame_core::{global_cuda_device, DType, Tensor};
 use inference_flame::models::t5gemma2_encoder::{T5Gemma2Config, T5Gemma2Encoder};
 
 const BASE: &str = "/home/alex/.serenity/models/checkpoints/motif-video-2b";
-const PY_DUMP: &str = "/home/alex/serenity/output/t5_python_dump.safetensors";
+const PY_DUMP: &str = "/home/alex/EriDiffusion/inference-flame/output/t5_python_dump.safetensors";
 
 // Must EXACTLY match the IDs in scripts/t5_parity_dump.py.
 // 18 real tokens + 494 pads = 512 total (exercises sliding-window geometry).

@@ -34,7 +34,7 @@ use inference_flame::models::t5_encoder::T5Encoder;
 
 const T5_PATH: &str = "/home/alex/.serenity/models/text_encoders/t5xxl_fp16.safetensors";
 const T5_TOKENIZER: &str = "/home/alex/.serenity/models/text_encoders/t5xxl_fp16.tokenizer.json";
-const DEFAULT_OUTPUT: &str = "/home/alex/serenity/output/chroma_embeddings.safetensors";
+const DEFAULT_OUTPUT: &str = "/home/alex/EriDiffusion/inference-flame/output/chroma_embeddings.safetensors";
 
 const T5_SEQ_LEN: usize = 512;
 

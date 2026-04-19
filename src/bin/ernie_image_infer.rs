@@ -173,13 +173,23 @@ fn run() -> anyhow::Result<()> {
         let t = sigma_to_timestep(sigma);
         let t_tensor = Tensor::from_vec(vec![t], Shape::from_dims(&[1]), device.clone())?;
 
-        // Sequential CFG: run cond pass, then uncond pass — never both at once
+        // Sequential CFG: run cond pass, then uncond pass — never both at once.
+        // Without periodic pool release, per-forward transients (attention
+        // scores ~2–4 GB, rope tables, intermediates) accumulate and OOM by
+        // ~step 5. Same pattern as flux1_dit's between-block trim.
         let pred = if GUIDANCE > 1.0 {
             let pred_cond = model.forward(&latent, &t_tensor, &cond_trim, &cond_lens)?;
+            flame_core::cuda_alloc_pool::clear_pool_cache();
+            flame_core::device::trim_cuda_mempool(0);
             let pred_uncond = model.forward(&latent, &t_tensor, &uncond_trim, &uncond_trim_lens)?;
+            flame_core::cuda_alloc_pool::clear_pool_cache();
+            flame_core::device::trim_cuda_mempool(0);
             pred_uncond.add(&pred_cond.sub(&pred_uncond)?.mul_scalar(GUIDANCE)?)?
         } else {
-            model.forward(&latent, &t_tensor, &cond_trim, &cond_lens)?
+            let p = model.forward(&latent, &t_tensor, &cond_trim, &cond_lens)?;
+            flame_core::cuda_alloc_pool::clear_pool_cache();
+            flame_core::device::trim_cuda_mempool(0);
+            p
         };
         latent = ernie_euler_step(&latent, &pred, sigma, sigma_next)?;
 

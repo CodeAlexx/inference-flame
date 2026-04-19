@@ -33,7 +33,7 @@ const HEIGHT: usize = 1024;
 const NUM_STEPS: usize = 50;
 const GUIDANCE: f32 = 5.0;
 const SCHEDULER_SCALE: f32 = 3.0; // 3.0 for images, 10.0 for video
-const OUTPUT_PATH: &str = "/home/alex/serenity/output/kandinsky5_output.png";
+const OUTPUT_PATH: &str = "/home/alex/EriDiffusion/inference-flame/output/kandinsky5_output.png";
 
 fn main() -> anyhow::Result<()> {
     env_logger::init();

@@ -11,7 +11,7 @@ use inference_flame::models::t5gemma2_encoder::{T5Gemma2Config, T5Gemma2Encoder}
 const BASE_DIR: &str = "/home/alex/.serenity/models/checkpoints/motif-video-2b";
 const DEFAULT_TOKENIZER: &str =
     "/home/alex/.serenity/models/checkpoints/motif-video-2b/tokenizer/tokenizer.json";
-const DEFAULT_OUTPUT: &str = "/home/alex/serenity/output/motif_embeds.safetensors";
+const DEFAULT_OUTPUT: &str = "/home/alex/EriDiffusion/inference-flame/output/motif_embeds.safetensors";
 const MAX_SEQ_LEN: usize = 512;  // adjust based on T5Gemma2 defaults
 const PAD_ID: i32 = 0; // Gemma pad token
 

@@ -22,10 +22,10 @@ fn main() -> anyhow::Result<()> {
 
     let args: Vec<String> = std::env::args().collect();
     let embeds_path = args.get(1).cloned().unwrap_or_else(|| {
-        "/home/alex/serenity/output/hunyuan15_embeds.safetensors".to_string()
+        "/home/alex/EriDiffusion/inference-flame/output/hunyuan15_embeds.safetensors".to_string()
     });
     let out_latents = args.get(2).cloned().unwrap_or_else(|| {
-        "/home/alex/serenity/output/hunyuan15_latents.safetensors".to_string()
+        "/home/alex/EriDiffusion/inference-flame/output/hunyuan15_latents.safetensors".to_string()
     });
 
     let num_steps: usize = env_usize("HV_STEPS", 20);

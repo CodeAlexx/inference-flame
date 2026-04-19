@@ -91,7 +91,7 @@ fn main() -> anyhow::Result<()> {
     let device = global_cuda_device();
 
     let dump_path = std::env::args().nth(1).unwrap_or_else(||
-        "/home/alex/serenity/output/motif_block_dump.safetensors".into());
+        "/home/alex/EriDiffusion/inference-flame/output/motif_block_dump.safetensors".into());
 
     println!("=== Motif-Video Parity Test ===");
     println!("Dump: {}", dump_path);

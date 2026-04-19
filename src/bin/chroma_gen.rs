@@ -38,8 +38,8 @@ const DEFAULT_DIT_SHARDS: &[&str] = &[
 const DEFAULT_VAE: &str =
     "/home/alex/.cache/huggingface/hub/models--lodestones--Chroma1-HD/snapshots/0e0c60ece1e82b17cb7f77342d765ba5024c40c0/vae/diffusion_pytorch_model.safetensors";
 
-const DEFAULT_EMBEDDINGS: &str = "/home/alex/serenity/output/chroma_embeddings.safetensors";
-const DEFAULT_OUTPUT: &str = "/home/alex/serenity/output/chroma_rust.png";
+const DEFAULT_EMBEDDINGS: &str = "/home/alex/EriDiffusion/inference-flame/output/chroma_embeddings.safetensors";
+const DEFAULT_OUTPUT: &str = "/home/alex/EriDiffusion/inference-flame/output/chroma_rust.png";
 
 // FLUX VAE constants — Chroma uses the same VAE.
 const AE_IN_CHANNELS: usize = 16;
@@ -249,6 +249,18 @@ fn main() -> anyhow::Result<()> {
     let latent = unpack_latent(&x, height, width)?;
     drop(x);
     println!("  Unpacked latent: {:?}", latent.shape().dims());
+
+    // Save unpacked latent for cross-tool VAE bisection. Gated on
+    // CHROMA_SAVE_LATENT=1 so default runs don't write debug files.
+    if std::env::var("CHROMA_SAVE_LATENT").is_ok() {
+        use std::collections::HashMap;
+        use std::path::Path;
+        let mut m: HashMap<String, Tensor> = HashMap::new();
+        m.insert("latent".to_string(), latent.clone_result()?);
+        let p = Path::new("/home/alex/EriDiffusion/inference-flame/output/chroma_rust_latent.safetensors");
+        flame_core::serialization::save_file(&m, p)?;
+        println!("  saved latent -> {}", p.display());
+    }
 
     let vae = LdmVAEDecoder::from_safetensors(
         &vae_path,

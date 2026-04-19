@@ -41,9 +41,9 @@ fn main() -> anyhow::Result<()> {
 
     let args: Vec<String> = std::env::args().collect();
     let embeds_path = args.get(1).cloned()
-        .unwrap_or_else(|| "/home/alex/serenity/output/motif_embeds.safetensors".into());
+        .unwrap_or_else(|| "/home/alex/EriDiffusion/inference-flame/output/motif_embeds.safetensors".into());
     let out_path = args.get(2).cloned()
-        .unwrap_or_else(|| "/home/alex/serenity/output/motif_latents.safetensors".into());
+        .unwrap_or_else(|| "/home/alex/EriDiffusion/inference-flame/output/motif_latents.safetensors".into());
 
     let height: usize = env_usize("MOTIF_HEIGHT", DEFAULT_HEIGHT);
     let width: usize = env_usize("MOTIF_WIDTH", DEFAULT_WIDTH);
