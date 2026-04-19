@@ -44,24 +44,42 @@ FP8_MAX = 448.0  # e4m3fn max representable
 FP8_MAX_T = torch.tensor(FP8_MAX)
 
 # Name suffixes that should be FP8-quantized.
-# Matches the standard diffusers 2D Linear weight naming.
+# Covers two families of 2D Linear weight naming:
+#   (1) Diffusers-style (Qwen-Image, SD3, standard HF transformers)
+#   (2) FLUX-LDM-style (Klein 4B/9B, FLUX.1) — fused qkv, `double_blocks.*`,
+#       `single_blocks.*`, `.linear1/.linear2` in single stream, etc.
 FP8_SUFFIXES = (
-    # Attention
+    # --- Diffusers-style attention ---
     ".to_q.weight", ".to_k.weight", ".to_v.weight", ".to_out.0.weight",
     ".add_q_proj.weight", ".add_k_proj.weight", ".add_v_proj.weight",
     ".to_add_out.weight",
-    # MLPs
+    # --- Diffusers-style MLPs ---
     ".img_mlp.net.0.proj.weight", ".img_mlp.net.2.weight",
     ".txt_mlp.net.0.proj.weight", ".txt_mlp.net.2.weight",
-    # FLUX-style FFN
     ".ff.net.0.proj.weight", ".ff.net.2.weight",
-    # Modulation
+    # --- Diffusers-style modulation ---
     ".img_mod.1.weight", ".txt_mod.1.weight",
-    # Global Linears that are large enough to matter
+    # --- FLUX-LDM double-stream (Klein / FLUX.1) ---
+    ".img_attn.qkv.weight", ".img_attn.proj.weight",
+    ".txt_attn.qkv.weight", ".txt_attn.proj.weight",
+    ".img_mlp.0.weight", ".img_mlp.2.weight",
+    ".txt_mlp.0.weight", ".txt_mlp.2.weight",
+    ".img_mod.lin.weight", ".txt_mod.lin.weight",
+    # --- FLUX-LDM single-stream ---
+    ".linear1.weight", ".linear2.weight",
+    ".modulation.lin.weight",
+    # --- Global Linears that are large enough to matter ---
     "img_in.weight", "txt_in.weight",
+    "time_in.in_layer.weight", "time_in.out_layer.weight",
+    "vector_in.in_layer.weight", "vector_in.out_layer.weight",
+    "guidance_in.in_layer.weight", "guidance_in.out_layer.weight",
     "time_text_embed.timestep_embedder.linear_1.weight",
     "time_text_embed.timestep_embedder.linear_2.weight",
     "norm_out.linear.weight", "proj_out.weight",
+    # FLUX final layer
+    "final_layer.linear.weight",
+    "final_layer.adaLN_modulation.1.weight",
+    "single_stream_modulation.lin.weight",
 )
 
 
