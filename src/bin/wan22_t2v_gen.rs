@@ -27,6 +27,10 @@ use flame_core::{global_cuda_device, DType, Shape, Tensor};
 
 use inference_flame::models::wan22_dit::Wan22Dit;
 
+// Override with WAN22_HIGH_NOISE_PATH / WAN22_LOW_NOISE_PATH env vars. Pair with
+// `BLOCKOFF_FP8_PINNED=1` to keep the FP8-scaled variants as FP8 in pinned RAM
+// (halves host RAM, ~28 GB → ~14 GB per expert — the only way both fit on a
+// 62 GB machine).
 const HIGH_NOISE_PATH: &str = "/home/alex/.serenity/models/checkpoints/wan2.2_t2v_high_noise_14b_fp16.safetensors";
 const LOW_NOISE_PATH: &str = "/home/alex/.serenity/models/checkpoints/wan2.2_t2v_low_noise_14b_fp16.safetensors";
 
@@ -44,10 +48,10 @@ fn main() -> anyhow::Result<()> {
 
     let args: Vec<String> = std::env::args().collect();
     let embeds_path = args.get(1).cloned().unwrap_or_else(|| {
-        "/home/alex/serenity/output/wan22_embeds.safetensors".to_string()
+        "/home/alex/EriDiffusion/inference-flame/output/wan22_embeds.safetensors".to_string()
     });
     let out_latents = args.get(2).cloned().unwrap_or_else(|| {
-        "/home/alex/serenity/output/wan22_latents.safetensors".to_string()
+        "/home/alex/EriDiffusion/inference-flame/output/wan22_latents.safetensors".to_string()
     });
 
     // Knobs
@@ -172,10 +176,16 @@ fn main() -> anyhow::Result<()> {
         if first_is_high { "high_noise" } else { "low_noise" });
     let t0 = Instant::now();
     let mut current_is_high = first_is_high;
+    let high_path = std::env::var("WAN22_HIGH_NOISE_PATH")
+        .unwrap_or_else(|_| HIGH_NOISE_PATH.to_string());
+    let low_path = std::env::var("WAN22_LOW_NOISE_PATH")
+        .unwrap_or_else(|_| LOW_NOISE_PATH.to_string());
+    println!("  high: {high_path}");
+    println!("  low:  {low_path}");
     let mut dit = if first_is_high {
-        Wan22Dit::load(HIGH_NOISE_PATH, &device)?
+        Wan22Dit::load(&high_path, &device)?
     } else {
-        Wan22Dit::load(LOW_NOISE_PATH, &device)?
+        Wan22Dit::load(&low_path, &device)?
     };
     println!("  DiT loaded in {:.1}s", t0.elapsed().as_secs_f32());
     println!();
@@ -202,9 +212,9 @@ fn main() -> anyhow::Result<()> {
             drop(dit);
             let t_switch = Instant::now();
             dit = if need_high {
-                Wan22Dit::load(HIGH_NOISE_PATH, &device)?
+                Wan22Dit::load(&high_path, &device)?
             } else {
-                Wan22Dit::load(LOW_NOISE_PATH, &device)?
+                Wan22Dit::load(&low_path, &device)?
             };
             current_is_high = need_high;
             println!("  [SWITCH] Loaded in {:.1}s", t_switch.elapsed().as_secs_f32());
