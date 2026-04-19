@@ -7,11 +7,44 @@
 //! 4. Denoise jointly with forward_audio_video
 //! 5. Save video + audio latents → decode with Python VAE
 
+use inference_flame::models::lora_loader::LoraWeights;
 use inference_flame::models::ltx2_model::{LTX2Config, LTX2StreamingModel};
 use inference_flame::models::gemma3_encoder::Gemma3Encoder;
 use inference_flame::models::feature_extractor;
 use inference_flame::sampling::ltx2_sampling::LTX2_DISTILLED_SIGMAS;
 use flame_core::{global_cuda_device, DType, Shape, Tensor};
+
+/// Parse `--lora PATH[:STRENGTH]`. Default strength is 1.0.
+fn parse_lora_arg(raw: &str) -> anyhow::Result<(String, f32)> {
+    if let Some(idx) = raw.rfind(':') {
+        let (path, tail) = raw.split_at(idx);
+        let tail = &tail[1..];
+        if let Ok(s) = tail.parse::<f32>() {
+            return Ok((path.to_string(), s));
+        }
+    }
+    Ok((raw.to_string(), 1.0))
+}
+
+fn collect_lora_args() -> anyhow::Result<Vec<(String, f32)>> {
+    let mut out = Vec::new();
+    let args: Vec<String> = std::env::args().collect();
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "--lora" {
+            let val = args.get(i + 1).ok_or_else(||
+                anyhow::anyhow!("--lora requires a PATH[:STRENGTH] argument"))?;
+            out.push(parse_lora_arg(val)?);
+            i += 2;
+        } else if let Some(val) = args[i].strip_prefix("--lora=") {
+            out.push(parse_lora_arg(val)?);
+            i += 1;
+        } else {
+            i += 1;
+        }
+    }
+    Ok(out)
+}
 use std::collections::HashMap;
 use std::time::Instant;
 
@@ -165,12 +198,33 @@ fn main() -> anyhow::Result<()> {
     let mut model = LTX2StreamingModel::load_globals(MODEL_PATH, &config)?;
     println!("  Global params loaded in {:.1}s", t0.elapsed().as_secs_f32());
 
-    match model.load_fp8_resident() {
-        Ok(()) => println!("  FP8 resident loaded in {:.1}s", t0.elapsed().as_secs_f32()),
-        Err(e) => {
-            println!("  FP8 resident failed ({e}), falling back to BlockOffloader");
-            model.init_offloader()?;
-            println!("  BlockOffloader initialized in {:.1}s", t0.elapsed().as_secs_f32());
+    // Parse and attach any --lora flags BEFORE picking the forward path.
+    // LTX-2 LoRAs patch both video AND audio weights — the distilled
+    // LoRA ships 2134 audio keys (64% of deltas) — so we must stay on a
+    // path that fuses them.
+    let lora_specs = collect_lora_args()?;
+    for (p, s) in &lora_specs {
+        println!("  LoRA: {} @ strength={:.3}", p, s);
+    }
+    for (path, strength) in &lora_specs {
+        let lora = LoraWeights::load(path, *strength, &device)?;
+        model.add_lora(lora);
+    }
+
+    // When LoRAs are attached, force BlockOffloader — FP8-resident can't
+    // re-fuse deltas after dequant and would silently miss audio LoRAs.
+    if !lora_specs.is_empty() {
+        println!("  LoRA attached — skipping FP8 resident, using BlockOffloader");
+        model.init_offloader()?;
+        println!("  BlockOffloader initialized in {:.1}s", t0.elapsed().as_secs_f32());
+    } else {
+        match model.load_fp8_resident() {
+            Ok(()) => println!("  FP8 resident loaded in {:.1}s", t0.elapsed().as_secs_f32()),
+            Err(e) => {
+                println!("  FP8 resident failed ({e}), falling back to BlockOffloader");
+                model.init_offloader()?;
+                println!("  BlockOffloader initialized in {:.1}s", t0.elapsed().as_secs_f32());
+            }
         }
     }
     // Print VRAM after model load

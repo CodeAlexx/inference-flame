@@ -47,6 +47,8 @@ use flame_core::{DType, Result, Shape, Tensor};
 use std::collections::HashMap;
 use std::f64::consts::PI;
 
+use super::lora_loader::{fuse_loras, LoraWeights};
+
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
@@ -189,6 +191,35 @@ fn linear3d(x: &Tensor, weight: &Tensor, bias: Option<&Tensor>) -> Result<Tensor
 /// on each weight per block per step was burning ~6 seconds per block.
 fn pre_transpose_weight(w: &Tensor) -> Result<Tensor> {
     Ok(w.clone())
+}
+
+/// Free helper: fuse every `loras` delta into every matching `.weight` entry
+/// in `weights`. No-op when `loras` is empty. Silently skips keys no LoRA has.
+///
+/// Broken out as a free function so it can be called while `self.offloader`
+/// is mutably borrowed (the block-streaming loops hold `&mut offloader`
+/// across the whole iteration).
+fn apply_loras_to_weights(
+    loras: &[LoraWeights],
+    weights: &mut HashMap<String, Tensor>,
+) -> Result<()> {
+    if loras.is_empty() { return Ok(()); }
+    let loras_slice: Vec<&LoraWeights> = loras.iter().collect();
+
+    let keys: Vec<String> = weights.keys().cloned().collect();
+    let mut fused_count = 0usize;
+    for k in keys {
+        if !k.ends_with(".weight") { continue; }
+        // Cheap membership check avoids a GPU clone when no LoRA has this key.
+        let any_hit = loras.iter().any(|l| l.deltas.contains_key(&k));
+        if !any_hit { continue; }
+        let orig = weights.get(&k).unwrap();
+        let fused = fuse_loras(orig, &k, &loras_slice)?;
+        weights.insert(k, fused);
+        fused_count += 1;
+    }
+    log::debug!("[LTX2] LoRA block fusion: {} keys fused", fused_count);
+    Ok(())
 }
 
 /// Compute `x @ weight^T` for 2D tensors. Wraps `linear3d` (which routes
@@ -2567,6 +2598,16 @@ pub struct LTX2StreamingModel {
     pub f32_cache: Vec<HashMap<String, Tensor>>,
     /// FP8-resident blocks: all weights on GPU, dequant per-block during forward.
     fp8_blocks: Vec<super::fp8_resident::ResidentBlock>,
+
+    /// Stacked LoRAs to fuse into block/global weights.
+    ///
+    /// Each LoRA's `compute_delta(base_key)` returns the `strength * (B @ A)`
+    /// delta in PyTorch `[out, in]` layout — matching the model's native
+    /// weight layout (see `pre_transpose_weight`, which is a no-op: weights
+    /// stay `[Cout, Cin]` because the cuBLASLt matmul absorbs the transpose).
+    /// Block-level fusion happens inside the BlockOffloader/disk-sync paths;
+    /// global fusion happens at `add_lora` time.
+    pub loras: Vec<LoraWeights>,
 }
 
 /// Intermediate state from [`LTX2StreamingModel::prepare_av_state`].
@@ -2810,7 +2851,224 @@ impl LTX2StreamingModel {
             key_prefix: prefix,
             f32_cache: Vec::new(),
             fp8_blocks: Vec::new(),
+            loras: Vec::new(),
         })
+    }
+
+    /// Attach a LoRA. Must be called AFTER `load_globals` and BEFORE
+    /// `load_fp8_resident` / `init_offloader`.
+    ///
+    /// Globals (proj_in/out, adaln_single, etc.) are fused in-place here.
+    /// Per-block weights are fused lazily inside the BlockOffloader and
+    /// disk-sync load paths (`load_block_from_disk`, `load_block`).
+    ///
+    /// FP8-resident path is NOT supported; see `load_fp8_resident`.
+    ///
+    /// Stacking multiple LoRAs is correct because fusion is additive:
+    /// `w + delta_a + delta_b == fuse_loras(w, key, &[&a, &b])`.
+    pub fn add_lora(&mut self, lora: LoraWeights) {
+        log::info!(
+            "[LTX2] Attaching LoRA: {} keys, strength={:.2}, rank={:?}",
+            lora.len(), lora.strength, lora.rank(),
+        );
+        // Fuse into global weights with this LoRA only — the prior globals
+        // already include deltas from earlier-pushed LoRAs.
+        if let Err(e) = self.fuse_lora_into_globals(&lora) {
+            log::warn!("[LTX2] LoRA global fusion hit error: {:?}", e);
+        }
+        self.loras.push(lora);
+    }
+
+    /// Fuse a single LoRA's deltas into the already-loaded global tensors.
+    ///
+    /// Global tensors are stored post-load in the LTX2 struct (e.g.
+    /// `proj_in_weight`). We try each possible base-key naming
+    /// (ComfyUI vs diffusers) and only one will match per LoRA. The helper
+    /// `fuse_loras` returns the original tensor unchanged if no delta exists
+    /// for the key — silent no-op is intentional and cheap.
+    fn fuse_lora_into_globals(&mut self, lora: &LoraWeights) -> Result<()> {
+        let loras_slice: &[&LoraWeights] = &[lora];
+
+        // Helper: fuse single tensor trying multiple candidate base keys.
+        // Returns the (possibly) updated tensor.
+        let fuse_tensor = |w: &Tensor, keys: &[&str]| -> Result<Tensor> {
+            for k in keys {
+                let delta = lora.compute_delta(k)?;
+                if delta.is_some() {
+                    return fuse_loras(w, k, loras_slice);
+                }
+            }
+            Ok(w.clone())
+        };
+
+        // proj_in / patchify_proj (ComfyUI vs diffusers)
+        self.proj_in_weight = fuse_tensor(
+            &self.proj_in_weight,
+            &["patchify_proj.weight", "proj_in.weight"],
+        )?;
+        // proj_out
+        self.proj_out_weight = fuse_tensor(
+            &self.proj_out_weight,
+            &["proj_out.weight"],
+        )?;
+
+        // time_embed / adaln_single (diffusers vs ComfyUI)
+        self.time_embed.linear_weight = fuse_tensor(
+            &self.time_embed.linear_weight,
+            &["adaln_single.linear.weight", "time_embed.linear.weight"],
+        )?;
+        self.time_embed.emb.linear_1_weight = fuse_tensor(
+            &self.time_embed.emb.linear_1_weight,
+            &[
+                "adaln_single.emb.timestep_embedder.linear_1.weight",
+                "time_embed.emb.timestep_embedder.linear_1.weight",
+            ],
+        )?;
+        self.time_embed.emb.linear_2_weight = fuse_tensor(
+            &self.time_embed.emb.linear_2_weight,
+            &[
+                "adaln_single.emb.timestep_embedder.linear_2.weight",
+                "time_embed.emb.timestep_embedder.linear_2.weight",
+            ],
+        )?;
+
+        // prompt_adaln_single (ComfyUI cross-attn context modulation)
+        if let Some(mut adaln) = self.prompt_adaln_single.take() {
+            adaln.linear_weight = fuse_tensor(
+                &adaln.linear_weight,
+                &["prompt_adaln_single.linear.weight"],
+            )?;
+            adaln.emb.linear_1_weight = fuse_tensor(
+                &adaln.emb.linear_1_weight,
+                &["prompt_adaln_single.emb.timestep_embedder.linear_1.weight"],
+            )?;
+            adaln.emb.linear_2_weight = fuse_tensor(
+                &adaln.emb.linear_2_weight,
+                &["prompt_adaln_single.emb.timestep_embedder.linear_2.weight"],
+            )?;
+            self.prompt_adaln_single = Some(adaln);
+        }
+
+        // audio_prompt_adaln_single
+        if let Some(mut adaln) = self.audio_prompt_adaln_single.take() {
+            adaln.linear_weight = fuse_tensor(
+                &adaln.linear_weight,
+                &["audio_prompt_adaln_single.linear.weight"],
+            )?;
+            adaln.emb.linear_1_weight = fuse_tensor(
+                &adaln.emb.linear_1_weight,
+                &["audio_prompt_adaln_single.emb.timestep_embedder.linear_1.weight"],
+            )?;
+            adaln.emb.linear_2_weight = fuse_tensor(
+                &adaln.emb.linear_2_weight,
+                &["audio_prompt_adaln_single.emb.timestep_embedder.linear_2.weight"],
+            )?;
+            self.audio_prompt_adaln_single = Some(adaln);
+        }
+
+        // audio_proj_in / audio_patchify_proj
+        if let Some(w) = self.audio_proj_in_weight.as_ref() {
+            let fused = fuse_tensor(
+                w,
+                &["audio_patchify_proj.weight", "audio_proj_in.weight"],
+            )?;
+            self.audio_proj_in_weight = Some(fused);
+        }
+        // audio_proj_out
+        if let Some(w) = self.audio_proj_out_weight.as_ref() {
+            let fused = fuse_tensor(w, &["audio_proj_out.weight"])?;
+            self.audio_proj_out_weight = Some(fused);
+        }
+
+        // audio_time_embed / audio_adaln_single
+        if let Some(mut adaln) = self.audio_time_embed.take() {
+            adaln.linear_weight = fuse_tensor(
+                &adaln.linear_weight,
+                &["audio_adaln_single.linear.weight", "audio_time_embed.linear.weight"],
+            )?;
+            adaln.emb.linear_1_weight = fuse_tensor(
+                &adaln.emb.linear_1_weight,
+                &[
+                    "audio_adaln_single.emb.timestep_embedder.linear_1.weight",
+                    "audio_time_embed.emb.timestep_embedder.linear_1.weight",
+                ],
+            )?;
+            adaln.emb.linear_2_weight = fuse_tensor(
+                &adaln.emb.linear_2_weight,
+                &[
+                    "audio_adaln_single.emb.timestep_embedder.linear_2.weight",
+                    "audio_time_embed.emb.timestep_embedder.linear_2.weight",
+                ],
+            )?;
+            self.audio_time_embed = Some(adaln);
+        }
+
+        // AV cross-attention modulation adaln_singles — both naming conventions
+        let av_key_pairs: &[(&str, &[&str])] = &[
+            ("av_cross_attn_video_scale_shift",
+             &["av_cross_attn_video_scale_shift", "av_ca_video_scale_shift_adaln_single"]),
+            ("av_cross_attn_audio_scale_shift",
+             &["av_cross_attn_audio_scale_shift", "av_ca_audio_scale_shift_adaln_single"]),
+            ("av_cross_attn_video_a2v_gate",
+             &["av_cross_attn_video_a2v_gate", "av_ca_video_a2v_gate_adaln_single",
+               "av_ca_a2v_gate_adaln_single"]),
+            ("av_cross_attn_audio_v2a_gate",
+             &["av_cross_attn_audio_v2a_gate", "av_ca_audio_v2a_gate_adaln_single",
+               "av_ca_v2a_gate_adaln_single"]),
+        ];
+        for (field, prefixes) in av_key_pairs.iter() {
+            let take_and_put = |adaln: Option<AdaLayerNormSingle>| -> Result<Option<AdaLayerNormSingle>> {
+                let Some(mut adaln) = adaln else { return Ok(None); };
+                // Build candidate key lists on the fly.
+                let lin_keys: Vec<String> = prefixes.iter()
+                    .map(|p| format!("{p}.linear.weight")).collect();
+                let lin_refs: Vec<&str> = lin_keys.iter().map(|s| s.as_str()).collect();
+                adaln.linear_weight = fuse_tensor(&adaln.linear_weight, &lin_refs)?;
+
+                let e1_keys: Vec<String> = prefixes.iter()
+                    .map(|p| format!("{p}.emb.timestep_embedder.linear_1.weight")).collect();
+                let e1_refs: Vec<&str> = e1_keys.iter().map(|s| s.as_str()).collect();
+                adaln.emb.linear_1_weight = fuse_tensor(&adaln.emb.linear_1_weight, &e1_refs)?;
+
+                let e2_keys: Vec<String> = prefixes.iter()
+                    .map(|p| format!("{p}.emb.timestep_embedder.linear_2.weight")).collect();
+                let e2_refs: Vec<&str> = e2_keys.iter().map(|s| s.as_str()).collect();
+                adaln.emb.linear_2_weight = fuse_tensor(&adaln.emb.linear_2_weight, &e2_refs)?;
+
+                Ok(Some(adaln))
+            };
+
+            match *field {
+                "av_cross_attn_video_scale_shift" => {
+                    self.av_cross_attn_video_scale_shift =
+                        take_and_put(self.av_cross_attn_video_scale_shift.take())?;
+                }
+                "av_cross_attn_audio_scale_shift" => {
+                    self.av_cross_attn_audio_scale_shift =
+                        take_and_put(self.av_cross_attn_audio_scale_shift.take())?;
+                }
+                "av_cross_attn_video_a2v_gate" => {
+                    self.av_cross_attn_video_a2v_gate =
+                        take_and_put(self.av_cross_attn_video_a2v_gate.take())?;
+                }
+                "av_cross_attn_audio_v2a_gate" => {
+                    self.av_cross_attn_audio_v2a_gate =
+                        take_and_put(self.av_cross_attn_audio_v2a_gate.take())?;
+                }
+                _ => {}
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Fuse all attached LoRAs into a per-block weight HashMap in-place.
+    ///
+    /// Called by the BlockOffloader and disk-sync load paths. Keys in the map
+    /// are bare (prefix-stripped) — matching LoRA base-key format. A LoRA
+    /// that lacks a key silently skips it (via `compute_delta -> None`).
+    fn apply_loras_to_block_weights(&self, weights: &mut HashMap<String, Tensor>) -> Result<()> {
+        apply_loras_to_weights(&self.loras, weights)
     }
 
     /// Load F32 tensors (scale_shift_table etc.) for a block from disk.
@@ -2839,6 +3097,23 @@ impl LTX2StreamingModel {
     pub fn load_fp8_resident(&mut self) -> Result<()> {
         use super::fp8_resident::{RawWeight, ResidentBlock};
         use cudarc::driver::DevicePtr;
+
+        // LoRA + FP8-resident is not wired yet: the FP8 path stores raw bytes
+        // with a separate scale_map and dequantizes into persistent buffers,
+        // so fusing a BF16 delta into an FP8 byte buffer would require a
+        // per-step re-fusion after dequant. Not implemented — fall back to
+        // the BlockOffloader path.
+        if !self.loras.is_empty() {
+            return Err(flame_core::Error::InvalidInput(format!(
+                "LoRA + FP8-resident not supported: {} LoRA(s) attached. \
+                 Use the BlockOffloader path instead \
+                 (init_offloader()); in ltx2_generate, any --lora flag \
+                 already skips FP8-resident. If you're calling \
+                 load_fp8_resident() directly, drop the LoRAs first or \
+                 switch to init_offloader().",
+                self.loras.len()
+            )));
+        }
 
         let device = flame_core::global_cuda_device();
         let t0 = std::time::Instant::now();
@@ -3069,20 +3344,32 @@ impl LTX2StreamingModel {
     }
 
     /// Load raw block weight map from disk (slow path).
+    ///
+    /// When any LoRA is attached we skip the `!audio` filter — the
+    /// distilled LoRA ships 64% of its deltas on audio weights, and the
+    /// filter would silently drop them before `apply_loras_to_block_weights`
+    /// runs. In the no-LoRA video-only case the old fast path is kept
+    /// (smaller memory footprint during block load).
     fn load_block_from_disk(&self, block_idx: usize) -> Result<HashMap<String, Tensor>> {
         let device = flame_core::global_cuda_device();
         let key_prefix = detect_key_prefix(&self.checkpoint_path)?;
         let prefix = format!("{key_prefix}transformer_blocks.{block_idx}.");
+        let include_audio = !self.loras.is_empty();
         let raw_weights = flame_core::serialization::load_file_filtered(
             &self.checkpoint_path, &device,
-            |key| key.starts_with(&prefix) && !key.contains("audio"),
+            |key| key.starts_with(&prefix) && (include_audio || !key.contains("audio")),
         )?;
-        Ok(raw_weights.into_iter()
+        let mut block_weights: HashMap<String, Tensor> = raw_weights.into_iter()
             .map(|(k, v)| {
                 let stripped = k.strip_prefix(&key_prefix).unwrap_or(&k).to_string();
                 (stripped, v)
             })
-            .collect())
+            .collect();
+        // Fuse LoRA deltas into raw weights. Weights are in native PyTorch
+        // [Cout, Cin] layout (pre_transpose_weight is a no-op) — matches
+        // LoRA delta shape [out, in] directly.
+        self.apply_loras_to_block_weights(&mut block_weights)?;
+        Ok(block_weights)
     }
 
     /// Load a single block's video-only weights.
@@ -3623,8 +3910,12 @@ impl LTX2StreamingModel {
             }
         } else if self.offloader.is_some() {
             // Async path: BlockOffloader prefetch/await
-            let offloader = self.offloader.as_mut().unwrap();
-            let key_prefix = &self.key_prefix;
+            //
+            // Split borrows: `apply_loras_to_weights` reads `&self.loras`
+            // while we also hold `&mut self.offloader`. Destructuring via
+            // pattern match makes borrowck happy.
+            let LTX2StreamingModel { offloader, loras, f32_cache, key_prefix, .. } = self;
+            let offloader = offloader.as_mut().unwrap();
             log::info!("[LTX2] Block streaming via BlockOffloader ({} blocks)", num_layers);
 
             offloader.prefetch_block(0)
@@ -3643,7 +3934,7 @@ impl LTX2StreamingModel {
                 // Chroma/FLUX1/Qwen fixed).
                 let mut block_weights: HashMap<String, Tensor> = raw_weights.iter()
                     .map(|(k, v)| {
-                        let stripped = k.strip_prefix(key_prefix).unwrap_or(k).to_string();
+                        let stripped = k.strip_prefix(key_prefix.as_str()).unwrap_or(k).to_string();
                         let tensor = if stripped.ends_with(".weight") && v.shape().dims().len() == 2 {
                             v.transpose()?
                         } else {
@@ -3652,10 +3943,13 @@ impl LTX2StreamingModel {
                         Ok::<_, flame_core::Error>((stripped, tensor))
                     })
                     .collect::<Result<HashMap<_, _>>>()?;
+                // Fuse LoRA deltas. Post-transpose, weights are [Cout, Cin] —
+                // matches LoRA delta shape.
+                apply_loras_to_weights(loras, &mut block_weights)?;
                 // Merge F32 tensors from cache (scale_shift_table only — not
                 // a .weight key, so not affected by the transpose pass above)
-                let n_f32 = if i < self.f32_cache.len() {
-                    let cache = &self.f32_cache[i];
+                let n_f32 = if i < f32_cache.len() {
+                    let cache = &f32_cache[i];
                     for (k, v) in cache {
                         block_weights.insert(k.clone(), v.clone());
                     }
@@ -4074,9 +4368,10 @@ impl LTX2StreamingModel {
                 }
             }
         } else if self.offloader.is_some() {
-            // BlockOffloader path
-            let offloader = self.offloader.as_mut().unwrap();
-            let key_prefix = &self.key_prefix;
+            // BlockOffloader path — split borrows so `loras` is readable
+            // alongside the mutable `offloader` borrow.
+            let LTX2StreamingModel { offloader, loras, f32_cache, key_prefix, .. } = self;
+            let offloader = offloader.as_mut().unwrap();
             log::info!("[LTX2] AV BlockOffloader forward ({} blocks)", num_layers);
 
             offloader.prefetch_block(0)
@@ -4097,7 +4392,7 @@ impl LTX2StreamingModel {
                 // parallel block in forward_video at line 3583 for rationale).
                 let mut block_weights: HashMap<String, Tensor> = raw_weights.iter()
                     .map(|(k, v)| {
-                        let stripped = k.strip_prefix(key_prefix).unwrap_or(k).to_string();
+                        let stripped = k.strip_prefix(key_prefix.as_str()).unwrap_or(k).to_string();
                         let tensor = if stripped.ends_with(".weight") && v.shape().dims().len() == 2 {
                             v.transpose()?
                         } else {
@@ -4106,9 +4401,11 @@ impl LTX2StreamingModel {
                         Ok::<_, flame_core::Error>((stripped, tensor))
                     })
                     .collect::<Result<HashMap<_, _>>>()?;
+                // Fuse LoRA deltas into AV block weights.
+                apply_loras_to_weights(loras, &mut block_weights)?;
                 // Merge F32 tensors from cache
-                if i < self.f32_cache.len() {
-                    for (k, v) in &self.f32_cache[i] {
+                if i < f32_cache.len() {
+                    for (k, v) in &f32_cache[i] {
                         block_weights.insert(k.clone(), v.clone());
                     }
                 }

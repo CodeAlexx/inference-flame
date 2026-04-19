@@ -16,9 +16,55 @@ pub const LTX2_STAGE2_DISTILLED_SIGMAS: [f32; 4] = [
     0.909375, 0.725, 0.421875, 0.0,
 ];
 
-/// Build token-dependent sigma schedule for dev model (25 steps).
+/// LinearQuadratic sigma schedule — direct port of Lightricks's
+/// `linear_quadratic_schedule` in `ltx_video/schedulers/rf.py`. This is
+/// the schedule all 0.9.8-dev yamls specify (`sampler: LinearQuadratic,
+/// threshold_noise: 0.025`) and the one every dev-mode LTX-2 gen by
+/// Lightricks actually runs. Parity-verified by `bin/ltx2_sigma_parity`
+/// against their imported Python function.
 ///
-/// Shifts sigmas based on latent token count using Flux-style exponential shift.
+/// Returns exactly `num_steps` values descending from 1.0 toward a value
+/// close to `1.0 - threshold_noise`. Lightricks's original fn appends a
+/// trailing `1.0` then reverses via `1.0 - x` then drops the last element
+/// (`sigma_schedule[:-1]`); this port does the same and ends up with the
+/// same `num_steps`-length list. The caller is responsible for appending
+/// a trailing 0.0 if the downstream Euler step expects a terminator.
+pub fn linear_quadratic_schedule(num_steps: usize, threshold_noise: f32) -> Vec<f32> {
+    if num_steps == 1 {
+        return vec![1.0];
+    }
+    let linear_steps = num_steps / 2;
+    let quadratic_steps = num_steps - linear_steps;
+
+    let slope = threshold_noise / linear_steps as f32;
+    let threshold_noise_step_diff = linear_steps as f32 - threshold_noise * num_steps as f32;
+    let quadratic_coef =
+        threshold_noise_step_diff / (linear_steps as f32 * (quadratic_steps as f32).powi(2));
+    let linear_coef = threshold_noise / linear_steps as f32
+        - 2.0 * threshold_noise_step_diff / (quadratic_steps as f32).powi(2);
+    let const_coef = quadratic_coef * (linear_steps as f32).powi(2);
+
+    // Build `linear + quadratic + [1.0]` then reverse via `1.0 - x` then
+    // drop the last element — mirrors Lightricks's Python exactly.
+    let mut ascending: Vec<f32> = Vec::with_capacity(num_steps + 1);
+    for i in 0..linear_steps {
+        ascending.push(slope * i as f32);
+    }
+    for i in linear_steps..num_steps {
+        let fi = i as f32;
+        ascending.push(quadratic_coef * fi * fi + linear_coef * fi + const_coef);
+    }
+    ascending.push(1.0);
+
+    let mut descending: Vec<f32> = ascending.into_iter().map(|x| 1.0 - x).collect();
+    descending.pop(); // drop the trailing 0 (matches `sigma_schedule[:-1]`)
+    descending
+}
+
+/// Build token-dependent sigma schedule — **Flux-style exponential shift**,
+/// not what Lightricks uses. Kept for experiments and other models;
+/// NOT on the LTX-2 dev reference path. Use `linear_quadratic_schedule`
+/// to match Lightricks's LTX-Video pipeline.
 pub fn build_dev_sigma_schedule(
     num_steps: usize,
     num_latent_tokens: usize,

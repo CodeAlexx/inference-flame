@@ -6,7 +6,11 @@
 //! 3. Create noise + sigma schedule (dev model)
 //! 4. Denoise with CFG: two forward passes per step (uncond + cond)
 //! 5. Save denoised latents → decode with Python VAE
+//!
+//! LoRA: pass `--lora PATH[:STRENGTH]` one or more times. Example:
+//!   ltx2_generate --lora /path/to/distilled.safetensors:0.9
 
+use inference_flame::models::lora_loader::LoraWeights;
 use inference_flame::models::ltx2_model::{LTX2Config, LTX2StreamingModel};
 use inference_flame::sampling::ltx2_sampling::{build_dev_sigma_schedule, LTX2_DISTILLED_SIGMAS};
 use flame_core::{global_cuda_device, DType, Shape, Tensor};
@@ -29,6 +33,43 @@ const LATENT_CHANNELS: usize = 128;
 const GUIDANCE_SCALE: f32 = 1.0; // Distilled: no CFG needed
 const NUM_STEPS: usize = 8;     // Distilled fixed steps
 
+/// Parse a single `--lora` value of the form `PATH[:STRENGTH]`.
+/// Default strength is 1.0 when omitted. Supports paths with no colon
+/// (e.g. `/foo/bar.safetensors`) as well as `path:0.75`.
+fn parse_lora_arg(raw: &str) -> anyhow::Result<(String, f32)> {
+    // Find the LAST ':' so paths that happen to contain ':' (rare on Linux)
+    // still work when the user supplied a strength.
+    if let Some(idx) = raw.rfind(':') {
+        let (path, tail) = raw.split_at(idx);
+        let tail = &tail[1..]; // skip ':'
+        if let Ok(s) = tail.parse::<f32>() {
+            return Ok((path.to_string(), s));
+        }
+    }
+    Ok((raw.to_string(), 1.0))
+}
+
+/// Collect all `--lora PATH[:STRENGTH]` pairs from `std::env::args`.
+fn collect_lora_args() -> anyhow::Result<Vec<(String, f32)>> {
+    let mut out = Vec::new();
+    let args: Vec<String> = std::env::args().collect();
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "--lora" {
+            let val = args.get(i + 1).ok_or_else(||
+                anyhow::anyhow!("--lora requires a PATH[:STRENGTH] argument"))?;
+            out.push(parse_lora_arg(val)?);
+            i += 2;
+        } else if let Some(val) = args[i].strip_prefix("--lora=") {
+            out.push(parse_lora_arg(val)?);
+            i += 1;
+        } else {
+            i += 1;
+        }
+    }
+    Ok(out)
+}
+
 fn main() -> anyhow::Result<()> {
     env_logger::init();
     let t_total = Instant::now();
@@ -39,6 +80,13 @@ fn main() -> anyhow::Result<()> {
     println!("  {}×{}, {} frames, {} steps, cfg={}", WIDTH, HEIGHT, NUM_FRAMES, NUM_STEPS, GUIDANCE_SCALE);
 
     let device = global_cuda_device();
+
+    // Parse LoRA args before building the model so we can force the
+    // BlockOffloader path when any are present.
+    let lora_specs = collect_lora_args()?;
+    for (p, s) in &lora_specs {
+        println!("  LoRA: {} @ strength={:.3}", p, s);
+    }
 
     let latent_f = ((NUM_FRAMES - 1) / 8) + 1;
     let latent_h = HEIGHT / 32;
@@ -69,13 +117,28 @@ fn main() -> anyhow::Result<()> {
     let config = LTX2Config::default();
     let mut model = LTX2StreamingModel::load_globals(MODEL_PATH, &config)?;
     println!("  Global params loaded in {:.1}s", t0.elapsed().as_secs_f32());
-    // Try FP8 resident first (fast, no I/O), fall back to BlockOffloader
-    match model.load_fp8_resident() {
-        Ok(()) => println!("  FP8 resident loaded in {:.1}s", t0.elapsed().as_secs_f32()),
-        Err(e) => {
-            println!("  FP8 resident failed ({e}), falling back to BlockOffloader");
-            model.init_offloader()?;
-            println!("  BlockOffloader initialized in {:.1}s", t0.elapsed().as_secs_f32());
+
+    // Attach LoRAs (fuses into globals now). Must happen BEFORE
+    // load_fp8_resident / init_offloader.
+    for (path, strength) in &lora_specs {
+        let lora = LoraWeights::load(path, *strength, &device)?;
+        model.add_lora(lora);
+    }
+
+    // When any LoRA is attached, go straight to BlockOffloader — FP8-resident
+    // can't re-fuse deltas after dequant. Otherwise, try FP8 resident first.
+    if !lora_specs.is_empty() {
+        println!("  LoRA attached — skipping FP8 resident, using BlockOffloader");
+        model.init_offloader()?;
+        println!("  BlockOffloader initialized in {:.1}s", t0.elapsed().as_secs_f32());
+    } else {
+        match model.load_fp8_resident() {
+            Ok(()) => println!("  FP8 resident loaded in {:.1}s", t0.elapsed().as_secs_f32()),
+            Err(e) => {
+                println!("  FP8 resident failed ({e}), falling back to BlockOffloader");
+                model.init_offloader()?;
+                println!("  BlockOffloader initialized in {:.1}s", t0.elapsed().as_secs_f32());
+            }
         }
     }
 
