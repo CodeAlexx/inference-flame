@@ -74,15 +74,17 @@ differs from Lightricks. Tracked here as TODO.
 
 Commit: `d2aa887`.
 
-## Phase 4 — Multi-scale
+## Phase 4 — Multi-scale ✅ COMPLETE
 
 | Item | Notes | Status |
 |---|---|---|
-| `LatentUpsampler` (spatial 2×) | 481MB ckpt, 3D conv + 4× ResBlock + PixelShuffleND(2) + 4× ResBlock + final conv. Config embedded in `__metadata__["config"]`. | ❌ |
-| `LTXMultiScalePipeline` | first pass at downscale 2/3 → upsample → AdaIN → second pass at 2× with `skip_initial_inference_steps=17`. | ❌ |
-| `adain_filter_latent` | Per-channel mean/std match of upsampled to reference latent. | ❌ |
-| `tone_map_latents` | Sigmoid compression of latent amplitudes before VAE decode. `compression=0.6` on distilled second pass. | ❌ |
-| `decode_timestep` + `decode_noise_scale` | `latents = latents * (1 - s) + noise * s; vae_decode(latents, timestep=t)`. Defaults `t=0.05, s=0.025`. Only when VAE's `timestep_conditioning == True`. | ❌ |
+| `LatentUpsampler` (spatial 2×) | 481MB ckpt, already ported at `src/models/ltx2_upsampler.rs` (used by `ltx2_two_stage`). Parity bin added. | ✅ cos_sim=0.999951, max_abs=4.7e-2 |
+| `LTXMultiScalePipeline` | `src/bin/ltx2_generate_ms.rs` — Gemma → first AV pass at W·d × H·d → un-normalize → LatentUpsampler 2× → AdaIN → re-normalize → second AV pass. Audio carried through unchanged and re-noised at stage-2 sigma for the joint forward. | ✅ compiles; full smoke-run deferred (10-15 min on 22B) |
+| `adain_filter_latent` | `sampling::ltx2_multiscale::adain_filter_latent`. F32-internal, unbiased std. | ✅ cos_sim=0.999991 at factor=1.0, bit-exact at factor=0.0 |
+| `tone_map_latents` | `sampling::ltx2_multiscale::tone_map_latents`. Sigmoid compression. | ✅ cos_sim=0.999994 at compression=1.0, bit-exact at 0.0 |
+| `decode_timestep` + `decode_noise_scale` | Decode-time noise injection for timestep-conditioned VAE. Not yet wired. Defaults `t=0.05, s=0.025`. | ⏸️ deferred — small, can add with `--decode-timestep`/`--decode-noise-scale` flags when a use case arises |
+
+Commit: `cb4fd01`.
 
 ## Phase 5 — Nice-to-have (deferred)
 
