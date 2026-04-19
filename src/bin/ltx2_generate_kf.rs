@@ -43,8 +43,19 @@ use inference_flame::vae::LTX2VaeEncoder;
 use std::collections::HashMap;
 use std::time::Instant;
 
-// -- Model paths, matching ltx2_generate_av.rs ------------------------------
+// -- Model paths ------------------------------------------------------------
+// BF16 distilled (NOT the FP8 file). BlockOffloader streams BF16 directly;
+// the FP8 file needs scale-aware dequant (tensorrt_llm) which we don't have,
+// and streaming FP8 through BlockOffloader without proper dequant produces
+// dim/gray output (documented in `ltx2_two_stage.rs` header). FP8-resident
+// on-GPU also OOMs the 24 GB card at AV forward intermediate sizes.
 const MODEL_PATH: &str =
+    "/home/alex/.serenity/models/checkpoints/ltx-2.3-22b-distilled.safetensors";
+// FP8-scaled-mm variant: same model weights pre-cast to F8_E4M3 with
+// per-tensor `weight_scale` sidecars. Used when `--fp8-stream` is set —
+// halves pinned-RAM vs BF16 streaming (~20.5 GB vs ~37 GB) with a ~2.2%
+// relative error per weight (cos_sim ≈ 0.9996 vs BF16 reference).
+const MODEL_PATH_FP8: &str =
     "/home/alex/.serenity/models/checkpoints/ltx-2.3-22b-distilled-fp8.safetensors";
 const LTX_CHECKPOINT: &str =
     "/home/alex/.serenity/models/checkpoints/ltx-2.3-22b-dev.safetensors";
@@ -322,6 +333,7 @@ fn main() -> anyhow::Result<()> {
         get_arg("--cond-noise-scale").unwrap_or(DEFAULT_COND_NOISE_SCALE);
     let neg_text =
         collect_str_arg("--neg").unwrap_or_else(|| DEFAULT_NEGATIVE.to_string());
+    let fp8_stream = has_flag("--fp8-stream");
 
     let do_cfg = cfg_scale > 1.0;
     let do_stg = stg_scale > 0.0 && !stg_blocks.is_empty();
@@ -526,7 +538,17 @@ fn main() -> anyhow::Result<()> {
         let lora = LoraWeights::load(p, *s, &device)?;
         model.add_lora(lora);
     }
-    if !lora_specs.is_empty() {
+    if fp8_stream {
+        // FP8-scaled-mm streaming: reads pre-cast FP8 bytes from disk, pins
+        // them (1 byte/elem), and GPU-dequants to BF16 per block using the
+        // sidecar `weight_scale` F32 scalars in the checkpoint metadata.
+        model.init_offloader_fp8_stream(MODEL_PATH_FP8)?;
+        println!(
+            "  FP8-stream BlockOffloader initialized in {:.1}s ({})",
+            t0.elapsed().as_secs_f32(),
+            MODEL_PATH_FP8,
+        );
+    } else if !lora_specs.is_empty() {
         model.init_offloader()?;
         println!(
             "  BlockOffloader initialized (LoRA path) in {:.1}s",

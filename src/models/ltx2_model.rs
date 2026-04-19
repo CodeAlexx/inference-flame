@@ -3402,6 +3402,14 @@ impl LTX2StreamingModel {
                 let stripped = name.strip_prefix(&self.prefix).unwrap_or(name);
                 if !stripped.starts_with("transformer_blocks.") { return None; }
                 if stripped.contains("scale_shift_table") { return None; }
+                // FP8-scaled-mm sidecar F32 scalars: `{name}.weight_scale` and
+                // `{name}.input_scale`. The BlockOffloader's FP8-pinned branch
+                // looks up `weight_scale` via metadata; neither sidecar carries
+                // weights themselves, so filter them out here. This keeps the
+                // block_weights HashMap clean regardless of load mode.
+                if stripped.ends_with(".weight_scale") || stripped.ends_with(".input_scale") {
+                    return None;
+                }
                 let rest = stripped.strip_prefix("transformer_blocks.")?;
                 rest.split('.').next()?.parse().ok()
             }
@@ -3431,6 +3439,99 @@ impl LTX2StreamingModel {
                     let s = k.strip_prefix(&prefix).unwrap_or(&k).to_string();
                     (s, v)
                 })
+                .collect();
+            f32_cache.push(stripped);
+        }
+        log::info!("[LTX2] F32 cache: {} blocks, {:.1}s total init",
+            f32_cache.len(), t0.elapsed().as_secs_f32());
+
+        self.offloader = Some(offloader);
+        self.f32_cache = f32_cache;
+        Ok(())
+    }
+
+    /// Like `init_offloader` but streams from an FP8-on-disk checkpoint,
+    /// keeping raw FP8 bytes pinned on host and doing per-block GPU dequant
+    /// to BF16 inside `BlockOffloader::prepare_weights`.
+    ///
+    /// Used for the LTX-2.3 22B distilled-fp8 safetensors (the `fp8_scaled_mm`
+    /// export format). Each FP8 linear weight has a scalar `{name}_scale` F32
+    /// sidecar in the safetensors metadata, threaded into the GPU kernel so the
+    /// reconstructed BF16 tensor matches `fp8_to_f32(byte) * weight_scale`.
+    /// Activation quantization (`input_scale`) is NOT applied — activations
+    /// remain BF16 throughout. Output matches the BF16 reference within FP8
+    /// mantissa-precision (cos_sim ≈ 0.9996 per-tensor, ~2.2% relative error).
+    ///
+    /// `fp8_checkpoint_path` must carry the same keys (prefix + transformer
+    /// block structure) as `self.checkpoint_path`. Globals must already be
+    /// loaded via `load_globals(original_path, ...)` (they are not re-read).
+    /// The `f32_cache` for scale_shift_table tensors IS re-loaded from the
+    /// FP8 file (these tensors are bit-identical across BF16 and FP8 files
+    /// so either source works, but pulling from the FP8 file keeps the I/O
+    /// in one place).
+    pub fn init_offloader_fp8_stream(&mut self, fp8_checkpoint_path: &str) -> Result<()> {
+        let device = flame_core::global_cuda_device();
+        let t0 = std::time::Instant::now();
+
+        // Detect prefix for the FP8 file (should match the BF16 prefix but
+        // verify — catches "user pointed at a file with a different namespace").
+        let prefix = detect_key_prefix(fp8_checkpoint_path)?;
+        if prefix != self.key_prefix {
+            return Err(flame_core::Error::InvalidInput(format!(
+                "FP8 checkpoint prefix '{}' does not match model's key_prefix '{}' \
+                 (loaded from {}). Both files must use the same naming convention.",
+                prefix, self.key_prefix, self.checkpoint_path,
+            )));
+        }
+        let num_layers = self.config.num_layers;
+        log::info!(
+            "[LTX2] Initializing FP8-stream BlockOffloader from {} ({} blocks, prefix='{}')",
+            fp8_checkpoint_path, num_layers, prefix,
+        );
+
+        struct Ltx2Facilitator {
+            prefix: String,
+            num_layers: usize,
+        }
+        impl flame_diffusion::block_offload::BlockFacilitator for Ltx2Facilitator {
+            fn block_count(&self) -> usize { self.num_layers }
+            fn classify_key(&self, name: &str) -> Option<usize> {
+                let stripped = name.strip_prefix(&self.prefix).unwrap_or(name);
+                if !stripped.starts_with("transformer_blocks.") { return None; }
+                if stripped.contains("scale_shift_table") { return None; }
+                if stripped.ends_with(".weight_scale") || stripped.ends_with(".input_scale") {
+                    return None;
+                }
+                let rest = stripped.strip_prefix("transformer_blocks.")?;
+                rest.split('.').next()?.parse().ok()
+            }
+        }
+        let facilitator = Ltx2Facilitator { prefix: prefix.clone(), num_layers };
+
+        let offloader = flame_diffusion::BlockOffloader::load_fp8_stream(
+            &[fp8_checkpoint_path],
+            &facilitator,
+            device.clone(),
+        ).map_err(|e| flame_core::Error::Io(format!("FP8-stream BlockOffloader load: {e}")))?;
+
+        log::info!(
+            "[LTX2] FP8-stream BlockOffloader ready: {} blocks, ~{:.2}GB pinned (raw FP8 bytes + BF16 bias/norm), {:.1}s",
+            offloader.block_count(),
+            offloader.pinned_bytes() as f64 / 1e9,
+            t0.elapsed().as_secs_f32(),
+        );
+
+        // F32 scale_shift_table cache — pulled from the FP8 file.
+        log::info!("[LTX2] Caching F32 block tensors from FP8 checkpoint...");
+        let mut f32_cache = Vec::with_capacity(num_layers);
+        for i in 0..num_layers {
+            let pfx = format!("{prefix}transformer_blocks.{i}.");
+            let f32_tensors = flame_core::serialization::load_file_filtered(
+                fp8_checkpoint_path, &device,
+                |key| key.starts_with(&pfx) && key.contains("scale_shift_table"),
+            )?;
+            let stripped: HashMap<String, Tensor> = f32_tensors.into_iter()
+                .map(|(k, v)| (k.strip_prefix(&prefix).unwrap_or(&k).to_string(), v))
                 .collect();
             f32_cache.push(stripped);
         }

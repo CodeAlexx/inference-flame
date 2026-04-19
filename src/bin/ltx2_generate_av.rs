@@ -144,6 +144,7 @@ fn main() -> anyhow::Result<()> {
     let cfg_star = has_flag("--cfg-star-rescale");
     let stg_blocks = parse_stg_blocks();
     let neg_text = collect_neg_text().unwrap_or_else(|| DEFAULT_NEGATIVE.to_string());
+    let fp8_stream = has_flag("--fp8-stream");
 
     let do_cfg = cfg_scale > 1.0;
     let do_stg = stg_scale > 0.0 && !stg_blocks.is_empty();
@@ -340,7 +341,18 @@ fn main() -> anyhow::Result<()> {
 
     // When LoRAs are attached, force BlockOffloader — FP8-resident can't
     // re-fuse deltas after dequant and would silently miss audio LoRAs.
-    if !lora_specs.is_empty() {
+    if fp8_stream {
+        // FP8-scaled-mm streaming: keeps raw FP8 bytes pinned on host, GPU
+        // dequants to BF16 per block with sidecar `weight_scale` scalars.
+        // ~20.5 GB pinned vs ~37 GB for BF16 streaming; fits on a 24 GB card
+        // without OOM at 480×288 and higher resolutions. LoRA deltas are
+        // fused BF16-post-dequant so audio LoRAs are preserved.
+        model.init_offloader_fp8_stream(MODEL_PATH)?;
+        println!(
+            "  FP8-stream BlockOffloader initialized in {:.1}s",
+            t0.elapsed().as_secs_f32()
+        );
+    } else if !lora_specs.is_empty() {
         println!("  LoRA attached — skipping FP8 resident, using BlockOffloader");
         model.init_offloader()?;
         println!("  BlockOffloader initialized in {:.1}s", t0.elapsed().as_secs_f32());
