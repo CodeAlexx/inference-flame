@@ -917,12 +917,9 @@ impl WuerstchenUNet {
         let x_dims = x.shape().dims().to_vec();
         let (h, w) = (x_dims[2], x_dims[3]);
 
-        // 4. effnet_mapper (Stage B only).
-        // NOTE: diffusers interpolates the effnet/pixels conditioning with bilinear.
-        // flame-core currently only has a nearest-neighbour GPU kernel. Using nearest
-        // introduces small quality loss but keeps us fully on the GPU.
+        // 4. effnet_mapper (Stage B only). Diffusers uses bilinear here.
         if let (Some(em), Some(effnet)) = (self.effnet_mapper.as_ref(), effnet_cond) {
-            let cfg = Upsample2dConfig::new(UpsampleMode::Nearest).with_size((h, w));
+            let cfg = Upsample2dConfig::new(UpsampleMode::Bilinear).with_size((h, w));
             let up = Upsample2d::new(cfg).forward(effnet)?;
             let mapped = em.forward(&up)?;
             x = x.add(&mapped)?;
@@ -936,7 +933,7 @@ impl WuerstchenUNet {
                 device.clone(),
             )?;
             let mapped = pm.forward(&pix)?;
-            let cfg = Upsample2dConfig::new(UpsampleMode::Nearest).with_size((h, w));
+            let cfg = Upsample2dConfig::new(UpsampleMode::Bilinear).with_size((h, w));
             let up = Upsample2d::new(cfg).forward(&mapped)?;
             x = x.add(&up)?;
         }
@@ -1047,11 +1044,11 @@ fn apply_downscaler(ds: &Downscaler, x: &Tensor, level: usize) -> Result<Tensor>
             // UpDownBlock2d(mode="down") order is [conv1x1, interp] — conv FIRST.
             let y = conv.forward(&xn)?;
             if *do_interp {
-                // Bilinear 0.5 interp; flame-core has only nearest at present.
+                // UpDownBlock2d-down: bilinear 0.5.
                 let dims = y.shape().dims().to_vec();
                 let new_h = dims[2] / 2;
                 let new_w = dims[3] / 2;
-                let cfg = Upsample2dConfig::new(UpsampleMode::Nearest).with_size((new_h, new_w));
+                let cfg = Upsample2dConfig::new(UpsampleMode::Bilinear).with_size((new_h, new_w));
                 Upsample2d::new(cfg).forward(&y)
             } else {
                 Ok(y)
@@ -1083,7 +1080,7 @@ fn apply_upscaler(us: &Upscaler, x: &Tensor, _device: &Arc<CudaDevice>) -> Resul
                 let dims = xn.shape().dims().to_vec();
                 let new_h = dims[2] * 2;
                 let new_w = dims[3] * 2;
-                let cfg = Upsample2dConfig::new(UpsampleMode::Nearest).with_size((new_h, new_w));
+                let cfg = Upsample2dConfig::new(UpsampleMode::Bilinear).with_size((new_h, new_w));
                 Upsample2d::new(cfg).forward(&xn)?
             } else {
                 xn

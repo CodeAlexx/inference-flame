@@ -792,28 +792,12 @@ impl SDCascadeAttnBlock {
             .reshape(&[b, sk, self.n_heads, self.head_dim])?
             .permute(&[0, 2, 1, 3])?;
 
-        // Scaled dot-product attention.
-        //
-        // FLAME-CORE WORKAROUND: the in-tree FA2 WMMA flash kernel
-        // (`forward_flash_bf16`) under-scales its output by ~32% whenever
-        // `Sk > BKV=64` tile size — the online-softmax denominator fails
-        // to accumulate correctly across K tiles. Verified by the failing
-        // `flame-core/tests/sdpa_ragged_sk.rs` repro test.
-        //
-        // Cascade routinely violates this (CLIP seq=77, self+cross Sk =
-        // HW + Sk_cond typically > 64), so for ANY Sk > 64 we force the
-        // materialized FP32 path via `sdpa_with_bias(bias=None, scale=None)`.
-        // `forward_with_bias` always runs FP32 scores + FP32 softmax +
-        // cast back to input dtype, and never touches FA2. For Sk ≤ 64
-        // the FA2 path is healthy and we take it.
-        //
-        // When the flame-core kernel bug is fixed (see FIXME in
-        // `src/cuda/flash_attention_fwd.cu`), this guard can be removed.
-        let attn_out = if sk > 64 {
-            flame_core::attention::sdpa_with_bias(&q, &k, &v, None, None)?
-        } else {
-            flame_core::attention::sdpa(&q, &k, &v, None)?
-        }; // [B, n_heads, Sq, head_dim]
+        // Scaled dot-product attention. FA2 multi-tile softmax bug was
+        // fixed in `flame_core::flash_attention_fwd.cu` on 2026-04-19 (see
+        // `flame-core/tests/sdpa_ragged_sk.rs`), so we can take the fast
+        // path unconditionally.
+        let attn_out = flame_core::attention::sdpa(&q, &k, &v, None)?;
+        // [B, n_heads, Sq, head_dim]
 
         // Merge heads: [B, n_heads, Sq, head_dim] -> [B, Sq, n_heads*head_dim = C]
         let merged = attn_out
@@ -1073,25 +1057,10 @@ mod tests {
 
     /// Parity test for `SDCascadeAttnBlock`.
     ///
-    /// ## Flash-attn kernel workaround
-    ///
-    /// `flame-core/tests/sdpa_ragged_sk.rs` confirms a kernel bug in
-    /// `flame_core::sdpa::forward_flash_bf16` (the FA2 WMMA kernel at
-    /// `flame-core/src/cuda/flash_attention_fwd.cu`): whenever `Sk > 64`
-    /// (the BKV tile size) the output magnitude is ~67% of correct.
-    ///
-    /// Previous skeptic hypothesis: "Sk not mod 16". Refuted — Sk=72
-    /// (mod-16 aligned) fails identically to Sk=71.
-    ///
-    /// Our Cascade AttnBlock self+cross-attn has `Sk = HW + Sk_cond`,
-    /// which for the 8×8 fixture is 64 + 7 = 71, and for real inference
-    /// is always > 64 (CLIP=77, HW scales with resolution). So the block's
-    /// forward pass routes through the materialized FP32 path
-    /// (`sdpa_with_bias(bias=None, scale=None)`) whenever `sk > 64`. See
-    /// the inline comment at the SDPA call site for details.
-    ///
-    /// Once the flame-core kernel bug is fixed, the guard can be removed
-    /// and this test will continue to pass on the FA2 fast path.
+    /// AttnBlock takes the FA2 fast path unconditionally after the
+    /// flame-core multi-tile softmax bug was fixed on 2026-04-19. Prior
+    /// code routed `Sk > 64` through the materialized FP32 path; that
+    /// guard has been removed.
     #[test]
     fn cascade_blocks_attn_block() -> Result<()> {
         let device = global_cuda_device();

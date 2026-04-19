@@ -22,6 +22,11 @@ Pure Rust diffusion model inference using [flame-core](https://github.com/CodeAl
 | ![FLUX.1-dev](docs/flux1_sample.png) | ![Motif](docs/motif_sample.png) | ![SD 1.5](docs/sd15_sample.png) |
 | *20 steps, guidance 3.5, 1024²* | *50 steps, APG cfg 8.0, 1280×720×49 @ 24fps — [sample.mp4](docs/motif_sample.mp4)* | *30 steps, CFG 7.5, 512², 58s* |
 
+| Stable Cascade |  |  |
+|---|---|---|
+| ![Stable Cascade](docs/cascade_sample.png) |  |  |
+| *Stage C 30 + Stage B 20 steps, CFG 5.0/1.1, 1024², 93s — two-stage Würstchen v3 (Stage C prior + Stage B decoder + Paella VQ-GAN)* |  |  |
+
 ### Image editing — "change her dress to blue"
 
 | Source | Klein 4B edit | Klein 9B edit | Qwen-Image-Edit-2511 |
@@ -66,6 +71,7 @@ Denoise is **10% faster per-step** than PyTorch. Fits entirely on a single 24GB 
 | LTX-2.3 | Video DiT + 3D VAE + BigVGAN vocoder | **World's first pure-Rust video pipeline.** Video working end-to-end (prompt → MP4). Audio path runs but still has artifacts — needs more work. |
 | Motif-Video 2B | 12 dual + 24 single DiT (T5Gemma2 text encoder, Wan 2.1 VAE) | Working end-to-end (prompt → MP4). 1280×720×49 @ 24fps, APG with norm-threshold clipping + momentum EMA matching reference. VAE decode currently via Python bridge (Rust `Wan21VaeDecoder` uses different safetensors key layout than diffusers-style motif checkpoint — `MOTIF_HANDOFF.md` has the diff). |
 | Anima 2B | Cosmos Predict2 DiT | Working |
+| Stable Cascade | Würstchen v3 — Stage C prior (2 levels, 8+24 blocks) + Stage B decoder (4 levels, 2/6/28/6 blocks, patch_size=2) + Paella VQ-GAN decoder | Working — 1024², 30+20 steps, ~93s on 3090 Ti. BF16 bilinear upsample, native `ConvTranspose2d`, CLIP-ViT-bigG-14 text encoder. Step-0 parity vs diffusers: Stage C 0.999966, Stage B 0.999980. Weights under the Stability AI Non-Commercial Research Community License. |
 
 ## Pipeline
 

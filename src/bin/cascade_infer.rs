@@ -63,6 +63,11 @@ struct Args {
     width: usize,
     height: usize,
     seed: u64,
+    /// Negative prompt text. Empty string gives the usual unconditional
+    /// embedding; any non-empty value flows into the Stage C/B uncond
+    /// passes so CFG pushes *away* from this description. May be a path
+    /// to a text file if the value contains a `/`.
+    neg_prompt: String,
 }
 
 impl Args {
@@ -77,6 +82,7 @@ impl Args {
         let mut width = 1024usize;
         let mut height = 1024usize;
         let mut seed = 42u64;
+        let mut neg_prompt = String::new();
 
         let mut i = 0;
         while i < args.len() {
@@ -122,6 +128,16 @@ impl Args {
                     seed = take(v, &k)?.parse()?;
                     i += 2;
                 }
+                "--negative-prompt" | "--neg" => {
+                    let val = take(v, &k)?;
+                    // If it's a readable file path, read from disk; else
+                    // treat the value itself as the negative prompt text.
+                    neg_prompt = match std::fs::read_to_string(&val) {
+                        Ok(s) => s.trim().to_string(),
+                        Err(_) => val,
+                    };
+                    i += 2;
+                }
                 _ => {
                     eprintln!("Unknown arg: {}", k);
                     i += 1;
@@ -139,6 +155,7 @@ impl Args {
             width,
             height,
             seed,
+            neg_prompt,
         })
     }
 }
@@ -253,8 +270,14 @@ fn main() -> anyhow::Result<()> {
 
     let pos_tokens = tokenize_clip(&prompt, &clip_tokenizer_path());
     let (pos_hidden, pos_pooled) = clip.encode_cascade(&pos_tokens)?;
-    let neg_tokens = tokenize_clip("", &clip_tokenizer_path());
+    let neg_tokens = tokenize_clip(&args.neg_prompt, &clip_tokenizer_path());
     let (neg_hidden, neg_pooled) = clip.encode_cascade(&neg_tokens)?;
+    if !args.neg_prompt.is_empty() {
+        println!(
+            "  Negative prompt: {}",
+            args.neg_prompt.chars().take(100).collect::<String>()
+        );
+    }
     println!(
         "  pos_hidden: {:?}  pos_pooled: {:?}",
         pos_hidden.shape().dims(),
