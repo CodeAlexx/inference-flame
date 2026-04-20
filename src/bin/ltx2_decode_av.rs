@@ -109,8 +109,55 @@ fn main() -> anyhow::Result<()> {
     let video_vae = LTX2VaeDecoder::from_file(&checkpoint, &device)?;
     println!("  VAE loaded in {:.1}s", t0.elapsed().as_secs_f32());
 
+    // Temporal tiling: for large-F latents (e.g. 10s = 33 latent frames at
+    // 768×448 → 257 pixel frames at full res), the VAE's peak activation
+    // is ~22 GB. We chunk along F, decode each tile, concat outputs.
+    //
+    // LTX-2's own default is 64 pixel-frame tiles with 24-pixel overlap
+    // and weighted blending (see /tmp/ltx-2/.../video_vae.py::tiled_decode).
+    // This implementation is the no-overlap first pass — boundary artifacts
+    // are possible but the VAE is causal so each tile is well-defined.
+    // Follow-up: add weighted overlap blend to eliminate seams.
+    //
+    // Env control:
+    //   LTX2_VAE_TEMPORAL_TILE=<latent_frames_per_tile>  — default off
+    //     (single-shot decode). Set to e.g. 9 to tile at the LTX-2-default
+    //     (64 pixel-frame tile / 8 temporal compression).
+    let tile_f_lat: Option<usize> = std::env::var("LTX2_VAE_TEMPORAL_TILE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n >= 1);
     let t_decode = Instant::now();
-    let video_decoded = video_vae.decode(&video_latents)?;
+    let video_decoded = if let Some(tile) = tile_f_lat {
+        let f_lat = vl_dims[2];
+        if tile >= f_lat {
+            println!("  Tile size {tile} ≥ latent frames {f_lat} — single-shot decode");
+            video_vae.decode(&video_latents)?
+        } else {
+            let n_tiles = (f_lat + tile - 1) / tile;
+            println!("  Temporal tile: {tile} latent frames × {n_tiles} tiles (of {f_lat} total)");
+            let mut tile_outputs: Vec<flame_core::Tensor> = Vec::with_capacity(n_tiles);
+            for tile_idx in 0..n_tiles {
+                let f0 = tile_idx * tile;
+                let f1 = (f0 + tile).min(f_lat);
+                let slice = video_latents.narrow(2, f0, f1 - f0)?;
+                let t_tile = Instant::now();
+                let out = video_vae.decode(&slice)?;
+                println!(
+                    "    tile {}/{}: latent F=[{f0}..{f1}] → pixel shape {:?} in {:.1}s",
+                    tile_idx + 1, n_tiles, out.shape().dims(), t_tile.elapsed().as_secs_f32(),
+                );
+                tile_outputs.push(out);
+                // Aggressively free the VAE's per-decode scratch between tiles.
+                flame_core::cuda_alloc_pool::clear_pool_cache();
+                flame_core::device::trim_cuda_mempool(0);
+            }
+            let refs: Vec<&flame_core::Tensor> = tile_outputs.iter().collect();
+            flame_core::Tensor::cat(&refs, 2)?
+        }
+    } else {
+        video_vae.decode(&video_latents)?
+    };
     println!(
         "  Decoded to {:?} in {:.1}s",
         video_decoded.shape().dims(),
