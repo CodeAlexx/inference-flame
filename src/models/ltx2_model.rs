@@ -193,6 +193,27 @@ fn pre_transpose_weight(w: &Tensor) -> Result<Tensor> {
     Ok(w.clone())
 }
 
+/// Allocator-side safety valve for the DiT block loop.
+///
+/// Call after `drop(block)` in each BlockOffloader / FP8-resident block
+/// loop iteration. Returns any cached blocks from flame's BF16 arena AND
+/// asks the CUDA async mempool to release all cached segments it's
+/// hanging onto. Without this, the second-pass forward at high token
+/// counts drifts toward OOM as freed pool blocks fragment the heap —
+/// observed at ~block 14/48 on pass-2 at 768×448, 257 frames.
+///
+/// Each call is ~tens of μs on a 3090 Ti. Disable via
+/// `LTX2_NO_BLOCK_TRIM=1` if it ever shows up in a perf trace.
+#[inline]
+fn maybe_trim_pool_between_blocks() {
+    static DISABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *DISABLE.get_or_init(|| std::env::var_os("LTX2_NO_BLOCK_TRIM").is_some()) {
+        return;
+    }
+    flame_core::cuda_alloc_pool::clear_pool_cache();
+    flame_core::device::trim_cuda_mempool(0);
+}
+
 /// Free helper: fuse every `loras` delta into every matching `.weight` entry
 /// in `weights`. No-op when `loras` is empty. Silently skips keys no LoRA has.
 ///
@@ -4129,6 +4150,7 @@ impl LTX2StreamingModel {
                     prompt_timestep.as_ref(),
                 )?;
                 drop(block);
+                maybe_trim_pool_between_blocks();
                 let t_total = t_block.elapsed().as_millis();
                 if (i + 1) % 12 == 0 || i + 1 == num_layers || i == 0 {
                     log::info!("[LTX2] Block {}/{}: dequant={}ms, build={}ms, forward={}ms, total={}ms",
@@ -4196,6 +4218,7 @@ impl LTX2StreamingModel {
                     prompt_timestep.as_ref(),
                 )?;
                 drop(block); // Free transposed weights immediately
+                maybe_trim_pool_between_blocks();
                 let t_total = t_block.elapsed().as_millis();
                 if (i + 1) % 12 == 0 || i + 1 == num_layers || i == 0 {
                     log::info!("[LTX2] Block {}/{}: load={}ms, forward={}ms, total={}ms",
@@ -4223,6 +4246,7 @@ impl LTX2StreamingModel {
                     }
                 }
                 drop(block);
+                maybe_trim_pool_between_blocks();
                 let t_total = t_block.elapsed().as_millis();
                 if (i + 1) % 12 == 0 || i + 1 == num_layers || i == 0 {
                     log::info!("[LTX2] Block {}/{}: load={}ms, forward={}ms, total={}ms",
@@ -4695,6 +4719,7 @@ impl LTX2StreamingModel {
                 hs = new_hs;
                 ahs = new_ahs;
                 drop(block);
+                maybe_trim_pool_between_blocks();
                 if (i + 1) % 12 == 0 || i + 1 == num_layers || i < 4 || i == num_layers - 1 {
                     log::info!("[LTX2] AV Block {}/{}: {}ms",
                         i + 1, num_layers, t_block.elapsed().as_millis());
@@ -4855,6 +4880,7 @@ impl LTX2StreamingModel {
                 hs = new_hs;
                 ahs = new_ahs;
                 drop(block);
+                maybe_trim_pool_between_blocks();
                 if prof || (i + 1) % 12 == 0 || i + 1 == num_layers || i == 0 {
                     log::info!("[LTX2] AV Block {}/{}: total={}ms (await={}ms, build={}ms, forward={}ms)",
                         i + 1, num_layers,

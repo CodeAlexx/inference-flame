@@ -105,7 +105,11 @@ fn main() -> anyhow::Result<()> {
     let target_h: usize = get_arg("--height").unwrap_or(320);
     let num_frames: usize = get_arg("--frames").unwrap_or(257);
     let seed: u64 = get_arg("--seed").unwrap_or(42);
-    let downscale: f32 = get_arg("--downscale").unwrap_or(0.6666_667);
+    // Lightricks's LTX-2 DistilledPipeline and HQ pipeline both use width/2
+    // × height/2 for stage 1. Our default matches; `--downscale` is retained
+    // as an override knob for the older 0.9.x Multi-Scale ratio (2/3).
+    let downscale: f32 = get_arg("--downscale").unwrap_or(0.5);
+    let fp8_stream: bool = std::env::args().any(|a| a == "--fp8-stream");
     let first_pass_steps: Option<usize> = get_arg("--first-pass-steps");
     let second_pass_steps: Option<usize> = get_arg("--second-pass-steps");
     let adain_factor: f32 = get_arg("--adain-factor").unwrap_or(1.0);
@@ -153,9 +157,24 @@ fn main() -> anyhow::Result<()> {
     // ========================================
     // Text Encoding — with on-disk cache.
     // ========================================
+    // Cache is keyed by a sha256 of the prompt — previously it was
+    // prompt-agnostic and silently reused whatever embeddings were
+    // last written, regardless of the current `--prompt`. Also embeds
+    // a schema version (bumped when the encoder pipeline changes — e.g.
+    // the 2026-04-19 feature_extractor layout fix) so older cached
+    // embeddings don't silently get loaded.
+    const CACHE_SCHEMA_VERSION: &str = "v2_post_fe_fix";
+    let prompt_hash = {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        prompt.hash(&mut h);
+        CACHE_SCHEMA_VERSION.hash(&mut h);
+        format!("{:016x}", h.finish())
+    };
     let cache_dir = format!("{OUTPUT_DIR}/embed_cache");
-    let video_cache = format!("{cache_dir}/video_context.safetensors");
-    let audio_cache = format!("{cache_dir}/audio_context.safetensors");
+    let video_cache = format!("{cache_dir}/video_context_{prompt_hash}.safetensors");
+    let audio_cache = format!("{cache_dir}/audio_context_{prompt_hash}.safetensors");
 
     let (video_context, audio_context) = if std::path::Path::new(&video_cache).exists()
         && std::path::Path::new(&audio_cache).exists()
@@ -238,8 +257,19 @@ fn main() -> anyhow::Result<()> {
     let t0 = Instant::now();
     let config = LTX2Config::default();
     let mut model = LTX2StreamingModel::load_globals(MODEL_PATH, &config)?;
-    model.init_offloader()?;
-    println!("  BlockOffloader ready in {:.1}s", t0.elapsed().as_secs_f32());
+    // FP8-cast streaming halves pinned RAM (~20 GB vs ~37 GB BF16) at the
+    // cost of ~2% relative weight error — cos_sim ≈ 0.9996 per-tensor
+    // (verified by `ltx2_fp8_stream_parity`). Worth it for larger
+    // target resolutions where BF16 pinned RAM would swap.
+    if fp8_stream {
+        const MODEL_PATH_FP8: &str =
+            "/home/alex/.serenity/models/checkpoints/ltx-2.3-22b-distilled-fp8.safetensors";
+        model.init_offloader_fp8_stream(MODEL_PATH_FP8)?;
+        println!("  FP8-stream BlockOffloader ready in {:.1}s", t0.elapsed().as_secs_f32());
+    } else {
+        model.init_offloader()?;
+        println!("  BlockOffloader ready in {:.1}s", t0.elapsed().as_secs_f32());
+    }
 
     // ========================================
     // Sigmas: default to the hard-coded distilled schedules. --*-steps
