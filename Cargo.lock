@@ -676,6 +676,7 @@ dependencies = [
  "flame-diffusion",
  "half",
  "image",
+ "lanpaint-flame",
  "log",
  "memmap2",
  "rand 0.8.5",
@@ -716,6 +717,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "00810f1d8b74be64b13dbf3db89ac67740615d6c891f0e7b6179326533011a07"
 dependencies = [
  "rayon",
+]
+
+[[package]]
+name = "lanpaint-flame"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "flame-core",
+ "thiserror 1.0.69",
 ]
 
 [[package]]

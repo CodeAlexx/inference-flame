@@ -9,6 +9,7 @@ description = "Pure Rust diffusion model inference using flame-core"
 [dependencies]
 flame-core = { path = "../flame-core", default-features = false, features = ["cuda", "bf16_u16", "cudnn", "shared_storage"] }
 flame-diffusion = { path = "../flame-diffusion" }
+lanpaint-flame = { path = "../lanpaint-flame" }
 cudarc = { version = "0.11.9", default-features = false, features = ["driver", "cublas", "cublaslt", "nvrtc", "cuda-12050", "f16"] }
 half = { version = "2.3", features = ["num-traits"] }
 serde_json = "1.0"
@@ -168,6 +169,10 @@ path = "src/bin/wan_infer.rs"
 [[bin]]
 name = "wan_smoke"
 path = "src/bin/wan_smoke.rs"
+
+[[bin]]
+name = "lanpaint_gpu_smoke"
+path = "src/bin/lanpaint_gpu_smoke.rs"
 
 [[bin]]
 name = "ldm_vae_encode_parity"
