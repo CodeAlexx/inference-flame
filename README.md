@@ -73,6 +73,13 @@ Denoise is **10% faster per-step** than PyTorch. Fits entirely on a single 24GB 
 | Anima 2B | Cosmos Predict2 DiT | Working |
 | Stable Cascade | Würstchen v3 — Stage C prior (2 levels, 8+24 blocks) + Stage B decoder (4 levels, 2/6/28/6 blocks, patch_size=2) + Paella VQ-GAN decoder | Working — 1024², 30+20 steps, ~93s on 3090 Ti. BF16 bilinear upsample, native `ConvTranspose2d`, CLIP-ViT-bigG-14 text encoder. Step-0 parity vs diffusers: Stage C 0.999966, Stage B 0.999980. Weights under the Stability AI Non-Commercial Research Community License. |
 
+## Adapters & samplers
+
+| Crate | Path | What it adds |
+|---|---|---|
+| [lycoris-rs](https://github.com/CodeAlexx/Eri-Lycoris) | `../eri-lycoris/lycoris-rs` | LyCORIS adapter loader: LoCon, LoHa, LoKr, Full (Linear + Conv + Tucker). Weight-merge mode. Per-model Kohya→flame name mappers for FLUX, Z-Image, Chroma, Klein, Qwen-Image, SDXL, SD 1.5 in `src/lycoris.rs`. `fuse_split_qkv` helper for fused-QKV models. Real-LoRA-validated against `zimageLokrEri_*.safetensors` (240 adapters → 30 QKV triples fused). DoRA loud-skips. |
+| [lanpaint-flame](../lanpaint-flame) | `../lanpaint-flame` | LanPaint training-free Langevin inpainting sampler ([scraed/LanPaint](https://github.com/scraed/LanPaint) port). Flow-matching path only. Smoke binary at `src/bin/lanpaint_gpu_smoke.rs` exercises the full damped-Langevin inner loop on `[1, 4, 64, 64]` BF16. |
+
 ## Pipeline
 
 Matches [BFL's official reference](https://github.com/black-forest-labs/flux2):
