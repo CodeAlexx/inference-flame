@@ -65,13 +65,16 @@ pub fn show(
 
 fn canvas_surface(
     ui: &mut Ui,
-    state: &AppState,
+    state: &mut AppState,
     t: &Tokens,
     height: f32,
     last_image: Option<&egui::TextureHandle>,
 ) {
-    let (rect, _resp) =
-        ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
+    let (rect, surface_resp) =
+        ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::click());
+    if surface_resp.double_clicked() && last_image.is_some() {
+        state.image_zoomed = true;
+    }
 
     let painter = ui.painter_at(rect);
 

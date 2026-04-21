@@ -3,7 +3,7 @@
 //! Mirrors `worker/{flux,chroma,klein,sd3,qwenimage,ernie}.rs` structurally —
 //! lazy load, drop-to-fit VRAM dance, per-step Started/Progress/Done event
 //! emission. Underlying pipeline mirrors
-//! `inference-flame/src/bin/anima_infer.rs`.
+//! `inference-flame/src/bin/anima_infer.rs` for DiT + denoise + VAE.
 //!
 //! ## Architecture
 //!
@@ -12,31 +12,25 @@
 //! and loaded entirely to GPU via `Anima::new_all_on_gpu(...)`. No block
 //! offloading.
 //!
-//! ## Text encoder — pre-computed context
+//! ## Text encoder — in-process Qwen3-0.6B + Anima LLM adapter
 //!
-//! Anima's LLM adapter transforms Qwen3 0.6B hidden states into the
-//! 1024-dim context consumed by `forward_with_context`. The Python pipeline
-//! runs Qwen3 + the adapter's cross-attention and caches the resulting
-//! context tensor.
+//! Mirrors `cache_anima_embeddings.py` exactly. Two tokenizers, two-stage
+//! encode:
+//!   1. Tokenize prompt with Qwen3-0.6B tokenizer, pad to `MAX_SEQ_LEN`
+//!   2. Tokenize same prompt with the T5-old (sentencepiece) tokenizer, pad
+//!      to `MAX_SEQ_LEN`
+//!   3. Run Qwen3-0.6B encoder on the Qwen3 ids → `[1, S, 1024]` hidden
+//!   4. Zero out hidden rows at Qwen3 padding positions
+//!   5. Apply final `model.norm` (Qwen3Encoder returns raw layer output)
+//!   6. Call `Anima::encode_context(t5_ids, qwen3_hidden)` to run the
+//!      cross-attention adapter → `[1, S, 1024]` context
+//!   7. Zero out context rows at T5 padding positions
 //!
-//! AGENT-DEFAULT: this worker mirrors the bin convention exactly. It reads
-//! pre-computed `context_cond` + `context_uncond` tensors from a safetensors
-//! file at `EMBEDS_PATH`. `job.prompt`/`job.negative` are IGNORED with an
-//! UNAMBIGUOUS warning log. The user must pre-compute before clicking
-//! Generate; if the file is missing we Fail with a clear error pointing at
-//! the bin.
-//!
-//! The Rust Qwen3 0.6B encoder + adapter forward path exists
-//! (`Anima::encode_context`) but no bin has been wired up to use it yet —
-//! doing so is out of scope for Batch C. Tracked as future work.
-//!
-//! ### Known v1 limitation: prompts are NOT typed in the UI
-//!
-//! Same as the qwenimage worker: typed prompts are ignored. The cached
-//! context file decides the result. The warning log says so explicitly. The
-//! UI has no per-job warning channel today, so this is the only signal a
-//! UI user gets that their typed prompt was discarded. Future work: wire
-//! `Anima::encode_context` into this worker and remove the cache.
+//! Anima DiT must be loaded BEFORE encoding because `encode_context` is a
+//! method on `Anima` (the adapter weights live in the DiT checkpoint under
+//! `net.llm_adapter.*`). Both encoder + DiT fit comfortably (~5 GB total)
+//! on a 24 GB card. Qwen3 encoder + tokenizers are dropped after encoding;
+//! Anima DiT stays resident through denoise.
 //!
 //! ## CFG
 //!
@@ -61,8 +55,7 @@
 //! VAE decode in Rust — it saves the latent for Python decode. We call the
 //! Rust `QwenImageVaeDecoder` directly here (same decoder used by the
 //! qwenimage worker) and squeeze the T=1 axis before conversion. If this
-//! produces wrong colors it's a parity issue with the anima shipping VAE
-//! that Batch C isn't resolving.
+//! produces wrong colors it's a parity issue with the anima shipping VAE.
 //!
 //! ### Known caveat: VAE color parity unverified
 //!
@@ -72,13 +65,7 @@
 //! Shape and permute pipeline is correct (audited against the bin), but
 //! whether the QwenImage VAE checkpoint is the right calibration for Anima
 //! latents is **unverified by code review**. If the first real run
-//! produces wrong colors, this is the first place to look. Two likely
-//! culprits:
-//!   1. The shipped `qwen_image_vae.safetensors` differs subtly from the
-//!      one the qwenimage worker uses (different scale/shift constants
-//!      bundled into the weights).
-//!   2. The latent stats (mean/std) Anima emits aren't calibrated to that
-//!      VAE's expected input distribution.
+//! produces wrong colors, this is the first place to look.
 //!
 //! ## Latent
 //!
@@ -87,13 +74,15 @@
 //!
 //! ## VRAM budget on a 24 GB card
 //!
-//! - Cached context tensors:              ~50-200 MB
+//! - Qwen3-0.6B encoder (BF16):           ~1.2 GB  (Stage 1 only)
 //! - Anima DiT (all resident, BF16):      ~3.9 GB
 //! - Qwen-Image VAE decoder:              ~0.4 GB
 //! - Activations (1024² latent):          ~2-3 GB
 //!
-//! Comfortable. No text-encoder VRAM cost (cached). Drop DiT before VAE
-//! decode for the usual cuDNN-workspace safety margin.
+//! Comfortable. Encoder + DiT briefly coexist (~5 GB) during text encoding.
+//! Encoder is dropped after both prompts encode; DiT stays resident through
+//! denoise; DiT dropped before VAE decode for the usual cuDNN-workspace
+//! safety margin.
 
 use std::collections::VecDeque;
 use std::path::Path;
@@ -107,12 +96,13 @@ use egui::ColorImage;
 use flame_core::{DType, Shape, Tensor};
 
 use inference_flame::models::anima::{load_all_weights, Anima};
+use inference_flame::models::qwen3_encoder::Qwen3Encoder;
 use inference_flame::vae::QwenImageVaeDecoder;
 
 use super::{GenerateJob, UiMsg, WorkerEvent};
 
 // ===========================================================================
-// Hardcoded weight paths (mirrors anima_infer.rs).
+// Hardcoded weight paths (mirrors anima_infer.rs / cache_anima_embeddings.py).
 // ===========================================================================
 
 /// Anima DiT — single consolidated safetensors file.
@@ -123,13 +113,41 @@ const MODEL_PATH: &str =
 const VAE_PATH: &str =
     "/home/alex/EriDiffusion/Models/anima/split_files/vae/qwen_image_vae.safetensors";
 
-/// Pre-computed cond + uncond context tensors safetensors file.
+/// Qwen3-0.6B base text encoder (single safetensors, ~1.2 GB BF16).
+const QWEN3_ENCODER_PATH: &str =
+    "/home/alex/EriDiffusion/Models/anima/split_files/text_encoders/qwen_3_06b_base.safetensors";
+
+/// Qwen3 tokenizer.json. We try the HF cache snapshot first (permanent)
+/// and fall back to the anima-trainer config (matches what generated the
+/// cached embeddings). Both produce identical token ids for the Qwen3-0.6B
+/// vocabulary.
 ///
-/// AGENT-DEFAULT: hardcoded path, same as qwenimage.rs. Must contain
-/// `context_cond` and `context_uncond` tensors (each [1, S_txt, 1024] BF16 —
-/// Anima's post-adapter text context). Generated by the Python pipeline.
-const EMBEDS_PATH: &str =
-    "/home/alex/EriDiffusion/inference-flame/output/anima_embeddings.safetensors";
+/// AGENT-DEFAULT: hardcoded preference list. The HF cache path comes from
+/// the auto-downloaded `Qwen/Qwen3-0.6B` snapshot; `/tmp/anima-trainer/` is
+/// where the user keeps the trainer checkout (less permanent — can be
+/// wiped on reboot).
+const QWEN3_TOKENIZER_PATHS: &[&str] = &[
+    "/home/alex/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca/tokenizer.json",
+    "/tmp/anima-trainer/configs/qwen3_06b/tokenizer.json",
+];
+
+/// T5-old tokenizer.json — bundled with the anima trainer's t5_old config.
+/// AGENT-DEFAULT: only known-correct location on disk. Anima's LLM adapter
+/// was trained against this exact tokenizer's vocabulary (T5 v1_1 style
+/// with sentencepiece); using a different T5 tokenizer would mis-index the
+/// adapter's `embed.weight` lookup.
+const T5_TOKENIZER_PATH: &str = "/tmp/anima-trainer/configs/t5_old/tokenizer.json";
+
+/// Sequence length for both Qwen3 and T5 tokenization. Mirrors
+/// cache_anima_embeddings.py::MAX_SEQ_LEN.
+const MAX_SEQ_LEN: usize = 256;
+
+/// Qwen3 pad token id (`<|endoftext|>` = 151643). Same as zimage worker.
+/// `Qwen3Encoder` uses this for pad-row detection inside the causal mask.
+const QWEN3_PAD_ID: i32 = 151643;
+
+/// T5 pad token id (`<pad>` = 0).
+const T5_PAD_ID: i32 = 0;
 
 /// Default CFG. anima_infer.rs uses 4.5 (HF recommendation).
 const DEFAULT_CFG: f32 = 4.5;
@@ -170,17 +188,6 @@ pub fn run(
 ) {
     let steps: u32 = if job.steps == 0 { DEFAULT_STEPS } else { job.steps };
     let cfg_scale: f32 = if job.cfg <= 0.0 { DEFAULT_CFG } else { job.cfg };
-
-    if !job.prompt.is_empty() {
-        // UNAMBIGUOUS — same rationale as the qwenimage worker. The UI has
-        // no per-job warning channel today; the log is the only signal.
-        log::warn!(
-            "ANIMA: TYPED PROMPT IS IGNORED. Inference will use the CACHED \
-             context tensors at {EMBEDS_PATH}. To change the prompt, re-run \
-             the Python pre-compute pipeline. (See module-level docstring's \
-             'Known v1 limitation' section.)"
-        );
-    }
 
     let _ = ev_tx.send(WorkerEvent::Started {
         id: job.id,
@@ -266,38 +273,11 @@ fn run_inner_body(
 ) -> Result<ColorImage, RunError> {
     let device = state.device.clone();
 
-    // -------- 1. Load pre-computed cond + uncond context --------
-    if !Path::new(EMBEDS_PATH).exists() {
-        return Err(RunError::Other(format!(
-            "Anima context file not found at {EMBEDS_PATH} — \
-             pre-compute via the Python pipeline first"
-        )));
-    }
-    log::info!("Anima: loading cached context from {EMBEDS_PATH}");
-    let t0 = Instant::now();
-    let emb = flame_core::serialization::load_file(Path::new(EMBEDS_PATH), &device)
-        .map_err(|e| RunError::Other(format!("context load: {e:?}")))?;
-    let context_cond = emb
-        .get("context_cond")
-        .ok_or_else(|| RunError::Other("missing 'context_cond' in embeddings file".into()))?
-        .clone();
-    let context_uncond = emb
-        .get("context_uncond")
-        .ok_or_else(|| RunError::Other("missing 'context_uncond' in embeddings file".into()))?
-        .clone();
-    drop(emb);
-    let context_cond = ensure_bf16(context_cond)?;
-    let context_uncond = ensure_bf16(context_uncond)?;
-    log::info!(
-        "Anima: context_cond {:?}, context_uncond {:?} ({:.1}s)",
-        context_cond.shape().dims(),
-        context_uncond.shape().dims(),
-        t0.elapsed().as_secs_f32(),
-    );
-
-    drain_pending(ui_rx, pending)?;
-
-    // -------- 2. Load Anima DiT (all weights on GPU) --------
+    // -------- 1. Load Anima DiT (all weights on GPU) --------
+    // Loaded BEFORE encoding because Anima::encode_context is a method on
+    // Anima — the adapter weights live in the DiT checkpoint under
+    // `net.llm_adapter.*`. ~3.9 GB, comfortably fits alongside the
+    // Qwen3-0.6B encoder.
     if !Path::new(MODEL_PATH).exists() {
         return Err(RunError::Other(format!(
             "Anima model not found at {MODEL_PATH}"
@@ -309,6 +289,17 @@ fn run_inner_body(
         .map_err(|e| RunError::Other(format!("weight load: {e:?}")))?;
     let mut model = Anima::new_all_on_gpu(MODEL_PATH.to_string(), all_weights, device.clone());
     log::info!("Anima: DiT loaded in {:.1}s", t0.elapsed().as_secs_f32());
+
+    drain_pending(ui_rx, pending)?;
+
+    // -------- 2. Encode prompts (Qwen3 + LLM adapter) --------
+    let (context_cond, context_uncond) =
+        encode_prompts(&model, &device, &job.prompt, &job.negative)?;
+    log::info!(
+        "Anima: context_cond {:?}, context_uncond {:?}",
+        context_cond.shape().dims(),
+        context_uncond.shape().dims(),
+    );
 
     drain_pending(ui_rx, pending)?;
 
@@ -461,13 +452,233 @@ fn run_inner_body(
     decoded_to_color_image(&rgb).map_err(|e| RunError::Other(format!("to ColorImage: {e:?}")))
 }
 
-fn ensure_bf16(t: Tensor) -> Result<Tensor, RunError> {
-    if t.dtype() == DType::BF16 {
-        Ok(t)
-    } else {
-        t.to_dtype(DType::BF16)
-            .map_err(|e| RunError::Other(format!("ensure_bf16: {e:?}")))
+// ---------------------------------------------------------------------------
+// Prompt encoding — Qwen3-0.6B + Anima LLM adapter, mirrors
+// cache_anima_embeddings.py exactly.
+// ---------------------------------------------------------------------------
+
+/// Tokenize, encode through Qwen3-0.6B, run Anima's LLM adapter, return
+/// `(context_cond, context_uncond)` — both `[1, MAX_SEQ_LEN, 1024]` BF16.
+///
+/// Loads the Qwen3 encoder + both tokenizers once, runs both prompts, then
+/// drops everything except the final context tensors.
+fn encode_prompts(
+    model: &Anima,
+    device: &Arc<CudaDevice>,
+    prompt: &str,
+    negative: &str,
+) -> Result<(Tensor, Tensor), RunError> {
+    // Load tokenizers — Qwen3 has a fallback chain, T5 is single-source.
+    let qwen3_tok_path = QWEN3_TOKENIZER_PATHS
+        .iter()
+        .copied()
+        .find(|p| Path::new(p).exists())
+        .ok_or_else(|| {
+            RunError::Other(format!(
+                "Qwen3-0.6B tokenizer not found. Checked:\n  - {}",
+                QWEN3_TOKENIZER_PATHS.join("\n  - ")
+            ))
+        })?;
+    if !Path::new(T5_TOKENIZER_PATH).exists() {
+        return Err(RunError::Other(format!(
+            "T5-old tokenizer not found at {T5_TOKENIZER_PATH}"
+        )));
     }
+    let qwen3_tk = tokenizers::Tokenizer::from_file(qwen3_tok_path)
+        .map_err(|e| RunError::Other(format!("qwen3 tokenizer load from {qwen3_tok_path}: {e}")))?;
+    let t5_tk = tokenizers::Tokenizer::from_file(T5_TOKENIZER_PATH)
+        .map_err(|e| RunError::Other(format!("t5 tokenizer load: {e}")))?;
+
+    // Load Qwen3-0.6B encoder
+    if !Path::new(QWEN3_ENCODER_PATH).exists() {
+        return Err(RunError::Other(format!(
+            "Qwen3-0.6B encoder weights not found at {QWEN3_ENCODER_PATH}"
+        )));
+    }
+    log::info!("Anima: loading Qwen3-0.6B text encoder from {QWEN3_ENCODER_PATH}");
+    let t0 = Instant::now();
+    let mut weights = flame_core::serialization::load_file(Path::new(QWEN3_ENCODER_PATH), device)
+        .map_err(|e| RunError::Other(format!("qwen3 encoder load: {e:?}")))?;
+    // Upcast non-BF16 shards if any.
+    let keys: Vec<String> = weights.keys().cloned().collect();
+    for k in keys {
+        let t = &weights[&k];
+        if t.dtype() != DType::BF16 {
+            let bf = t
+                .to_dtype(DType::BF16)
+                .map_err(|e| RunError::Other(format!("upcast {k}: {e:?}")))?;
+            weights.insert(k, bf);
+        }
+    }
+
+    // Auto-detect config (vocab=151936, hidden=1024, layers=28, heads=16/8).
+    // Override extract_layers to grab ONLY the final layer — that's what
+    // HF's `last_hidden_state` represents (modulo the final RMSNorm we
+    // apply manually below; Qwen3Encoder::encode skips it).
+    let mut cfg = Qwen3Encoder::config_from_weights(&weights)
+        .map_err(|e| RunError::Other(format!("qwen3 config: {e:?}")))?;
+    let last_layer = cfg.num_layers.checked_sub(1).ok_or_else(|| {
+        RunError::Other(format!(
+            "Qwen3 num_layers={} — expected >=1",
+            cfg.num_layers
+        ))
+    })?;
+    cfg.extract_layers = vec![last_layer];
+
+    // Final-norm weight is needed AFTER encoder.encode() to produce the
+    // post-norm `last_hidden_state` HF returns. Qwen3Encoder doesn't apply
+    // it inside encode(), so we extract it here before the encoder takes
+    // ownership of the weights map.
+    let final_norm_w = weights
+        .get("model.norm.weight")
+        .ok_or_else(|| RunError::Other("missing model.norm.weight in Qwen3 encoder".into()))?
+        .clone();
+
+    let encoder = Qwen3Encoder::new(weights, cfg, device.clone());
+    log::info!(
+        "Anima: Qwen3-0.6B encoder ready in {:.1}s",
+        t0.elapsed().as_secs_f32()
+    );
+
+    // Encode both prompts
+    let context_cond =
+        encode_one_prompt(model, &encoder, &final_norm_w, &qwen3_tk, &t5_tk, device, prompt)?;
+    let context_uncond =
+        encode_one_prompt(model, &encoder, &final_norm_w, &qwen3_tk, &t5_tk, device, negative)?;
+
+    // Drop encoder + tokenizers + final_norm_w before returning.
+    drop(encoder);
+    drop(final_norm_w);
+    drop(qwen3_tk);
+    drop(t5_tk);
+    flame_core::cuda_alloc_pool::clear_pool_cache();
+    flame_core::device::trim_cuda_mempool(0);
+    log::info!("Anima: Qwen3 encoder dropped, CUDA pool flushed (~1.2 GB freed)");
+
+    Ok((context_cond, context_uncond))
+}
+
+/// Tokenize → encode → final norm → adapter → mask. Returns `[1, S, 1024]`.
+fn encode_one_prompt(
+    model: &Anima,
+    encoder: &Qwen3Encoder,
+    final_norm_w: &Tensor,
+    qwen3_tk: &tokenizers::Tokenizer,
+    t5_tk: &tokenizers::Tokenizer,
+    device: &Arc<CudaDevice>,
+    prompt: &str,
+) -> Result<Tensor, RunError> {
+    // 1. Tokenize with Qwen3 tokenizer, pad to MAX_SEQ_LEN.
+    let qwen3_ids = pad_tokenize(qwen3_tk, prompt, MAX_SEQ_LEN, QWEN3_PAD_ID)?;
+    // 2. Tokenize with T5 tokenizer, pad to MAX_SEQ_LEN.
+    let t5_ids = pad_tokenize(t5_tk, prompt, MAX_SEQ_LEN, T5_PAD_ID)?;
+
+    // 3. Build attention masks (1 for real tokens, 0 for pad). We use these
+    // to zero out padding positions in both the Qwen3 hidden state and the
+    // post-adapter context, matching cache_anima_embeddings.py.
+    let qwen3_mask: Vec<f32> = qwen3_ids
+        .iter()
+        .map(|&id| if id == QWEN3_PAD_ID { 0.0 } else { 1.0 })
+        .collect();
+    let t5_mask: Vec<f32> = t5_ids
+        .iter()
+        .map(|&id| if id == T5_PAD_ID { 0.0 } else { 1.0 })
+        .collect();
+
+    // 4. Encode through Qwen3 → [1, S, 1024] (raw last-layer hidden, no
+    // final norm).
+    let raw_hidden = encoder
+        .encode(&qwen3_ids)
+        .map_err(|e| RunError::Other(format!("qwen3 encode: {e:?}")))?;
+
+    // 5. Apply final RMSNorm (model.norm). HF's last_hidden_state is
+    // post-norm; the cached embeddings were generated with this applied,
+    // so the adapter expects post-norm input.
+    let normed_hidden = rms_norm_last_dim(&raw_hidden, final_norm_w, 1e-6)?;
+
+    // 6. Zero out hidden rows at Qwen3 padding positions (matches Python:
+    // `nd_encoded_text[~nd_attn_mask.bool()] = 0`).
+    let qwen3_hidden = mask_seq_dim(&normed_hidden, &qwen3_mask, device)?;
+
+    // 7. Build T5 token-id tensor for the adapter's embed lookup. Anima's
+    // embedding_lookup() reads ids as f32 (representing integers).
+    let t5_id_f32: Vec<f32> = t5_ids.iter().map(|&i| i as f32).collect();
+    let t5_id_tensor = Tensor::from_vec(
+        t5_id_f32,
+        Shape::from_dims(&[1, MAX_SEQ_LEN]),
+        device.clone(),
+    )
+    .map_err(|e| RunError::Other(format!("t5 id tensor: {e:?}")))?;
+
+    // 8. Run the adapter to produce the final context.
+    let context = model
+        .encode_context(&t5_id_tensor, &qwen3_hidden)
+        .map_err(|e| RunError::Other(format!("encode_context: {e:?}")))?;
+
+    // 9. Zero out context at T5 padding positions (matches Python:
+    // `context[~t5_attn_mask.bool()] = 0`).
+    let masked = mask_seq_dim(&context, &t5_mask, device)?;
+    Ok(masked)
+}
+
+/// Tokenize + truncate to `max_len` + right-pad with `pad_id`.
+fn pad_tokenize(
+    tk: &tokenizers::Tokenizer,
+    text: &str,
+    max_len: usize,
+    pad_id: i32,
+) -> Result<Vec<i32>, RunError> {
+    let enc = tk
+        .encode(text, true)
+        .map_err(|e| RunError::Other(format!("tokenize: {e}")))?;
+    let mut out: Vec<i32> = enc.get_ids().iter().take(max_len).map(|&i| i as i32).collect();
+    while out.len() < max_len {
+        out.push(pad_id);
+    }
+    Ok(out)
+}
+
+/// Apply RMSNorm along the last (hidden) dim using flame_core's BF16 kernel.
+/// Mirrors what Qwen3Encoder uses internally for `model.norm`.
+fn rms_norm_last_dim(x: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor, RunError> {
+    let dims = x.shape().dims().to_vec();
+    let hidden = *dims.last().unwrap();
+    let batch: usize = dims[..dims.len() - 1].iter().product();
+    let x_2d = x
+        .reshape(&[batch, hidden])
+        .map_err(|e| RunError::Other(format!("rms reshape in: {e:?}")))?;
+    let out_2d = flame_core::cuda_ops_bf16::rms_norm_bf16(&x_2d, Some(weight), eps)
+        .map_err(|e| RunError::Other(format!("rms_norm_bf16: {e:?}")))?;
+    out_2d
+        .reshape(&dims)
+        .map_err(|e| RunError::Other(format!("rms reshape out: {e:?}")))
+}
+
+/// Multiply each row in the seq dim of `x` (`[1, S, D]`) by the per-position
+/// scalar in `mask` (`[S]`). Used to zero out padding positions.
+fn mask_seq_dim(x: &Tensor, mask: &[f32], device: &Arc<CudaDevice>) -> Result<Tensor, RunError> {
+    let dims = x.shape().dims().to_vec();
+    if dims.len() != 3 {
+        return Err(RunError::Other(format!(
+            "mask_seq_dim expected [B, S, D], got {dims:?}"
+        )));
+    }
+    let s = dims[1];
+    if mask.len() != s {
+        return Err(RunError::Other(format!(
+            "mask len {} != seq len {s}",
+            mask.len()
+        )));
+    }
+    // Build a [1, S, 1] BF16 mask tensor and broadcast-multiply.
+    let mask_t = Tensor::from_f32_to_bf16(
+        mask.to_vec(),
+        Shape::from_dims(&[1, s, 1]),
+        device.clone(),
+    )
+    .map_err(|e| RunError::Other(format!("mask alloc: {e:?}")))?;
+    x.mul(&mask_t)
+        .map_err(|e| RunError::Other(format!("mask mul: {e:?}")))
 }
 
 // ---------------------------------------------------------------------------

@@ -476,16 +476,27 @@ fn main() -> Result<()> {
             // makes that OK despite the inner &mut borrow.
             let inner_model_fn =
                 |x: &Tensor, t: &Tensor| -> flame_core::Result<Tensor> {
-                    let v = flux_velocity(x, t).map_err(|e| {
+                    // FLUX's fused_linear3d_native is BF16-only. LanPaint's
+                    // internal compute is F32 (autocast), so it hands us F32
+                    // tensors. Downcast at the boundary, run FLUX in BF16,
+                    // then upcast the velocity result back to F32 for the
+                    // x_0 = x - t·v conversion that follows.
+                    let x_bf16 = if x.dtype() == DType::BF16 {
+                        x.clone()
+                    } else {
+                        x.to_dtype(DType::BF16)?
+                    };
+                    let t_bf16 = if t.dtype() == DType::BF16 {
+                        t.clone()
+                    } else {
+                        t.to_dtype(DType::BF16)?
+                    };
+                    let v = flux_velocity(&x_bf16, &t_bf16).map_err(|e| {
                         flame_core::Error::InvalidOperation(format!(
                             "flux inner velocity: {e:?}"
                         ))
                     })?;
-                    // x_0 = x - t * v. `t` is [B] BF16; broadcast manually.
-                    //
-                    // We do the math in F32 to avoid BF16 precision loss,
-                    // then cast back — LanPaint itself also upcasts to F32
-                    // internally, so it'll be re-cast either way.
+                    // x_0 = x - t * v in F32 to keep precision.
                     let x_f32 = x.to_dtype(DType::F32)?;
                     let v_f32 = v.to_dtype(DType::F32)?;
                     let t_f32 = t.to_dtype(DType::F32)?;

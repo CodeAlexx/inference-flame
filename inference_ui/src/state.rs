@@ -539,6 +539,10 @@ pub struct AppState {
     pub current_step: u32,
     #[serde(skip)]
     pub total_steps: u32,
+    /// Lightbox overlay for the canvas image — set true on double-click,
+    /// cleared by Escape or click-outside.
+    #[serde(skip)]
+    pub image_zoomed: bool,
 
     // Phase 4 — right-panel queue/history + GPU telemetry. Both transient:
     // the queue is rebuilt on launch (jobs are submitted via the action bar,
@@ -571,6 +575,7 @@ impl Default for AppState {
             generating: false,
             current_step: 0,
             total_steps: 0,
+            image_zoomed: false,
             // Seed queue + perf with mock data so the right panel has visible
             // content on first launch. Phase 5 will replace mock with real
             // worker submissions; Phase 6 with NVML-driven perf updates.

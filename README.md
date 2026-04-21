@@ -73,6 +73,20 @@ Denoise is **10% faster per-step** than PyTorch. Fits entirely on a single 24GB 
 | Anima 2B | Cosmos Predict2 DiT | Working |
 | Stable Cascade | Würstchen v3 — Stage C prior (2 levels, 8+24 blocks) + Stage B decoder (4 levels, 2/6/28/6 blocks, patch_size=2) + Paella VQ-GAN decoder | Working — 1024², 30+20 steps, ~93s on 3090 Ti. BF16 bilinear upsample, native `ConvTranspose2d`, CLIP-ViT-bigG-14 text encoder. Step-0 parity vs diffusers: Stage C 0.999966, Stage B 0.999980. Weights under the Stability AI Non-Commercial Research Community License. |
 
+## Desktop UI (`inference_ui/`)
+
+![Flame Inference UI — Qwen-Image](docs/inference_ui_qwenimage.png)
+
+Pure-Rust egui desktop app that drives all 11 image-model workers in-process. No HTTP, no browser, no Python server — model load stays hot across gens, preview stays native `egui::ColorImage`, CUDA context never leaves the process. ~3K LoC of UI shell + ~8K LoC of worker code shipped across 6 UI phases and 4 model-wiring batches via a builder → skeptic → bug-fixer agent pipeline.
+
+**Shipped model workers**: FLUX 1 Dev, Chroma, Klein 4B/9B, Z-Image base/turbo, SD 3.5 Medium, Qwen-Image, ERNIE-Image, Anima 2B, SDXL, SD 1.5, Stable Cascade. Text encoders (CLIP-L, CLIP-G, T5-XXL, Qwen3, Qwen2.5-VL, Mistral-3) all load in-process — typed prompts drive every generation. VRAM dance (drop encoder before DiT, drop DiT before VAE decode) fits every model in 24 GB.
+
+Launch:
+```bash
+LD_LIBRARY_PATH=/path/to/libtorch/lib \
+  ./inference_ui/target/release/inference-ui
+```
+
 ## Adapters & samplers
 
 | Crate | Path | What it adds |

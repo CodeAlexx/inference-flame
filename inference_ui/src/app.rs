@@ -277,6 +277,47 @@ impl eframe::App for FlameInferenceApp {
         crate::panels::queue_panel(ctx, self);
         crate::panels::canvas_panel(ctx, self);
 
+        // ------ 4b. Lightbox overlay (if image_zoomed) ------------------
+        // Painted LAST so it's on top of everything. Click anywhere or
+        // press Escape (handled in handle_shortcuts) to close.
+        if self.state.image_zoomed {
+            if let Some(tex) = &self.last_image {
+                let screen = ctx.screen_rect();
+                egui::Area::new(egui::Id::new("lightbox"))
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(screen.min)
+                    .show(ctx, |ui| {
+                        let painter = ui.painter();
+                        // Backdrop: semi-opaque dark over the whole window
+                        painter.rect_filled(screen, 0.0, egui::Color32::from_black_alpha(220));
+                        // Aspect-fit the image into a 90% box
+                        let pad = 32.0;
+                        let avail_w = (screen.width() - 2.0 * pad).max(40.0);
+                        let avail_h = (screen.height() - 2.0 * pad).max(40.0);
+                        let [tw, th] = tex.size();
+                        let aspect = tw as f32 / th.max(1) as f32;
+                        let (iw, ih) = if avail_w / aspect <= avail_h {
+                            (avail_w, avail_w / aspect)
+                        } else {
+                            (avail_h * aspect, avail_h)
+                        };
+                        let img_rect = egui::Rect::from_center_size(
+                            screen.center(),
+                            egui::vec2(iw, ih),
+                        );
+                        egui::Image::from_texture(tex).paint_at(ui, img_rect);
+                        // Click anywhere closes (alt to Esc)
+                        let resp = ui.allocate_rect(screen, egui::Sense::click());
+                        if resp.clicked() {
+                            self.state.image_zoomed = false;
+                        }
+                    });
+            } else {
+                // Defensive: no image to show, drop the flag
+                self.state.image_zoomed = false;
+            }
+        }
+
         // ------ 5. Detect state change → debounced save -----------------
         // After the UI pass, snapshot the (potentially mutated) state and
         // compare against the previous frame's snapshot. Any difference
@@ -347,9 +388,14 @@ impl FlameInferenceApp {
             }
         }
 
-        // Esc — Stop (only when generating). egui itself uses Esc to
-        // dismiss popups, so we only consume when there's a job to stop.
-        if self.state.generating
+        // Esc — priority: close lightbox zoom > Stop > (fall through to
+        // egui's popup dismissal). egui itself uses Esc to dismiss popups,
+        // so we only consume when there's something specific to undo.
+        if self.state.image_zoomed
+            && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape))
+        {
+            self.state.image_zoomed = false;
+        } else if self.state.generating
             && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape))
         {
             self.action_stop();
