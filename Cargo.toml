@@ -144,6 +144,34 @@ name = "zimage_inpaint"
 path = "src/bin/zimage_inpaint.rs"
 
 [[bin]]
+name = "klein_inpaint"
+path = "src/bin/klein_inpaint.rs"
+
+[[bin]]
+name = "chroma_inpaint"
+path = "src/bin/chroma_inpaint.rs"
+
+[[bin]]
+name = "qwenimage_inpaint"
+path = "src/bin/qwenimage_inpaint.rs"
+
+[[bin]]
+name = "sd3_inpaint"
+path = "src/bin/sd3_inpaint.rs"
+
+[[bin]]
+name = "ernie_inpaint"
+path = "src/bin/ernie_inpaint.rs"
+
+[[bin]]
+name = "sdxl_inpaint"
+path = "src/bin/sdxl_inpaint.rs"
+
+[[bin]]
+name = "sd15_inpaint"
+path = "src/bin/sd15_inpaint.rs"
+
+[[bin]]
 name = "wan22_t2v_gen"
 path = "src/bin/wan22_t2v_gen.rs"
 
