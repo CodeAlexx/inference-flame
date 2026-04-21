@@ -390,7 +390,7 @@ fn run_inner_body(
     log::info!("Cascade: loading Stage C from {}", stage_c_path().display());
     let t_stage_c_load = Instant::now();
     let stage_c_latent = {
-        let unet_c = WuerstchenUNet::load(
+        let unet_c = load_cascade_unet(
             stage_c_path().to_str().unwrap(),
             WuerstchenUNetConfig::stage_c(),
             &device,
@@ -483,7 +483,7 @@ fn run_inner_body(
     log::info!("Cascade: loading Stage B from {}", stage_b_path().display());
     let t_stage_b_load = Instant::now();
     let stage_b_latent = {
-        let unet_b = WuerstchenUNet::load(
+        let unet_b = load_cascade_unet(
             stage_b_path().to_str().unwrap(),
             WuerstchenUNetConfig::stage_b(),
             &device,
@@ -593,7 +593,7 @@ fn run_inner_body(
     log::info!("Cascade: loading Stage A (Paella VQ-GAN)");
     let t_vae = Instant::now();
     let rgb = {
-        let vae = PaellaVQDecoder::load(stage_a_path().to_str().unwrap(), &device)
+        let vae = load_cascade_paella(stage_a_path().to_str().unwrap(), &device)
             .map_err(|e| RunError::Other(format!("Stage A load: {e:?}")))?;
         let img = vae
             .decode(&stage_b_latent)
@@ -629,6 +629,48 @@ fn cfg_combine(v_cond: &Tensor, v_uncond: &Tensor, cfg: f32) -> Result<Tensor, R
     v_uncond
         .add(&scaled)
         .map_err(|e| RunError::Other(format!("cfg combine: {e:?}")))
+}
+
+// ---------------------------------------------------------------------------
+// GGUF-or-safetensors dispatch for the three Cascade stages. All three stages
+// now accept either a `.gguf` (dequantized + uploaded in one shot by the
+// Phase 1 loader) or a `.safetensors` file. Mirrors the per-worker pattern
+// in flux/klein/zimage/sdxl/sd15/anima/ernie.
+// ---------------------------------------------------------------------------
+
+fn load_cascade_unet(
+    path: &str,
+    config: WuerstchenUNetConfig,
+    device: &Arc<CudaDevice>,
+) -> Result<WuerstchenUNet, flame_core::Error> {
+    if path.to_ascii_lowercase().ends_with(".gguf") {
+        log::info!("Cascade: loading GGUF UNet from {path}");
+        let weights = inference_flame::gguf::load_file_gguf(
+            std::path::Path::new(path),
+            device.clone(),
+        )
+        .map_err(|e| flame_core::Error::InvalidInput(format!("GGUF load: {e}")))?;
+        WuerstchenUNet::from_weights(weights, config, device)
+    } else {
+        WuerstchenUNet::load(path, config, device)
+    }
+}
+
+fn load_cascade_paella(
+    path: &str,
+    device: &Arc<CudaDevice>,
+) -> Result<PaellaVQDecoder, flame_core::Error> {
+    if path.to_ascii_lowercase().ends_with(".gguf") {
+        log::info!("Cascade: loading GGUF Paella VQ-GAN from {path}");
+        let weights = inference_flame::gguf::load_file_gguf(
+            std::path::Path::new(path),
+            device.clone(),
+        )
+        .map_err(|e| flame_core::Error::InvalidInput(format!("GGUF load: {e}")))?;
+        PaellaVQDecoder::from_weights(weights, device)
+    } else {
+        PaellaVQDecoder::load(path, device)
+    }
 }
 
 // ---------------------------------------------------------------------------

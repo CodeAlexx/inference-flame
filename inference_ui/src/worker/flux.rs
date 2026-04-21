@@ -300,14 +300,34 @@ fn run_inner_body(
     drain_pending(ui_rx, pending)?;
 
     // -------- 3. Load FLUX 1 DiT (BlockOffloader; reloaded each job) --------
-    log::info!("FLUX: loading DiT from {DIT_PATH}");
+    // `job.path` is an override from the Base ComboBox (see action_bar.rs +
+    // worker/paths.rs). None → use the hardcoded DIT_PATH. Only the main DiT
+    // path is overridable; CLIP / T5 / VAE stay on their hardcoded consts.
+    let dit_path: &str = job.path.as_deref().unwrap_or(DIT_PATH);
+    log::info!("FLUX: loading DiT from {dit_path}");
     let t0 = Instant::now();
-    if !Path::new(DIT_PATH).exists() {
+    if !Path::new(dit_path).exists() {
         return Err(RunError::Other(format!(
-            "FLUX DiT weights not found at {DIT_PATH}"
+            "FLUX DiT weights not found at {dit_path}"
         )));
     }
-    let mut dit = Flux1DiT::load(DIT_PATH, &device)
+    // GGUF guard: Flux1DiT is BlockOffloader-only (pinned host memory +
+    // dual-GPU-slot ping-pong). The GGUF loader returns a HashMap<String,
+    // Tensor> already dequanted and resident on GPU, which is fundamentally
+    // incompatible with BlockOffloader's mmap-streaming design. Resident-mode
+    // FLUX DiT would need a non-trivial refactor of `Flux1DiT::forward` to
+    // pull blocks from a HashMap instead of `self.offloader.await_block(i)`.
+    // AGENT-DEFAULT: fail fast with a clear error rather than silently
+    // loading a 6 GB file via the wrong path. Tracked as follow-up work.
+    if dit_path.to_ascii_lowercase().ends_with(".gguf") {
+        return Err(RunError::Other(
+            "FLUX 1 DiT GGUF not yet supported: Flux1DiT uses BlockOffloader \
+             (streaming pinned-host + dual-GPU-slot) which can't consume a \
+             pre-loaded HashMap. Use .safetensors for FLUX for now."
+                .to_string(),
+        ));
+    }
+    let mut dit = Flux1DiT::load(dit_path, &device)
         .map_err(|e| RunError::Other(format!("FLUX DiT load: {e:?}")))?;
     log::info!("FLUX: DiT loaded in {:.1}s", t0.elapsed().as_secs_f32());
 

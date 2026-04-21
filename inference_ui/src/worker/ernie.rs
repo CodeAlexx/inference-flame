@@ -318,40 +318,108 @@ fn run_inner_body(
     drain_pending(ui_rx, pending)?;
 
     // -------- 3. Load ERNIE-Image DiT (all blocks resident) --------
-    if !Path::new(TRANSFORMER_DIR).exists() {
-        return Err(RunError::Other(format!(
-            "ERNIE transformer dir not found at {TRANSFORMER_DIR}"
-        )));
-    }
-    log::info!("ERNIE: loading DiT from {TRANSFORMER_DIR}");
     let t1 = Instant::now();
-    let shard_paths = {
-        let mut paths = Vec::new();
-        for entry in std::fs::read_dir(TRANSFORMER_DIR)
-            .map_err(|e| RunError::Other(format!("read_dir {TRANSFORMER_DIR}: {e}")))?
-        {
-            let p = entry
-                .map_err(|e| RunError::Other(format!("read_dir entry: {e}")))?
-                .path();
-            if p.extension().and_then(|s| s.to_str()) == Some("safetensors") {
-                paths.push(p.to_string_lossy().into_owned());
+    let mut all_weights = std::collections::HashMap::new();
+
+    // Base-ComboBox override: if `job.path` is Some AND the file exists,
+    // treat it as a direct single-file load (either .gguf or .safetensors).
+    // This takes precedence over the dir scan below so a specific user
+    // selection always wins.
+    let override_path: Option<&str> = job.path.as_deref();
+    let override_file_exists = matches!(override_path, Some(p) if Path::new(p).is_file());
+
+    if override_file_exists {
+        let path = override_path.unwrap();
+        let lower = path.to_ascii_lowercase();
+        if lower.ends_with(".gguf") {
+            log::info!("ERNIE: loading GGUF from {path} (UI override)");
+            all_weights = inference_flame::gguf::load_file_gguf(
+                Path::new(path),
+                device.clone(),
+            )
+            .map_err(|e| RunError::Other(format!("ERNIE GGUF load: {e:?}")))?;
+        } else if lower.ends_with(".safetensors") {
+            log::info!("ERNIE: loading safetensors from {path} (UI override)");
+            let partial = flame_core::serialization::load_file(Path::new(path), &device)
+                .map_err(|e| RunError::Other(format!("load {path}: {e:?}")))?;
+            for (k, v) in partial {
+                all_weights.insert(k, v);
             }
-        }
-        paths.sort();
-        if paths.is_empty() {
+        } else {
             return Err(RunError::Other(format!(
-                "no .safetensors shards in {TRANSFORMER_DIR}"
+                "ERNIE: override path has unsupported extension: {path}"
             )));
         }
-        paths
-    };
+    } else {
+        // Fall back to the directory scan. Mixing types is rejected with a
+        // clear error. Extension match is case-insensitive (fixes P1-2 from
+        // SKEPTIC_GGUF_WIRING.md — a file named `model.GGUF` previously
+        // wouldn't match `Some("gguf")` literal).
+        if !Path::new(TRANSFORMER_DIR).exists() {
+            return Err(RunError::Other(format!(
+                "ERNIE transformer dir not found at {TRANSFORMER_DIR}"
+            )));
+        }
+        log::info!("ERNIE: loading DiT from {TRANSFORMER_DIR}");
+        let (safe_paths, gguf_paths): (Vec<String>, Vec<String>) = {
+            let mut safe = Vec::new();
+            let mut gguf = Vec::new();
+            for entry in std::fs::read_dir(TRANSFORMER_DIR)
+                .map_err(|e| RunError::Other(format!("read_dir {TRANSFORMER_DIR}: {e}")))?
+            {
+                let p = entry
+                    .map_err(|e| RunError::Other(format!("read_dir entry: {e}")))?
+                    .path();
+                // Case-insensitive extension match. Linux preserves case in
+                // filenames; `model.GGUF` and `model.gguf` are both real files.
+                let ext_lower = p
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.to_ascii_lowercase());
+                match ext_lower.as_deref() {
+                    Some("safetensors") => safe.push(p.to_string_lossy().into_owned()),
+                    Some("gguf") => gguf.push(p.to_string_lossy().into_owned()),
+                    _ => {}
+                }
+            }
+            safe.sort();
+            gguf.sort();
+            (safe, gguf)
+        };
 
-    let mut all_weights = std::collections::HashMap::new();
-    for path in &shard_paths {
-        let partial = flame_core::serialization::load_file(Path::new(path), &device)
-            .map_err(|e| RunError::Other(format!("load shard {path}: {e:?}")))?;
-        for (k, v) in partial {
-            all_weights.insert(k, v);
+        if !gguf_paths.is_empty() {
+            if !safe_paths.is_empty() {
+                return Err(RunError::Other(format!(
+                    "ERNIE transformer dir has BOTH .gguf and .safetensors files: {TRANSFORMER_DIR}. \
+                     Pick one — remove the unused set."
+                )));
+            }
+            if gguf_paths.len() > 1 {
+                return Err(RunError::Other(format!(
+                    "ERNIE: multiple .gguf files in {TRANSFORMER_DIR}; only single-file GGUF supported. \
+                     Got: {gguf_paths:?}"
+                )));
+            }
+            let path = &gguf_paths[0];
+            log::info!("ERNIE: loading GGUF from {path}");
+            all_weights = inference_flame::gguf::load_file_gguf(
+                Path::new(path),
+                device.clone(),
+            )
+            .map_err(|e| RunError::Other(format!("ERNIE GGUF load: {e:?}")))?;
+        } else {
+            if safe_paths.is_empty() {
+                return Err(RunError::Other(format!(
+                    "no .safetensors or .gguf in {TRANSFORMER_DIR}"
+                )));
+            }
+            for path in &safe_paths {
+                let partial = flame_core::serialization::load_file(Path::new(path), &device)
+                    .map_err(|e| RunError::Other(format!("load shard {path}: {e:?}")))?;
+                for (k, v) in partial {
+                    all_weights.insert(k, v);
+                }
+            }
         }
     }
     let config = ErnieImageConfig::default();

@@ -26,6 +26,7 @@ pub mod ernie;
 pub mod flux;
 pub mod klein;
 pub mod mock;
+pub mod paths;
 pub mod qwenimage;
 pub mod sd15;
 pub mod sd3;
@@ -108,7 +109,16 @@ impl ModelKind {
     /// schedule differs and that lives in our worker, not the brief). If a
     /// future variant needs to differ, split the match here.
     pub fn from_model_string(s: &str) -> Self {
-        let lower = s.to_ascii_lowercase();
+        // Strip trailing `.gguf` / `.safetensors` so the match arms below
+        // don't need to enumerate both variants of every filename. The
+        // downstream workers dispatch on the suffix themselves when deciding
+        // loader path (GGUF dequant vs safetensors mmap).
+        let raw_lower = s.to_ascii_lowercase();
+        let trimmed = raw_lower
+            .strip_suffix(".gguf")
+            .or_else(|| raw_lower.strip_suffix(".safetensors"))
+            .unwrap_or(&raw_lower);
+        let lower = trimmed;
         if lower.contains("z-image-turbo") || lower.contains("zimage-turbo") {
             Self::ZImageTurbo
         } else if lower.contains("z-image-base") || lower.contains("zimage-base") {
@@ -271,6 +281,17 @@ pub struct GenerateJob {
     pub seed: i64,
     pub sampler: String,
     pub scheduler: String,
+    /// Absolute path to the main DiT/UNet weights file (or directory) chosen
+    /// via the Base ComboBox. `None` means the worker should fall back to its
+    /// hardcoded default path (backward-compat — preserves the existing
+    /// variant-based dispatch for Z-Image base/turbo, Klein 4B/9B, etc.).
+    /// When `Some`, this OVERRIDES the worker's `const *_PATH` for the main
+    /// DiT/UNet load ONLY. Text encoder / VAE paths stay hardcoded — the
+    /// ComboBox drives the main checkpoint selection, not the satellite
+    /// encoders. Used primarily so a user's GGUF selection in the UI actually
+    /// reaches the load site (without this, every `.ends_with(".gguf")` check
+    /// in the workers is dead code; see SKEPTIC_GGUF_WIRING.md P0-1).
+    pub path: Option<String>,
 }
 
 /// Owned by `FlameInferenceApp`. Drop = channel close = worker shutdown.

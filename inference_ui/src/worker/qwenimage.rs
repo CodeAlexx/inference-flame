@@ -358,16 +358,41 @@ fn run_inner_body(
     drain_pending(ui_rx, pending)?;
 
     // -------- 2. Load Qwen-Image DiT (BlockOffloader) --------
-    for shard in DIT_SHARDS {
+    // Base-ComboBox override wins. None → fall back to the 9 hardcoded shards.
+    // Single-file override (e.g. a .gguf) turns into a 1-element slice.
+    let override_shard: Option<String> = job.path.clone();
+    let shard_slice: Vec<&str> = match override_shard.as_deref() {
+        Some(p) => vec![p],
+        None => DIT_SHARDS.iter().copied().collect(),
+    };
+    for shard in &shard_slice {
         if !Path::new(shard).exists() {
             return Err(RunError::Other(format!(
                 "Qwen-Image DiT shard not found: {shard}"
             )));
         }
     }
-    log::info!("Qwen-Image: loading DiT (BlockOffloader, 9 shards)");
+    log::info!(
+        "Qwen-Image: loading DiT (BlockOffloader, {} shards)",
+        shard_slice.len()
+    );
     let t0 = Instant::now();
-    let mut dit = QwenImageDit::load(DIT_SHARDS, &device)
+    // GGUF guard: QwenImageDit is BlockOffloader-only. Same reasoning as
+    // FLUX/Chroma: BlockOffloader wants mmap'd safetensors, not a pre-loaded
+    // HashMap. AGENT-DEFAULT: fail fast with a clear error.
+    if shard_slice
+        .iter()
+        .any(|p| p.to_ascii_lowercase().ends_with(".gguf"))
+    {
+        return Err(RunError::Other(
+            "Qwen-Image DiT GGUF not yet supported: QwenImageDit uses \
+             BlockOffloader (streaming pinned-host + dual-GPU-slot) which \
+             can't consume a pre-loaded HashMap. Use .safetensors for \
+             Qwen-Image for now."
+                .to_string(),
+        ));
+    }
+    let mut dit = QwenImageDit::load(&shard_slice, &device)
         .map_err(|e| RunError::Other(format!("DiT load: {e:?}")))?;
     log::info!("Qwen-Image: DiT loaded in {:.1}s", t0.elapsed().as_secs_f32());
 

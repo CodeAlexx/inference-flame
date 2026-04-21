@@ -276,16 +276,40 @@ fn run_inner_body(
     drain_pending(ui_rx, pending)?;
 
     // -------- 2. Load Chroma DiT --------
-    for path in CHROMA_DIT_SHARDS {
+    // `job.path` is an override from the Base ComboBox (single file) —
+    // promote it to a 1-element slice so the sharded-loader signature still
+    // works. When None, fall back to the hardcoded HF-snapshot shards.
+    // Only the main DiT is overridable; T5 / VAE stay on their consts.
+    let override_shard: Option<String> = job.path.clone();
+    let shard_slice: Vec<&str> = match override_shard.as_deref() {
+        Some(p) => vec![p],
+        None => CHROMA_DIT_SHARDS.iter().copied().collect(),
+    };
+    for path in &shard_slice {
         if !Path::new(path).exists() {
             return Err(RunError::Other(format!(
                 "Chroma DiT shard not found: {path}"
             )));
         }
     }
-    log::info!("Chroma: loading DiT ({} shards)", CHROMA_DIT_SHARDS.len());
+    log::info!("Chroma: loading DiT ({} shards)", shard_slice.len());
     let t0 = Instant::now();
-    let mut dit = ChromaDit::load(CHROMA_DIT_SHARDS, &device)
+    // GGUF guard: ChromaDit is BlockOffloader-only. Same reasoning as the
+    // FLUX worker: the BlockOffloader is inherently mmap-streaming and
+    // can't consume a pre-loaded HashMap from the GGUF dequant path.
+    // AGENT-DEFAULT: fail fast with a clear error.
+    if shard_slice
+        .iter()
+        .any(|p| p.to_ascii_lowercase().ends_with(".gguf"))
+    {
+        return Err(RunError::Other(
+            "Chroma DiT GGUF not yet supported: ChromaDit uses BlockOffloader \
+             (streaming pinned-host + dual-GPU-slot) which can't consume a \
+             pre-loaded HashMap. Use .safetensors for Chroma for now."
+                .to_string(),
+        ));
+    }
+    let mut dit = ChromaDit::load(&shard_slice, &device)
         .map_err(|e| RunError::Other(format!("Chroma DiT load: {e:?}")))?;
     log::info!("Chroma: DiT loaded in {:.1}s", t0.elapsed().as_secs_f32());
 

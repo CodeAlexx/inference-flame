@@ -20,7 +20,7 @@ use egui::{vec2, Align, Button, Color32, Layout, RichText, Stroke, Ui};
 
 use crate::state::{AppState, Mode, QueueJob};
 use crate::tokens::{Tokens, FONT_MONO};
-use crate::worker::{GenerateJob, ModelKind, UiMsg};
+use crate::worker::{paths::resolve_image_model_path, GenerateJob, ModelKind, UiMsg};
 
 pub fn show(
     ui: &mut Ui,
@@ -182,6 +182,11 @@ fn build_job_from_state(id: u64, state: &AppState) -> GenerateJob {
     // we don't recognize falls through to Mock (synthetic gradient) so
     // the UI still produces a placeholder image.
     let model_kind = ModelKind::from_model_string(&cn.model);
+    // Resolve the ComboBox filename → absolute disk path so the worker's
+    // hardcoded .safetensors default doesn't silently override a GGUF
+    // selection. `None` means "worker uses its hardcoded default path" —
+    // see `worker/paths.rs` for the per-ModelKind resolution strategy.
+    let path = resolve_image_model_path(&cn.model, model_kind);
     GenerateJob {
         id,
         model_kind,
@@ -194,5 +199,6 @@ fn build_job_from_state(id: u64, state: &AppState) -> GenerateJob {
         seed: state.seed,
         sampler: cn.sampler.clone(),
         scheduler: cn.scheduler.clone(),
+        path,
     }
 }

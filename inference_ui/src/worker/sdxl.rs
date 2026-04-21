@@ -323,16 +323,29 @@ fn run_inner_body(
     drain_pending(ui_rx, pending)?;
 
     // -------- 2. Load SDXL UNet (all weights on GPU) --------
-    if !Path::new(MODEL_PATH).exists() {
+    // Base-ComboBox override wins; `None` falls back to hardcoded MODEL_PATH.
+    let model_path: &str = job.path.as_deref().unwrap_or(MODEL_PATH);
+    if !Path::new(model_path).exists() {
         return Err(RunError::Other(format!(
-            "SDXL UNet not found at {MODEL_PATH} \
+            "SDXL UNet not found at {model_path} \
              (expected pre-extracted BF16 safetensors)"
         )));
     }
-    log::info!("SDXL: loading UNet from {MODEL_PATH}");
+    log::info!("SDXL: loading UNet from {model_path}");
     let t0 = Instant::now();
-    let mut model = SDXLUNet::from_safetensors_all_gpu(MODEL_PATH, &device)
-        .map_err(|e| RunError::Other(format!("UNet load: {e:?}")))?;
+    let mut model = if model_path.to_ascii_lowercase().ends_with(".gguf") {
+        log::info!("SDXL: loading GGUF from {model_path}");
+        let weights = inference_flame::gguf::load_file_gguf(
+            Path::new(model_path),
+            device.clone(),
+        )
+        .map_err(|e| RunError::Other(format!("SDXL GGUF load: {e:?}")))?;
+        SDXLUNet::from_weights_all_gpu(weights, model_path.to_string(), &device)
+            .map_err(|e| RunError::Other(format!("UNet build: {e:?}")))?
+    } else {
+        SDXLUNet::from_safetensors_all_gpu(model_path, &device)
+            .map_err(|e| RunError::Other(format!("UNet load: {e:?}")))?
+    };
     log::info!("SDXL: UNet loaded in {:.1}s", t0.elapsed().as_secs_f32());
 
     drain_pending(ui_rx, pending)?;

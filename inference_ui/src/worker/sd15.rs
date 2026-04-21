@@ -293,16 +293,29 @@ fn run_inner_body(
     drain_pending(ui_rx, pending)?;
 
     // -------- 2. Load SD 1.5 UNet --------
-    if !Path::new(&unet_path()).exists() {
+    // Base-ComboBox override wins; `None` falls back to the HF-snapshot
+    // default (unet_path()).
+    let unet_p: String = job.path.clone().unwrap_or_else(unet_path);
+    if !Path::new(&unet_p).exists() {
         return Err(RunError::Other(format!(
-            "SD 1.5 UNet not found at {}",
-            unet_path()
+            "SD 1.5 UNet not found at {unet_p}"
         )));
     }
-    log::info!("SD 1.5: loading UNet from {}", unet_path());
+    log::info!("SD 1.5: loading UNet from {unet_p}");
     let t0 = Instant::now();
-    let mut model = SD15UNet::from_safetensors_all_gpu(&unet_path(), &device)
-        .map_err(|e| RunError::Other(format!("UNet load: {e:?}")))?;
+    let mut model = if unet_p.to_ascii_lowercase().ends_with(".gguf") {
+        log::info!("SD 1.5: loading GGUF from {unet_p}");
+        let weights = inference_flame::gguf::load_file_gguf(
+            Path::new(&unet_p),
+            device.clone(),
+        )
+        .map_err(|e| RunError::Other(format!("SD 1.5 GGUF load: {e:?}")))?;
+        SD15UNet::from_weights_all_gpu(weights, unet_p.clone(), &device)
+            .map_err(|e| RunError::Other(format!("UNet build: {e:?}")))?
+    } else {
+        SD15UNet::from_safetensors_all_gpu(&unet_p, &device)
+            .map_err(|e| RunError::Other(format!("UNet load: {e:?}")))?
+    };
     log::info!("SD 1.5: UNet loaded in {:.1}s", t0.elapsed().as_secs_f32());
 
     drain_pending(ui_rx, pending)?;

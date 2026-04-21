@@ -18,29 +18,61 @@ use crate::widgets::{combo_enum, combo_str, flat_collapsing};
 // strings are matched by `ModelKind::from_model_string` to dispatch to the
 // real Z-Image inference worker. Other entries here still route to Mock
 // until those models get wired up.
+// Placeholder model list. Matches `ModelKind::from_model_string` dispatch
+// arms; the `.gguf` entries coexist with `.safetensors` because each worker
+// dispatches on the resolved path's suffix (see e.g. `worker/zimage.rs`
+// `ensure_dit`). Keeps two GGUF quant variants per family (Q4_K_M + Q8_0)
+// as a reasonable default — user renames their actual file to match or we
+// surface a "not found at <path>" error. AGENT-DEFAULT: chose Q4_K_M + Q8_0
+// over enumerating every possible type (Q2..Q6) to avoid ComboBox bloat.
+// GGUF DiT files that use BlockOffloader (flux, chroma, qwen-image) are
+// still listed so the user sees them, but the workers return an explicit
+// "GGUF + BlockOffloader not yet supported" error at load time.
 const IMAGE_MODELS: &[&str] = &[
     "z-image-base.safetensors",
+    "z-image-base-Q4_K_M.gguf",
+    "z-image-base-Q8_0.gguf",
     "z-image-turbo.safetensors",
+    "z-image-turbo-Q4_K_M.gguf",
+    "z-image-turbo-Q8_0.gguf",
     "flux1-dev.safetensors",
+    "flux1-dev-Q4_K_M.gguf",
+    "flux1-dev-Q8_0.gguf",
     "flux1-schnell.safetensors",
     "sd3.5-large.safetensors",
     "sdxl-base-1.0.safetensors",
+    "sdxl-base-1.0-Q4_K_M.gguf",
+    "sdxl-base-1.0-Q8_0.gguf",
     "sdxl-turbo.safetensors",
     "pony-diffusion-v6.safetensors",
     // Klein (Flux 2 base) variants. Filenames intentionally include the
     // size token (4b / 9b) so `ModelKind::from_model_string` routes each
     // to its correct dispatch arm.
     "klein-4b.safetensors",
+    "klein-4b-Q4_K_M.gguf",
+    "klein-4b-Q8_0.gguf",
     "klein-9b.safetensors",
+    "klein-9b-Q4_K_M.gguf",
+    "klein-9b-Q8_0.gguf",
     "chroma.safetensors",
+    "chroma-Q4_K_M.gguf",
+    "chroma-Q8_0.gguf",
     // Batch C additions. Filename strings carry the discriminator that
     // `ModelKind::from_model_string` matches on (`sd3` / `qwen` / `ernie` /
     // `anima`). The actual on-disk paths are hardcoded inside each worker —
     // see `worker/{sd3,qwenimage,ernie,anima}.rs`.
     "sd3.5-medium.safetensors",
+    "sd3.5-medium-Q4_K_M.gguf",
+    "sd3.5-medium-Q8_0.gguf",
     "qwen-image.safetensors",
+    "qwen-image-Q4_K_M.gguf",
+    "qwen-image-Q8_0.gguf",
     "ernie-image-8b.safetensors",
+    "ernie-image-8b-Q4_K_M.gguf",
+    "ernie-image-8b-Q8_0.gguf",
     "anima-2b.safetensors",
+    "anima-2b-Q4_K_M.gguf",
+    "anima-2b-Q8_0.gguf",
     // Batch D additions — legacy VE image models (ε-prediction, scaled-linear
     // β schedule, NOT flow). `sdxl-*.safetensors` entries above already
     // dispatch to the Sdxl arm via `ModelKind::from_model_string`.
@@ -48,7 +80,11 @@ const IMAGE_MODELS: &[&str] = &[
     // respective ModelKind arms — see `worker/{sdxl,sd15,cascade}.rs`.
     // Actual on-disk weight paths are hardcoded inside each worker.
     "sd15.safetensors",
+    "sd15-Q4_K_M.gguf",
+    "sd15-Q8_0.gguf",
     "stable-cascade.safetensors",
+    "stable-cascade-Q4_K_M.gguf",
+    "stable-cascade-Q8_0.gguf",
 ];
 
 const VIDEO_MODELS: &[&str] = &[

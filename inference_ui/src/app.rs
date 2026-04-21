@@ -435,13 +435,15 @@ impl FlameInferenceApp {
     /// Ctrl+Enter shortcut. Mirrors `sections::action_bar`'s click path:
     /// mint id → snapshot → pre-populate running slot → send to worker.
     fn action_generate(&mut self) {
-        use crate::worker::{GenerateJob, ModelKind, UiMsg};
+        use crate::worker::{paths::resolve_image_model_path, GenerateJob, ModelKind, UiMsg};
         let id = self.next_job_id;
         self.next_job_id += 1;
         let cn = self.state.current();
+        let model_kind = ModelKind::from_model_string(&cn.model);
+        let path = resolve_image_model_path(&cn.model, model_kind);
         let job = GenerateJob {
             id,
-            model_kind: ModelKind::from_model_string(&cn.model),
+            model_kind,
             prompt: self.state.prompt.clone(),
             negative: self.state.negative.clone(),
             width: cn.width,
@@ -451,6 +453,7 @@ impl FlameInferenceApp {
             seed: self.state.seed,
             sampler: cn.sampler.clone(),
             scheduler: cn.scheduler.clone(),
+            path,
         };
         let (w, h, steps, sampler) = (cn.width, cn.height, cn.steps, cn.sampler.clone());
         self.state.queue.running = Some(QueueJob {
@@ -471,13 +474,15 @@ impl FlameInferenceApp {
 
     /// Shared +Queue logic for the Ctrl+Shift+Enter shortcut.
     fn action_queue(&mut self) {
-        use crate::worker::{GenerateJob, ModelKind, UiMsg};
+        use crate::worker::{paths::resolve_image_model_path, GenerateJob, ModelKind, UiMsg};
         let id = self.next_job_id;
         self.next_job_id += 1;
         let cn = self.state.current();
+        let model_kind = ModelKind::from_model_string(&cn.model);
+        let path = resolve_image_model_path(&cn.model, model_kind);
         let job = GenerateJob {
             id,
-            model_kind: ModelKind::from_model_string(&cn.model),
+            model_kind,
             prompt: self.state.prompt.clone(),
             negative: self.state.negative.clone(),
             width: cn.width,
@@ -487,6 +492,7 @@ impl FlameInferenceApp {
             seed: self.state.seed,
             sampler: cn.sampler.clone(),
             scheduler: cn.scheduler.clone(),
+            path,
         };
         let (w, h, steps, sampler) = (cn.width, cn.height, cn.steps, cn.sampler.clone());
         self.state.queue.queued.push(QueueJob {

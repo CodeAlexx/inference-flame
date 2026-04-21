@@ -256,6 +256,32 @@ fn run_inner_body(
 ) -> Result<ColorImage, RunError> {
     let device = state.device.clone();
 
+    // Resolve the DiT/VAE checkpoint path ONCE up-front: `job.path` override
+    // from the Base ComboBox wins, else the hardcoded MODEL_PATH default.
+    // Bind the owned storage here so every downstream borrow (&str) outlives
+    // its usage site.
+    let model_path_owned: String = job
+        .path
+        .clone()
+        .unwrap_or_else(|| MODEL_PATH.to_string());
+    let model_path: &str = model_path_owned.as_str();
+
+    // P1 VAE guard — fire BEFORE the 28-step denoise so the user learns
+    // about the GGUF-VAE limitation immediately, not after ~2 minutes of
+    // denoising wasted work. SD3's VAE lives inside the same safetensors
+    // blob as the DiT. If the user picked a GGUF DiT, the GGUF file almost
+    // certainly doesn't ship VAE weights under the expected
+    // `first_stage_model.*` keys — the downstream `LdmVAEDecoder::from_safetensors`
+    // call will fail. Surface the clearer error early.
+    if model_path.to_ascii_lowercase().ends_with(".gguf") {
+        return Err(RunError::Other(
+            "SD3.5 Medium GGUF VAE decode not yet supported: GGUF DiT files \
+             don't ship the embedded SD3 VAE weights. Supply a .safetensors \
+             SD3 DiT for now, or wait for separate-VAE support to land."
+                .to_string(),
+        ));
+    }
+
     // -------- 1. Triple text encoder pipeline (sequential load → drop) --------
     log::info!("SD3.5 Medium: encoding text (CLIP-L + CLIP-G + T5-XXL)");
     let t_enc = Instant::now();
@@ -273,16 +299,25 @@ fn run_inner_body(
     drain_pending(ui_rx, pending)?;
 
     // -------- 2. Load SD3.5 Medium DiT (resident) --------
-    log::info!("SD3.5 Medium: loading DiT from {MODEL_PATH}");
-    if !Path::new(MODEL_PATH).exists() {
+    log::info!("SD3.5 Medium: loading DiT from {model_path}");
+    if !Path::new(model_path).exists() {
         return Err(RunError::Other(format!(
-            "SD3.5 Medium weights not found at {MODEL_PATH}"
+            "SD3.5 Medium weights not found at {model_path}"
         )));
     }
     let t0 = Instant::now();
-    let resident = load_sd3_all(MODEL_PATH, &device)
-        .map_err(|e| RunError::Other(format!("SD3 load: {e:?}")))?;
-    let mut model = SD3MMDiT::new(MODEL_PATH.to_string(), resident, device.clone());
+    // NB: the early guard above already returns for .gguf so this branch is
+    // unreachable today — kept so the pre-extracted resident path stays
+    // available if/when the VAE side grows a separate-file load option.
+    let resident = if model_path.to_ascii_lowercase().ends_with(".gguf") {
+        log::info!("SD3.5 Medium: loading GGUF from {model_path}");
+        inference_flame::gguf::load_file_gguf(Path::new(model_path), device.clone())
+            .map_err(|e| RunError::Other(format!("SD3 GGUF load: {e:?}")))?
+    } else {
+        load_sd3_all(model_path, &device)
+            .map_err(|e| RunError::Other(format!("SD3 load: {e:?}")))?
+    };
+    let mut model = SD3MMDiT::new(model_path.to_string(), resident, device.clone());
     log::info!(
         "SD3.5 Medium: DiT loaded in {:.1}s — depth={}, hidden={}, heads={}",
         t0.elapsed().as_secs_f32(),
@@ -422,9 +457,13 @@ fn run_inner_body(
     log::info!("SD3.5 Medium: DiT + context dropped, pool flushed before VAE");
 
     // -------- 6. VAE decode (load + use + drop) --------
+    // SD3's VAE lives inside the same safetensors blob as the DiT. The
+    // .gguf-path early guard at the top of this function already rejected
+    // that case before encode/denoise, so by the time we get here `model_path`
+    // is guaranteed to be a safetensors file containing both DiT + VAE keys.
     let t_vae = Instant::now();
     let vae = LdmVAEDecoder::from_safetensors(
-        MODEL_PATH,
+        model_path,
         VAE_IN_CHANNELS,
         VAE_SCALE,
         VAE_SHIFT,

@@ -399,7 +399,8 @@ fn run_inner_body(
     drain_pending(ui_rx, pending)?;
 
     // -------- 3. DiT (lazy load, swapped on variant change) --------
-    ensure_dit(state, variant)?;
+    // Thread the Base-ComboBox path override (None → variant.dit_path()).
+    ensure_dit(state, variant, job.path.as_deref())?;
 
     // -------- 4. VAE decoder (lazy load, persistent) --------
     ensure_vae(state)?;
@@ -555,7 +556,11 @@ fn ensure_encoder(state: &mut ZImageState) -> Result<(), RunError> {
     Ok(())
 }
 
-fn ensure_dit(state: &mut ZImageState, variant: ZImageVariant) -> Result<(), RunError> {
+fn ensure_dit(
+    state: &mut ZImageState,
+    variant: ZImageVariant,
+    override_path: Option<&str>,
+) -> Result<(), RunError> {
     // Variant change → drop existing DiT before loading the new one.
     if state.dit_variant != Some(variant) {
         state.dit = None;
@@ -564,7 +569,8 @@ fn ensure_dit(state: &mut ZImageState, variant: ZImageVariant) -> Result<(), Run
     if state.dit.is_some() {
         return Ok(());
     }
-    let path = variant.dit_path();
+    // Base-ComboBox override wins; `None` falls back to variant default.
+    let path: &str = override_path.unwrap_or(variant.dit_path());
     let p = Path::new(path);
     if !p.exists() {
         return Err(RunError::Other(format!(
@@ -576,7 +582,15 @@ fn ensure_dit(state: &mut ZImageState, variant: ZImageVariant) -> Result<(), Run
         variant
     );
     let t0 = Instant::now();
-    let weights: HashMap<String, Tensor> = if p.is_dir() {
+    let lower = path.to_ascii_lowercase();
+    let weights: HashMap<String, Tensor> = if lower.ends_with(".gguf") {
+        // GGUF path: Phase 1 loader dequantizes Q-blocks → BF16, uploads, and
+        // applies the standard key-name remap. NextDiT::new_resident accepts
+        // the same key set as the safetensors loader, so no extra wiring.
+        log::info!("Z-Image: loading GGUF from {path}");
+        inference_flame::gguf::load_file_gguf(p, state.device.clone())
+            .map_err(|e| RunError::Other(format!("GGUF load: {e:?}")))?
+    } else if p.is_dir() {
         // Directory of sharded safetensors — iterate, sort, load, merge.
         // Same pattern as zimage_infer.rs.
         let mut weights = HashMap::new();

@@ -278,16 +278,27 @@ fn run_inner_body(
     // Anima — the adapter weights live in the DiT checkpoint under
     // `net.llm_adapter.*`. ~3.9 GB, comfortably fits alongside the
     // Qwen3-0.6B encoder.
-    if !Path::new(MODEL_PATH).exists() {
+    //
+    // Base-ComboBox override wins; `None` falls back to hardcoded MODEL_PATH.
+    let model_path: &str = job.path.as_deref().unwrap_or(MODEL_PATH);
+    if !Path::new(model_path).exists() {
         return Err(RunError::Other(format!(
-            "Anima model not found at {MODEL_PATH}"
+            "Anima model not found at {model_path}"
         )));
     }
-    log::info!("Anima: loading DiT from {MODEL_PATH}");
+    log::info!("Anima: loading DiT from {model_path}");
     let t0 = Instant::now();
-    let all_weights = load_all_weights(MODEL_PATH, &device)
-        .map_err(|e| RunError::Other(format!("weight load: {e:?}")))?;
-    let mut model = Anima::new_all_on_gpu(MODEL_PATH.to_string(), all_weights, device.clone());
+    let all_weights = if model_path.to_ascii_lowercase().ends_with(".gguf") {
+        // GGUF path: loader dequants + strips standard top-level prefixes.
+        // Anima accepts the same key set as the safetensors loader.
+        log::info!("Anima: loading GGUF from {model_path}");
+        inference_flame::gguf::load_file_gguf(Path::new(model_path), device.clone())
+            .map_err(|e| RunError::Other(format!("Anima GGUF load: {e:?}")))?
+    } else {
+        load_all_weights(model_path, &device)
+            .map_err(|e| RunError::Other(format!("weight load: {e:?}")))?
+    };
+    let mut model = Anima::new_all_on_gpu(model_path.to_string(), all_weights, device.clone());
     log::info!("Anima: DiT loaded in {:.1}s", t0.elapsed().as_secs_f32());
 
     drain_pending(ui_rx, pending)?;

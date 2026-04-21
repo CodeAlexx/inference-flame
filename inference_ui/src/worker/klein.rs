@@ -376,7 +376,8 @@ fn run_inner_body(
     drain_pending(ui_rx, pending)?;
 
     // -------- 3. Load DiT (resident, fall back to offloaded for 9B) --------
-    let dit = ensure_dit(variant)?;
+    // Thread the Base-ComboBox path override (None → use variant.dit_path()).
+    let dit = ensure_dit(variant, job.path.as_deref(), &device)?;
 
     drain_pending(ui_rx, pending)?;
 
@@ -726,8 +727,13 @@ fn load_sharded_qwen3(
 /// `klein9b_infer.rs::Model::OnGpu / Offloaded` selection. Klein 4B always
 /// loads resident — at ~7 GB it fits comfortably even after VAE/encoder
 /// considerations.
-fn ensure_dit(variant: KleinVariant) -> Result<DitInstance, RunError> {
-    let path = variant.dit_path();
+fn ensure_dit(
+    variant: KleinVariant,
+    override_path: Option<&str>,
+    device: &Arc<CudaDevice>,
+) -> Result<DitInstance, RunError> {
+    // Base-ComboBox override wins; `None` falls back to variant default.
+    let path: &str = override_path.unwrap_or(variant.dit_path());
     if !Path::new(path).exists() {
         return Err(RunError::Other(format!(
             "Klein {:?} DiT weights not found at {path}",
@@ -736,36 +742,64 @@ fn ensure_dit(variant: KleinVariant) -> Result<DitInstance, RunError> {
     }
     log::info!("Klein {:?}: loading DiT from {path}", variant);
     let t0 = Instant::now();
+    let is_gguf = path.to_ascii_lowercase().ends_with(".gguf");
 
     let dit = match variant {
         KleinVariant::Klein4B => {
             // 4B always fits resident.
-            let m = KleinTransformer::from_safetensors(path)
-                .map_err(|e| RunError::Other(format!("Klein 4B load: {e:?}")))?;
+            let m = if is_gguf {
+                log::info!("Klein 4B: loading GGUF from {path}");
+                let weights = inference_flame::gguf::load_file_gguf(
+                    Path::new(path),
+                    device.clone(),
+                )
+                .map_err(|e| RunError::Other(format!("Klein 4B GGUF load: {e:?}")))?;
+                KleinTransformer::from_weights(weights)
+                    .map_err(|e| RunError::Other(format!("Klein 4B build: {e:?}")))?
+            } else {
+                KleinTransformer::from_safetensors(path)
+                    .map_err(|e| RunError::Other(format!("Klein 4B load: {e:?}")))?
+            };
             DitInstance::OnGpu(m)
         }
         KleinVariant::Klein9B => {
-            // Try resident first; fall back to offloaded on failure.
-            // Mirrors klein9b_infer.rs lines 135-144.
-            match KleinTransformer::from_safetensors(path) {
-                Ok(m) => {
-                    log::info!("Klein 9B: resident load succeeded");
-                    DitInstance::OnGpu(m)
-                }
-                Err(e) => {
-                    log::warn!(
-                        "Klein 9B: resident load failed ({e:?}), falling back to offloaded"
-                    );
-                    // Pool flush before retrying — the failed resident attempt
-                    // may have left partial allocations behind.
-                    flame_core::cuda_alloc_pool::clear_pool_cache();
-                    flame_core::device::trim_cuda_mempool(0);
-                    let m = KleinOffloaded::from_safetensors(path).map_err(|e| {
-                        RunError::Other(format!(
-                            "Klein 9B offloaded fallback also failed: {e:?}"
-                        ))
-                    })?;
-                    DitInstance::Offloaded(m)
+            if is_gguf {
+                // GGUF only supports resident mode (no mmap → no Offloaded
+                // fallback). Most Q-quant 9B files dequant to ~18 GB BF16 —
+                // fits on a 24 GB card after the encoder drop, but no
+                // fallback if it doesn't.
+                log::info!("Klein 9B: loading GGUF from {path}");
+                let weights = inference_flame::gguf::load_file_gguf(
+                    Path::new(path),
+                    device.clone(),
+                )
+                .map_err(|e| RunError::Other(format!("Klein 9B GGUF load: {e:?}")))?;
+                let m = KleinTransformer::from_weights(weights)
+                    .map_err(|e| RunError::Other(format!("Klein 9B build: {e:?}")))?;
+                DitInstance::OnGpu(m)
+            } else {
+                // Try resident first; fall back to offloaded on failure.
+                // Mirrors klein9b_infer.rs lines 135-144.
+                match KleinTransformer::from_safetensors(path) {
+                    Ok(m) => {
+                        log::info!("Klein 9B: resident load succeeded");
+                        DitInstance::OnGpu(m)
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "Klein 9B: resident load failed ({e:?}), falling back to offloaded"
+                        );
+                        // Pool flush before retrying — the failed resident attempt
+                        // may have left partial allocations behind.
+                        flame_core::cuda_alloc_pool::clear_pool_cache();
+                        flame_core::device::trim_cuda_mempool(0);
+                        let m = KleinOffloaded::from_safetensors(path).map_err(|e| {
+                            RunError::Other(format!(
+                                "Klein 9B offloaded fallback also failed: {e:?}"
+                            ))
+                        })?;
+                        DitInstance::Offloaded(m)
+                    }
                 }
             }
         }
