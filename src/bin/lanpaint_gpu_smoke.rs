@@ -198,6 +198,7 @@ fn main() -> ExitCode {
         friction: 20.0,
         beta: 1.0,
         step_size: 0.15,
+        is_flow: true,
     };
     let lanpaint = LanPaint::new(
         cfg,

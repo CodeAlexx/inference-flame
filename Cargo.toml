@@ -136,6 +136,10 @@ name = "flux1_infer"
 path = "src/bin/flux1_infer.rs"
 
 [[bin]]
+name = "flux_inpaint"
+path = "src/bin/flux_inpaint.rs"
+
+[[bin]]
 name = "wan22_t2v_gen"
 path = "src/bin/wan22_t2v_gen.rs"
 
