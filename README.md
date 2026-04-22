@@ -87,6 +87,30 @@ LD_LIBRARY_PATH=/path/to/libtorch/lib \
   ./inference_ui/target/release/inference-ui
 ```
 
+## Turbo (experimental — Klein 9B)
+
+`--features turbo` enables `klein9b_infer_turbo`, a Klein 9B path whose block
+weights live in CUDA VMM-backed slots instead of `cudaMallocAsync` GPU buffers.
+Virtual addresses from `cuMemAddressReserve` stay stable across block swaps —
+the prerequisite for CUDA graph capture across the denoise loop (Phase 2).
+Slot residency is gated by `Arc<ResidentHandle>` refcount + an event recorded
+on the reader's compute stream at Drop, so eviction can't unmap pages while
+compute is still reading them.
+
+Hardware: NVIDIA GPU with `CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED`
+(Pascal+). On unsupported devices the binary errors out — no silent fallback.
+
+```bash
+cargo build -p inference-flame --features turbo --release
+LD_LIBRARY_PATH=/path/to/cudnn/lib \
+  target/release/klein9b_infer_turbo "your prompt here"
+```
+
+Default builds (turbo off) are unchanged. Bench numbers vs the existing
+`flame_diffusion::BlockOffloader` path land here once measured. Phase 1 wires
+Klein 9B only; the same pattern fans out to Chroma / ERNIE / FLUX / LTX-2 in
+follow-up phases (each is a near-clone of `forward_with_turbo`).
+
 ## Adapters & samplers
 
 | Crate | Path | What it adds |

@@ -1210,6 +1210,125 @@ impl KleinOffloaded {
         let img_out = modulate_pre(&img_out, &shift, &scale)?;
         linear3d(&img_out, &w["final_layer.linear.weight"])
     }
+
+    /// Forward pass that pulls block weights through a TurboBlockLoader (VMM
+    /// double-buffered). Mirrors `forward_with_offloader` exactly — the only
+    /// differences are the loader type and `await_block`'s return type.
+    ///
+    /// Behind `feature = "turbo"` so the default build never references the
+    /// turbo module.
+    #[cfg(feature = "turbo")]
+    pub fn forward_with_turbo(
+        &self,
+        img: &Tensor,
+        txt: &Tensor,
+        timesteps: &Tensor,
+        img_ids: &Tensor,
+        txt_ids: &Tensor,
+        loader: &mut crate::turbo::TurboBlockLoader,
+    ) -> Result<Tensor> {
+        let w = &self.shared;
+        let cfg = &self.config;
+
+        let mut img = linear3d(img, &w["img_in.weight"])?;
+        let mut txt = linear3d(txt, &w["txt_in.weight"])?;
+
+        let t_emb = timestep_embedding(timesteps, cfg.timestep_dim, 1000.0)?;
+        let t_emb_bf16 = t_emb.to_dtype(DType::BF16)?;
+        let vec = {
+            let h = linear3d(&t_emb_bf16, &w["time_in.in_layer.weight"])?;
+            let h = h.silu()?;
+            linear3d(&h, &w["time_in.out_layer.weight"])?
+        };
+
+        let (pe_cos, pe_sin) = build_rope_2d(img_ids, txt_ids, &cfg.axes_dims, cfg.theta)?;
+
+        let vec_silu = vec.silu()?;
+        let img_mods_arr: [Tensor; 6] = vec_to_arr6(
+            shared_modulation_from_silu(&vec_silu, &w["double_stream_modulation_img.lin.weight"], 6)?
+        )?;
+        let txt_mods_arr: [Tensor; 6] = vec_to_arr6(
+            shared_modulation_from_silu(&vec_silu, &w["double_stream_modulation_txt.lin.weight"], 6)?
+        )?;
+        let single_mods_arr: [Tensor; 3] = vec_to_arr3(
+            shared_modulation_from_silu(&vec_silu, &w["single_stream_modulation.lin.weight"], 3)?
+        )?;
+
+        let total_blocks = cfg.num_double + cfg.num_single;
+        if loader.block_count() != total_blocks {
+            return Err(flame_core::Error::InvalidInput(format!(
+                "TurboBlockLoader has {} blocks, expected {} (={} double + {} single)",
+                loader.block_count(), total_blocks, cfg.num_double, cfg.num_single,
+            )));
+        }
+
+        // The turbo loader publishes BF16View tensors over VMM-mapped memory
+        // already in their on-disk [out, in] layout — no auto-transpose pass
+        // is required (unlike BlockOffloader, which transposes inside
+        // `prepare_weights`). Native cuBLASLt TRANSA=T (`linear3d_nt`,
+        // `native_weights=true`) consumes them in place.
+        loader
+            .prefetch_block(0)
+            .map_err(|e| flame_core::Error::InvalidInput(format!("turbo prefetch(0): {e}")))?;
+
+        for i in 0..cfg.num_double {
+            let block = loader
+                .await_block(i)
+                .map_err(|e| flame_core::Error::InvalidInput(format!("turbo await({i}): {e}")))?;
+            let next = i + 1;
+            if next < total_blocks {
+                loader
+                    .prefetch_block(next)
+                    .map_err(|e| flame_core::Error::InvalidInput(format!("turbo prefetch({next}): {e}")))?;
+            }
+            let (new_img, new_txt) = double_block_forward(
+                &block.weights, i, &img, &txt,
+                &img_mods_arr, &txt_mods_arr,
+                &pe_cos, &pe_sin,
+                cfg.num_heads, cfg.head_dim,
+                true,
+            )?;
+            img = new_img;
+            txt = new_txt;
+        }
+
+        let mut x = Tensor::cat(&[&txt, &img], 1)?;
+        let txt_len = txt.shape().dims()[1];
+
+        for i in 0..cfg.num_single {
+            let block_idx = cfg.num_double + i;
+            let block = loader
+                .await_block(block_idx)
+                .map_err(|e| flame_core::Error::InvalidInput(format!("turbo await({block_idx}): {e}")))?;
+            let next = block_idx + 1;
+            if next < total_blocks {
+                loader
+                    .prefetch_block(next)
+                    .map_err(|e| flame_core::Error::InvalidInput(format!("turbo prefetch({next}): {e}")))?;
+            }
+            x = single_block_forward(
+                &block.weights, i, &x,
+                &single_mods_arr,
+                &pe_cos, &pe_sin,
+                cfg.num_heads, cfg.head_dim,
+                cfg.inner_dim, cfg.mlp_hidden,
+                true,
+            )?;
+        }
+
+        let total_len = x.shape().dims()[1];
+        let img_out = x.narrow(1, txt_len, total_len - txt_len)?;
+
+        let final_mod = linear3d(&vec_silu, &w["final_layer.adaLN_modulation.1.weight"])?;
+        let last_dim = *final_mod.shape().dims().last().unwrap();
+        let half_mod = last_dim / 2;
+        let ndim = final_mod.shape().dims().len();
+        let shift = final_mod.narrow(ndim - 1, 0, half_mod)?;
+        let scale = final_mod.narrow(ndim - 1, half_mod, half_mod)?;
+
+        let img_out = modulate_pre(&img_out, &shift, &scale)?;
+        linear3d(&img_out, &w["final_layer.linear.weight"])
+    }
 }
 
 // ---------------------------------------------------------------------------

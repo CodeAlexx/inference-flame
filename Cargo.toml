@@ -5,6 +5,13 @@ authors = ["Alex"]
 edition = "2021"
 license = "MIT"
 description = "Pure Rust diffusion model inference using flame-core"
+# Disable auto-discovery: several src/bin/* files are work-in-progress and
+# reference modules that don't exist (motif_video_dit, nucleus_dit,
+# qwen3vl_encoder). Auto-discovery would pull them into every `cargo test`
+# invocation. We enumerate the working bins / tests / benches manually.
+autobins = false
+autotests = false
+autobenches = false
 
 [dependencies]
 flame-core = { path = "../flame-core", default-features = false, features = ["cuda", "bf16_u16", "cudnn", "shared_storage"] }
@@ -26,6 +33,10 @@ image = "0.24"
 default = ["cuda", "bf16_u16"]
 cuda = []
 bf16_u16 = []
+# Turbo Flame Phase 1: VMM-backed double-buffered block loader for Klein 9B
+# inference. Off by default — enables `src/turbo/`, the
+# `klein9b_infer_turbo` binary, and the `turbo_*` test suite.
+turbo = []
 
 [[bin]]
 name = "bench_flame"
@@ -250,3 +261,57 @@ path = "src/bin/ltx2_adain_tone_map_parity.rs"
 [[bin]]
 name = "ltx2_generate_ms"
 path = "src/bin/ltx2_generate_ms.rs"
+
+[[bin]]
+name = "klein9b_infer_turbo"
+path = "src/bin/klein9b_infer_turbo.rs"
+required-features = ["turbo"]
+
+[[bench]]
+name = "turbo_klein9b_offload"
+path = "benches/turbo_klein9b_offload.rs"
+harness = false
+required-features = ["turbo"]
+
+# ---------------------------------------------------------------------------
+# Integration tests (tests/*.rs) — enumerated manually because autotests=false.
+# ---------------------------------------------------------------------------
+
+[[test]]
+name = "gguf"
+path = "tests/gguf.rs"
+
+[[test]]
+name = "turbo_vmm_arena_basic"
+path = "tests/turbo_vmm_arena_basic.rs"
+required-features = ["turbo"]
+
+[[test]]
+name = "turbo_ensure_resident_hot"
+path = "tests/turbo_ensure_resident_hot.rs"
+required-features = ["turbo"]
+
+[[test]]
+name = "turbo_ensure_resident_cold"
+path = "tests/turbo_ensure_resident_cold.rs"
+required-features = ["turbo"]
+
+[[test]]
+name = "turbo_vmm_unsupported"
+path = "tests/turbo_vmm_unsupported.rs"
+required-features = ["turbo"]
+
+[[test]]
+name = "turbo_tensor_over_vmm"
+path = "tests/turbo_tensor_over_vmm.rs"
+required-features = ["turbo"]
+
+[[test]]
+name = "turbo_reader_outlives_prefetch"
+path = "tests/turbo_reader_outlives_prefetch.rs"
+required-features = ["turbo"]
+
+[[test]]
+name = "turbo_klein9b_parity"
+path = "tests/turbo_klein9b_parity.rs"
+required-features = ["turbo"]
