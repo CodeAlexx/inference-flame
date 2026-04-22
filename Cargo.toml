@@ -267,9 +267,31 @@ name = "klein9b_infer_turbo"
 path = "src/bin/klein9b_infer_turbo.rs"
 required-features = ["turbo"]
 
+[[bin]]
+name = "chroma_infer_turbo"
+path = "src/bin/chroma_infer_turbo.rs"
+required-features = ["turbo"]
+
+[[bin]]
+name = "qwenimage_edit_gen_turbo"
+path = "src/bin/qwenimage_edit_gen_turbo.rs"
+required-features = ["turbo"]
+
 [[bench]]
 name = "turbo_klein9b_offload"
 path = "benches/turbo_klein9b_offload.rs"
+harness = false
+required-features = ["turbo"]
+
+[[bench]]
+name = "turbo_chroma_offload"
+path = "benches/turbo_chroma_offload.rs"
+harness = false
+required-features = ["turbo"]
+
+[[bench]]
+name = "turbo_qwen_edit_offload"
+path = "benches/turbo_qwen_edit_offload.rs"
 harness = false
 required-features = ["turbo"]
 
@@ -314,4 +336,14 @@ required-features = ["turbo"]
 [[test]]
 name = "turbo_klein9b_parity"
 path = "tests/turbo_klein9b_parity.rs"
+required-features = ["turbo"]
+
+[[test]]
+name = "turbo_chroma_parity"
+path = "tests/turbo_chroma_parity.rs"
+required-features = ["turbo"]
+
+[[test]]
+name = "turbo_qwen_edit_parity"
+path = "tests/turbo_qwen_edit_parity.rs"
 required-features = ["turbo"]

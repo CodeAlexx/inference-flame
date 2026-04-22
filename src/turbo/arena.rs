@@ -35,6 +35,33 @@ impl VmmArena {
         Ok(Self { allocator, copy_stream, device })
     }
 
+    /// Construct a VMM arena for Chroma (8.9B, FLUX-derivative: 19 double +
+    /// 38 single blocks, dim 3072). Block byte size is comparable to Klein 9B
+    /// (same per-block parameter count magnitude since inner_dim is smaller
+    /// but there are separate Q/K/V projections), so the same 4 GB physical
+    /// pool / 32 GB virtual reserve comfortably fits two slots.
+    pub fn new_for_chroma(
+        device: Arc<CudaDevice>,
+        copy_stream: Arc<CudaStream>,
+    ) -> Result<Self, VmmError> {
+        let device_ordinal = device.ordinal() as i32;
+        let allocator = SlabAllocator::new(device_ordinal, Some(PHYSICAL_POOL_BYTES))?;
+        Ok(Self { allocator, copy_stream, device })
+    }
+
+    /// Construct a VMM arena for Qwen-Image-Edit (60-layer DiT, dim 3072).
+    /// Per-block size is comparable to the others (within single-block
+    /// Klein/Chroma magnitudes); the 4 GB physical pool / 32 GB virtual
+    /// reserve is sufficient for two slots after granularity rounding.
+    pub fn new_for_qwen_image_edit(
+        device: Arc<CudaDevice>,
+        copy_stream: Arc<CudaStream>,
+    ) -> Result<Self, VmmError> {
+        let device_ordinal = device.ordinal() as i32;
+        let allocator = SlabAllocator::new(device_ordinal, Some(PHYSICAL_POOL_BYTES))?;
+        Ok(Self { allocator, copy_stream, device })
+    }
+
     pub fn virtual_reserve_bytes() -> usize { VIRTUAL_RESERVE_BYTES }
     pub fn physical_pool_bytes() -> usize { PHYSICAL_POOL_BYTES }
 }

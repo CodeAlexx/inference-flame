@@ -87,29 +87,56 @@ LD_LIBRARY_PATH=/path/to/libtorch/lib \
   ./inference_ui/target/release/inference-ui
 ```
 
-## Turbo (experimental — Klein 9B)
+## Turbo (experimental — Klein 9B / Chroma / Qwen-Image-Edit)
 
-`--features turbo` enables `klein9b_infer_turbo`, a Klein 9B path whose block
-weights live in CUDA VMM-backed slots instead of `cudaMallocAsync` GPU buffers.
+`--features turbo` enables three turbo binaries whose block weights live in
+CUDA VMM-backed slots instead of `cudaMallocAsync` GPU buffers:
+
+- `klein9b_infer_turbo` — Klein 9B (Phase 1 baseline)
+- `chroma_infer_turbo` — Chroma 1-HD (Phase 2 v5.1)
+- `qwenimage_edit_gen_turbo` — Qwen-Image-Edit-2511 (Phase 2 v5.1)
+
 Virtual addresses from `cuMemAddressReserve` stay stable across block swaps —
-the prerequisite for CUDA graph capture across the denoise loop (Phase 2).
+the prerequisite for CUDA graph capture across the denoise loop (Phase 3+).
 Slot residency is gated by `Arc<ResidentHandle>` refcount + an event recorded
 on the reader's compute stream at Drop, so eviction can't unmap pages while
 compute is still reading them.
 
+Phase 2 v5.1 introduces an `OffloaderApi` trait (`src/offload_api.rs`) that
+both `flame_diffusion::BlockOffloader` and
+`inference_flame::turbo::TurboBlockLoader` implement, so each model's per-block
+forward loop is generic over the loader. The block-loop body itself extracts
+mechanically into `forward_inner<L: OffloaderApi>` — that part is a near-zero-
+delta code-motion. Per-model integration is ~100–150 LoC including the trait
+wiring, doc comments, the `transpose_2d_weights` weight-prep gate (BlockOffloader
+auto-transposes; turbo uses on-disk layout), and pre-loop work duplication that
+Rust's borrow rules force when the turbo entry point takes `&self` while the
+non-turbo wrapper takes `&mut self`. See `PHASE2_TIMING_REPORT.md` for the full
+three-model timing breakdown plus the LoC accounting.
+
 Hardware: NVIDIA GPU with `CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED`
-(Pascal+). On unsupported devices the binary errors out — no silent fallback.
+(Pascal+). On unsupported devices each binary errors out — no silent fallback.
+
+Sharded checkpoints: `chroma_infer_turbo` and `qwenimage_edit_gen_turbo` need
+single-file safetensors (Phase 1's `TurboBlockLoader` is single-file). Set
+`CHROMA_TURBO_SAFETENSORS=...` / `QWEN_TURBO_SAFETENSORS=...` to point at a
+merged single-file checkpoint.
 
 ```bash
 cargo build -p inference-flame --features turbo --release
 LD_LIBRARY_PATH=/path/to/cudnn/lib \
   target/release/klein9b_infer_turbo "your prompt here"
+
+CHROMA_INFER_FORCE=1 \
+CHROMA_TURBO_SAFETENSORS=/path/to/Chroma1-HD.safetensors \
+  target/release/chroma_infer_turbo "your prompt here"
+
+QWEN_TURBO_SAFETENSORS=/path/to/qwen_image_edit_2511.safetensors \
+  target/release/qwenimage_edit_gen_turbo \
+    embeds.safetensors out_latents.safetensors
 ```
 
-Default builds (turbo off) are unchanged. Bench numbers vs the existing
-`flame_diffusion::BlockOffloader` path land here once measured. Phase 1 wires
-Klein 9B only; the same pattern fans out to Chroma / ERNIE / FLUX / LTX-2 in
-follow-up phases (each is a near-clone of `forward_with_turbo`).
+Default builds (turbo off) are unchanged.
 
 ## Adapters & samplers
 

@@ -300,6 +300,13 @@ impl ChromaDit {
     /// to [Cin, Cout] for matmul. But fused_linear3d_native expects the
     /// original [Cout, Cin] layout. Un-transpose them back.
     fn untranspose_block_weights(raw: &Arc<HashMap<String, Tensor>>) -> Result<HashMap<String, Tensor>> {
+        Self::untranspose_block_weights_map(&**raw)
+    }
+
+    /// Phase 2 v5.1: same as `untranspose_block_weights` but accepts a
+    /// borrowed `HashMap` directly. Lets `forward_inner` consume both
+    /// `OffloaderBlock` and `TurboAwaited` uniformly via their `Deref` impls.
+    fn untranspose_block_weights_map(raw: &HashMap<String, Tensor>) -> Result<HashMap<String, Tensor>> {
         let mut out = HashMap::with_capacity(raw.len());
         for (k, v) in raw.iter() {
             if k.ends_with(".weight") && v.shape().dims().len() == 2 {
@@ -309,6 +316,20 @@ impl ChromaDit {
             }
         }
         Ok(out)
+    }
+
+    /// Phase 2 v5.1: turbo path needs no weight prep — the loader publishes
+    /// BF16View tensors over VMM-mapped memory in their on-disk `[Cout, Cin]`
+    /// layout already. We still build a `HashMap<String, Tensor>` (cheap clone
+    /// of the BF16View tensors — they're non-owning views over the slot) so
+    /// `double_block_forward` and `single_block_forward` see a uniform
+    /// argument shape regardless of the loader.
+    fn passthrough_block_weights(raw: &HashMap<String, Tensor>) -> HashMap<String, Tensor> {
+        let mut out = HashMap::with_capacity(raw.len());
+        for (k, v) in raw.iter() {
+            out.insert(k.clone(), v.clone());
+        }
+        out
     }
 
     /// Flatten [B, N, C] → [1, B*N, C], call fused_linear3d, reshape back.
@@ -642,27 +663,66 @@ impl ChromaDit {
         pe_cos: &Tensor,
         pe_sin: &Tensor,
     ) -> Result<Tensor> {
-        let cfg = self.config.clone();
-        let _dim = cfg.inner_dim;
         let img_len = img.shape().dims()[1];
-        let _txt_len = txt.shape().dims()[1];
 
-        // --- Input projections ---
+        // --- Input projections (use &self.shared) ---
         let img_in_w = self.shared.get("x_embedder.weight")
             .ok_or_else(|| flame_core::Error::InvalidInput("Missing x_embedder.weight".into()))?;
         let img_in_b = self.shared.get("x_embedder.bias")
             .ok_or_else(|| flame_core::Error::InvalidInput("Missing x_embedder.bias".into()))?;
-        let mut img = Self::linear_bias(img, img_in_w, img_in_b)?;
+        let img_proj = Self::linear_bias(img, img_in_w, img_in_b)?;
 
         let ctx_w = self.shared.get("context_embedder.weight")
             .ok_or_else(|| flame_core::Error::InvalidInput("Missing context_embedder.weight".into()))?;
         let ctx_b = self.shared.get("context_embedder.bias")
             .ok_or_else(|| flame_core::Error::InvalidInput("Missing context_embedder.bias".into()))?;
-        let mut txt = Self::linear_bias(txt, ctx_w, ctx_b)?;
-        chroma_log_stage("0:img_in", &img);
-        chroma_log_stage("0:txt_in", &txt);
+        let txt_proj = Self::linear_bias(txt, ctx_w, ctx_b)?;
+        chroma_log_stage("0:img_in", &img_proj);
+        chroma_log_stage("0:txt_in", &txt_proj);
         chroma_log_stage("0:pooled_temb", pooled_temb);
 
+        // Split-borrow `self` into disjoint field references so we can pass
+        // `&shared`/`&config` together with `&mut self.offloader` to
+        // `forward_inner` without a borrow-checker conflict.
+        let ChromaDit { shared, offloader, config, .. } = self;
+        Self::forward_inner(
+            shared, config,
+            img_proj, txt_proj, img_len,
+            pooled_temb, pe_cos, pe_sin,
+            offloader,
+            /* transpose_2d_weights = */ true,
+        )
+    }
+
+    /// Block-loop body extracted from `forward_cached`. Generic over any
+    /// `OffloaderApi` implementation (BlockOffloader for the existing path;
+    /// TurboBlockLoader for the Phase 2 turbo path).
+    ///
+    /// `transpose_2d_weights`:
+    ///   * `true` for `BlockOffloader` — it auto-transposes 2D `.weight`
+    ///     tensors to `[Cin, Cout]` inside `prepare_weights`, and Chroma's
+    ///     `fused_linear3d_native` consumes the original `[Cout, Cin]` layout,
+    ///     so we un-transpose.
+    ///   * `false` for `TurboBlockLoader` — it publishes BF16View tensors over
+    ///     VMM-mapped memory in their on-disk `[Cout, Cin]` layout already,
+    ///     no transpose needed.
+    ///
+    /// This is the only Phase 2 v5.1 mechanism for accommodating loader-side
+    /// layout differences. If a future Chroma `prepare_block` step needs to
+    /// do anything else loader-dependent, widen to an enum (and flag for a
+    /// design call first).
+    fn forward_inner<L: crate::offload_api::OffloaderApi>(
+        shared: &HashMap<String, Tensor>,
+        cfg: &ChromaConfig,
+        mut img: Tensor,
+        mut txt: Tensor,
+        img_len: usize,
+        pooled_temb: &Tensor,
+        pe_cos: &Tensor,
+        pe_sin: &Tensor,
+        loader: &mut L,
+        transpose_2d_weights: bool,
+    ) -> Result<Tensor> {
         // --- Block indexing constants (layout from diffusers transformer_chroma.py) ---
         //   single block i:  [3*i : 3*i + 3]                          for i in 0..38
         //   double img i:    [114 + 6*i : 114 + 6*i + 6]               for i in 0..19
@@ -673,24 +733,34 @@ impl ChromaDit {
 
         // --- Double blocks ---
         let total_blocks = cfg.num_double_blocks + cfg.num_single_blocks;
-        self.offloader.prefetch_block(0)
+        loader.prefetch_block(0)
             .map_err(|e| flame_core::Error::InvalidInput(format!("prefetch: {e}")))?;
 
         for i in 0..cfg.num_double_blocks {
-            let raw_arc = self.offloader.await_block(i)
+            let block = loader.await_block(i)
                 .map_err(|e| flame_core::Error::InvalidInput(format!("await: {e}")))?;
             if i + 1 < total_blocks {
-                self.offloader.prefetch_block(i + 1)
+                loader.prefetch_block(i + 1)
                     .map_err(|e| flame_core::Error::InvalidInput(format!("prefetch: {e}")))?;
             }
-            let raw = Self::untranspose_block_weights(&raw_arc)?;
+            // Loader-aware weight prep: BlockOffloader pre-transposes 2D
+            // weights; TurboBlockLoader does not. See doc comment.
+            let raw = if transpose_2d_weights {
+                Self::untranspose_block_weights_map(&*block)?
+            } else {
+                // No clone needed — pass the borrowed map directly via Deref.
+                // To keep the call signatures uniform we still build a HashMap
+                // so block_forward sees `&HashMap<String, Tensor>` regardless.
+                Self::passthrough_block_weights(&*block)
+            };
 
             // Slice modulation params for this block.
             // pooled_temb is [B, L, inner_dim].
             let img_mod = pooled_temb.narrow(1, img_offset_dbl + 6 * i, 6)?; // [B, 6, dim]
             let txt_mod = pooled_temb.narrow(1, txt_offset_dbl + 6 * i, 6)?; // [B, 6, dim]
 
-            let (new_img, new_txt) = self.double_block_forward(
+            let (new_img, new_txt) = Self::double_block_forward(
+                cfg,
                 &img, &txt, &img_mod, &txt_mod, pe_cos, pe_sin, &raw, i,
             )?;
             img = new_img;
@@ -710,16 +780,20 @@ impl ChromaDit {
 
         for i in 0..cfg.num_single_blocks {
             let block_idx = cfg.num_double_blocks + i;
-            let raw_arc = self.offloader.await_block(block_idx)
+            let block = loader.await_block(block_idx)
                 .map_err(|e| flame_core::Error::InvalidInput(format!("await: {e}")))?;
             if block_idx + 1 < total_blocks {
-                self.offloader.prefetch_block(block_idx + 1)
+                loader.prefetch_block(block_idx + 1)
                     .map_err(|e| flame_core::Error::InvalidInput(format!("prefetch: {e}")))?;
             }
-            let raw = Self::untranspose_block_weights(&raw_arc)?;
+            let raw = if transpose_2d_weights {
+                Self::untranspose_block_weights_map(&*block)?
+            } else {
+                Self::passthrough_block_weights(&*block)
+            };
 
             let single_mod = pooled_temb.narrow(1, 3 * i, 3)?; // [B, 3, dim]
-            x = self.single_block_forward(&x, &single_mod, pe_cos, pe_sin, &raw, i)?;
+            x = Self::single_block_forward(cfg, &x, &single_mod, pe_cos, pe_sin, &raw, i)?;
 
             if i % 10 == 0 || i == cfg.num_single_blocks - 1 {
                 log::info!("[Chroma] Single block {}/{}", i + 1, cfg.num_single_blocks);
@@ -744,13 +818,57 @@ impl ChromaDit {
         chroma_log_stage("3:pre_proj_out", &modulated);
 
         // proj_out
-        let proj_w = self.shared.get("proj_out.weight")
+        let proj_w = shared.get("proj_out.weight")
             .ok_or_else(|| flame_core::Error::InvalidInput("Missing proj_out.weight".into()))?;
-        let proj_b = self.shared.get("proj_out.bias")
+        let proj_b = shared.get("proj_out.bias")
             .ok_or_else(|| flame_core::Error::InvalidInput("Missing proj_out.bias".into()))?;
         let out = Self::linear_bias(&modulated, proj_w, proj_b)?;
         chroma_log_stage("4:proj_out", &out);
         Ok(out)
+    }
+
+    /// Phase 2 v5.1: turbo entrypoint. Does input projections then dispatches
+    /// the per-block loop through `forward_inner` with a `TurboBlockLoader`
+    /// and `transpose_2d_weights=false`.
+    ///
+    /// Behind `feature = "turbo"` so the default build never references the
+    /// turbo module.
+    #[cfg(feature = "turbo")]
+    pub fn forward_with_turbo(
+        &self,
+        img: &Tensor,
+        txt: &Tensor,
+        timesteps: &Tensor,
+        img_ids: &Tensor,
+        txt_ids: &Tensor,
+        loader: &mut crate::turbo::TurboBlockLoader,
+    ) -> Result<Tensor> {
+        // Per-step cache (approximator + RoPE) — same as the offloader path
+        // does inside `forward`, factored through `precompute_step_cache`.
+        let (pooled_temb, pe_cos, pe_sin) =
+            self.precompute_step_cache(timesteps, img_ids, txt_ids)?;
+
+        let img_len = img.shape().dims()[1];
+
+        let img_in_w = self.shared.get("x_embedder.weight")
+            .ok_or_else(|| flame_core::Error::InvalidInput("Missing x_embedder.weight".into()))?;
+        let img_in_b = self.shared.get("x_embedder.bias")
+            .ok_or_else(|| flame_core::Error::InvalidInput("Missing x_embedder.bias".into()))?;
+        let img_proj = Self::linear_bias(img, img_in_w, img_in_b)?;
+
+        let ctx_w = self.shared.get("context_embedder.weight")
+            .ok_or_else(|| flame_core::Error::InvalidInput("Missing context_embedder.weight".into()))?;
+        let ctx_b = self.shared.get("context_embedder.bias")
+            .ok_or_else(|| flame_core::Error::InvalidInput("Missing context_embedder.bias".into()))?;
+        let txt_proj = Self::linear_bias(txt, ctx_w, ctx_b)?;
+
+        Self::forward_inner(
+            &self.shared, &self.config,
+            img_proj, txt_proj, img_len,
+            &pooled_temb, &pe_cos, &pe_sin,
+            loader,
+            /* transpose_2d_weights = */ false,
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -762,8 +880,12 @@ impl ChromaDit {
     ///   [0]=shift_msa  [1]=scale_msa  [2]=gate_msa
     ///   [3]=shift_mlp  [4]=scale_mlp  [5]=gate_mlp
     /// (matching the diffusers `ChromaAdaLayerNormZeroPruned.forward` chunking.)
+    ///
+    /// Phase 2 v5.1: associated function (no `&self`). `cfg` is passed
+    /// explicitly so `forward_inner` can call this from a destructure-borrowed
+    /// context where `self` is split into disjoint field borrows.
     fn double_block_forward(
-        &self,
+        cfg: &ChromaConfig,
         img: &Tensor,
         txt: &Tensor,
         img_mod: &Tensor,
@@ -773,7 +895,6 @@ impl ChromaDit {
         weights: &HashMap<String, Tensor>,
         block_idx: usize,
     ) -> Result<(Tensor, Tensor)> {
-        let cfg = &self.config;
         let h = cfg.num_heads;
         let d = cfg.head_dim;
         let prefix = format!("transformer_blocks.{block_idx}");
@@ -875,8 +996,11 @@ impl ChromaDit {
 
     /// Single block forward. `single_mod` is `[B, 3, dim]` containing
     /// (shift_msa, scale_msa, gate_msa).
+    ///
+    /// Phase 2 v5.1: associated function (no `&self`). See
+    /// `double_block_forward` rationale.
     fn single_block_forward(
-        &self,
+        cfg: &ChromaConfig,
         x: &Tensor,
         single_mod: &Tensor,
         pe_cos: &Tensor,
@@ -884,7 +1008,6 @@ impl ChromaDit {
         weights: &HashMap<String, Tensor>,
         block_idx: usize,
     ) -> Result<Tensor> {
-        let cfg = &self.config;
         let h = cfg.num_heads;
         let d = cfg.head_dim;
         let dim = cfg.inner_dim;

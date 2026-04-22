@@ -12,8 +12,10 @@ pub mod vmm;
 pub mod arena;
 pub mod block;
 pub mod loader;
+pub mod api;
 
 pub use arena::VmmArena;
 pub use block::TurboBlock;
 pub use loader::TurboBlockLoader;
 pub use vmm::{ResidentHandle, SlabAllocator, VmmError};
+pub use api::TurboAwaited;

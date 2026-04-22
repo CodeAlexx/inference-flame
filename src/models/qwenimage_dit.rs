@@ -551,6 +551,16 @@ impl QwenImageDit {
     fn untranspose_block_weights(
         raw: &Arc<HashMap<String, Tensor>>,
     ) -> Result<HashMap<String, Tensor>> {
+        Self::untranspose_block_weights_map(&**raw)
+    }
+
+    /// Phase 2 v5.1: same as `untranspose_block_weights` but accepts a
+    /// borrowed `HashMap` directly. Lets `forward_edit_with_ref_timestep_inner`
+    /// consume both `OffloaderBlock` and `TurboAwaited` uniformly via their
+    /// `Deref` impls.
+    fn untranspose_block_weights_map(
+        raw: &HashMap<String, Tensor>,
+    ) -> Result<HashMap<String, Tensor>> {
         let mut out = HashMap::with_capacity(raw.len());
         for (k, v) in raw.iter() {
             if k.ends_with(".weight") && v.shape().dims().len() == 2 {
@@ -560,6 +570,18 @@ impl QwenImageDit {
             }
         }
         Ok(out)
+    }
+
+    /// Phase 2 v5.1: turbo path needs no weight prep — the loader publishes
+    /// BF16View tensors over VMM-mapped memory in their on-disk
+    /// `[Cout, Cin]` layout already. We still build a HashMap for uniform
+    /// downstream consumption.
+    fn passthrough_block_weights(raw: &HashMap<String, Tensor>) -> HashMap<String, Tensor> {
+        let mut out = HashMap::with_capacity(raw.len());
+        for (k, v) in raw.iter() {
+            out.insert(k.clone(), v.clone());
+        }
+        out
     }
 
     pub fn forward(
@@ -619,7 +641,7 @@ impl QwenImageDit {
             let raw = Self::untranspose_block_weights(&raw_arc)?;
 
             let (new_img, new_txt) =
-                self.block_forward(&img, &txt, &temb, &pe_cos, &pe_sin, &raw, i)?;
+                Self::block_forward(&cfg, &img, &txt, &temb, &pe_cos, &pe_sin, &raw, i)?;
             img = new_img;
             txt = new_txt;
 
@@ -738,7 +760,7 @@ impl QwenImageDit {
             .ok_or_else(|| flame_core::Error::InvalidInput("Missing img_in.weight".into()))?;
         let img_in_b = self.shared.get("img_in.bias")
             .ok_or_else(|| flame_core::Error::InvalidInput("Missing img_in.bias".into()))?;
-        let mut img = Self::linear_bias(hidden_states, img_in_w, img_in_b)?;
+        let img = Self::linear_bias(hidden_states, img_in_w, img_in_b)?;
 
         // ── txt_norm (RMSNorm) then txt_in ──
         let txt_norm_w = self.shared.get("txt_norm.weight")
@@ -748,7 +770,7 @@ impl QwenImageDit {
         let txt_in_b = self.shared.get("txt_in.bias")
             .ok_or_else(|| flame_core::Error::InvalidInput("Missing txt_in.bias".into()))?;
         let txt_normed = Self::rms_norm(encoder_hidden_states, txt_norm_w, 1e-6)?;
-        let mut txt = Self::linear_bias(&txt_normed, txt_in_w, txt_in_b)?;
+        let txt = Self::linear_bias(&txt_normed, txt_in_w, txt_in_b)?;
 
         // ── time_text_embed (target) and optional per-region ref temb ──
         let temb = self.time_text_embed(timestep)?;
@@ -765,26 +787,80 @@ impl QwenImageDit {
             &self.device,
         )?;
 
+        // Split-borrow `self` into disjoint field references so we can pass
+        // `&shared`/`&config` together with `&mut self.offloader` to
+        // `forward_edit_with_ref_timestep_inner` without a borrow-checker
+        // conflict.
+        let QwenImageDit { shared, offloader, config, .. } = self;
+        Self::forward_edit_with_ref_timestep_inner(
+            shared, config,
+            img, txt,
+            &temb, temb_ref.as_ref(), target_seq_len,
+            &pe_cos, &pe_sin,
+            offloader,
+            /* transpose_2d_weights = */ true,
+        )
+    }
+
+    /// Block-loop body extracted from `forward_edit_with_ref_timestep`.
+    /// Generic over any `OffloaderApi` implementation (BlockOffloader for the
+    /// existing path; TurboBlockLoader for the Phase 2 turbo path).
+    ///
+    /// `transpose_2d_weights`:
+    ///   * `true` for `BlockOffloader` — auto-transposes 2D `.weight` tensors
+    ///     to `[Cin, Cout]` inside `prepare_weights`; we un-transpose for
+    ///     `fused_linear3d_native`'s `[Cout, Cin]` contract.
+    ///   * `false` for `TurboBlockLoader` — publishes BF16View tensors over
+    ///     VMM-mapped memory in their on-disk `[Cout, Cin]` layout already.
+    ///
+    /// Multi-region RoPE math (`pe_cos`/`pe_sin`), the `zero_cond_t` per-region
+    /// timestep conditioning (`temb`/`temb_ref`/`target_seq_len`), and the
+    /// `image_regions` decomposition all live OUTSIDE this function — they
+    /// were precomputed by the caller and only flow into the per-block forward
+    /// as immutable inputs. The block loop iterates weights and dispatches to
+    /// `block_forward` or `block_forward_per_region`; nothing inside the loop
+    /// depends on the loader's identity beyond `prefetch_block`/`await_block`.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_edit_with_ref_timestep_inner<L: crate::offload_api::OffloaderApi>(
+        shared: &HashMap<String, Tensor>,
+        cfg: &QwenImageConfig,
+        mut img: Tensor,
+        mut txt: Tensor,
+        temb: &Tensor,
+        temb_ref: Option<&Tensor>,
+        target_seq_len: usize,
+        pe_cos: &Tensor,
+        pe_sin: &Tensor,
+        loader: &mut L,
+        transpose_2d_weights: bool,
+    ) -> Result<Tensor> {
         // ── Transformer blocks (same as T2I forward) ──
         let total_blocks = cfg.num_layers;
-        self.offloader.prefetch_block(0)
+        loader.prefetch_block(0)
             .map_err(|e| flame_core::Error::InvalidInput(format!("prefetch: {e}")))?;
 
         for i in 0..total_blocks {
-            let raw_arc = self.offloader.await_block(i)
+            let block = loader.await_block(i)
                 .map_err(|e| flame_core::Error::InvalidInput(format!("await: {e}")))?;
             if i + 1 < total_blocks {
-                self.offloader.prefetch_block(i + 1)
+                loader.prefetch_block(i + 1)
                     .map_err(|e| flame_core::Error::InvalidInput(format!("prefetch: {e}")))?;
             }
-            let raw = Self::untranspose_block_weights(&raw_arc)?;
+            // Loader-aware weight prep: BlockOffloader pre-transposes 2D
+            // weights; TurboBlockLoader does not. See doc comment.
+            let raw = if transpose_2d_weights {
+                Self::untranspose_block_weights_map(&*block)?
+            } else {
+                Self::passthrough_block_weights(&*block)
+            };
 
-            let (new_img, new_txt) = match &temb_ref {
-                Some(tr) => self.block_forward_per_region(
-                    &img, &txt, &temb, tr, target_seq_len,
-                    &pe_cos, &pe_sin, &raw, i,
+            let (new_img, new_txt) = match temb_ref {
+                Some(tr) => Self::block_forward_per_region(
+                    cfg,
+                    &img, &txt, temb, tr, target_seq_len,
+                    pe_cos, pe_sin, &raw, i,
                 )?,
-                None => self.block_forward(&img, &txt, &temb, &pe_cos, &pe_sin, &raw, i)?,
+                None => Self::block_forward(cfg, &img, &txt, temb, pe_cos, pe_sin, &raw, i)?,
             };
             img = new_img;
             txt = new_txt;
@@ -795,9 +871,9 @@ impl QwenImageDit {
         }
 
         // ── norm_out + proj_out (same as T2I) ──
-        let norm_out_w = self.shared.get("norm_out.linear.weight")
+        let norm_out_w = shared.get("norm_out.linear.weight")
             .ok_or_else(|| flame_core::Error::InvalidInput("Missing norm_out.linear.weight".into()))?;
-        let norm_out_b = self.shared.get("norm_out.linear.bias")
+        let norm_out_b = shared.get("norm_out.linear.bias")
             .ok_or_else(|| flame_core::Error::InvalidInput("Missing norm_out.linear.bias".into()))?;
         let temb_silu = temb.silu()?;
         let mods = Self::linear_bias(&temb_silu.unsqueeze(1)?, norm_out_w, norm_out_b)?
@@ -809,9 +885,9 @@ impl QwenImageDit {
         let scaled = normed.mul(&one_plus.unsqueeze(1)?)?;
         let modulated = scaled.add(&shift.unsqueeze(1)?)?;
 
-        let proj_w = self.shared.get("proj_out.weight")
+        let proj_w = shared.get("proj_out.weight")
             .ok_or_else(|| flame_core::Error::InvalidInput("Missing proj_out.weight".into()))?;
-        let proj_b = self.shared.get("proj_out.bias")
+        let proj_b = shared.get("proj_out.bias")
             .ok_or_else(|| flame_core::Error::InvalidInput("Missing proj_out.bias".into()))?;
         // Returns the FULL prediction over (target + reference) tokens. The
         // caller is responsible for slicing `[:, :target_seq_len, :]` before
@@ -819,12 +895,92 @@ impl QwenImageDit {
         Self::linear_bias(&modulated, proj_w, proj_b)
     }
 
+    /// Phase 2 v5.1: turbo entrypoint. Mirrors `forward_edit_with_ref_timestep`
+    /// pre-loop work (input projections, time_text_embed for both target +
+    /// reference, multi-region RoPE), then dispatches the per-block loop
+    /// through `forward_edit_with_ref_timestep_inner` with a
+    /// `TurboBlockLoader` and `transpose_2d_weights = false`.
+    ///
+    /// Behind `feature = "turbo"` so the default build never references the
+    /// turbo module.
+    #[cfg(feature = "turbo")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_edit_with_ref_timestep_turbo(
+        &self,
+        hidden_states: &Tensor,
+        encoder_hidden_states: &Tensor,
+        timestep: &Tensor,
+        ref_timestep: Option<&Tensor>,
+        image_regions: &[(usize, usize, usize)],
+        loader: &mut crate::turbo::TurboBlockLoader,
+    ) -> Result<Tensor> {
+        let cfg = self.config.clone();
+        let img_len = hidden_states.shape().dims()[1];
+        let txt_len = encoder_hidden_states.shape().dims()[1];
+
+        let expected_img_len: usize = image_regions
+            .iter()
+            .map(|(f, h, w)| f * h * w)
+            .sum();
+        if expected_img_len != img_len {
+            return Err(flame_core::Error::InvalidInput(format!(
+                "forward_edit_turbo: hidden_states seq_len {} != sum(image_regions) {} (regions={:?})",
+                img_len, expected_img_len, image_regions
+            )));
+        }
+        let target_seq_len: usize = {
+            let (f, h, w) = image_regions[0];
+            f * h * w
+        };
+
+        let img_in_w = self.shared.get("img_in.weight")
+            .ok_or_else(|| flame_core::Error::InvalidInput("Missing img_in.weight".into()))?;
+        let img_in_b = self.shared.get("img_in.bias")
+            .ok_or_else(|| flame_core::Error::InvalidInput("Missing img_in.bias".into()))?;
+        let img = Self::linear_bias(hidden_states, img_in_w, img_in_b)?;
+
+        let txt_norm_w = self.shared.get("txt_norm.weight")
+            .ok_or_else(|| flame_core::Error::InvalidInput("Missing txt_norm.weight".into()))?;
+        let txt_in_w = self.shared.get("txt_in.weight")
+            .ok_or_else(|| flame_core::Error::InvalidInput("Missing txt_in.weight".into()))?;
+        let txt_in_b = self.shared.get("txt_in.bias")
+            .ok_or_else(|| flame_core::Error::InvalidInput("Missing txt_in.bias".into()))?;
+        let txt_normed = Self::rms_norm(encoder_hidden_states, txt_norm_w, 1e-6)?;
+        let txt = Self::linear_bias(&txt_normed, txt_in_w, txt_in_b)?;
+
+        let temb = self.time_text_embed(timestep)?;
+        let temb_ref: Option<Tensor> = match ref_timestep {
+            Some(rt) => Some(self.time_text_embed(rt)?),
+            None => None,
+        };
+
+        let (pe_cos, pe_sin) = Self::build_rope_tables_multi(
+            image_regions,
+            txt_len,
+            &cfg,
+            &self.device,
+        )?;
+
+        Self::forward_edit_with_ref_timestep_inner(
+            &self.shared, &self.config,
+            img, txt,
+            &temb, temb_ref.as_ref(), target_seq_len,
+            &pe_cos, &pe_sin,
+            loader,
+            /* transpose_2d_weights = */ false,
+        )
+    }
+
     // -----------------------------------------------------------------------
     // Block forward
     // -----------------------------------------------------------------------
 
+    /// Phase 2 v5.1: associated function (no `&self`). `cfg` is passed
+    /// explicitly so `forward_edit_with_ref_timestep_inner` can call this
+    /// from a destructure-borrowed context where `self` is split into
+    /// disjoint field borrows.
     fn block_forward(
-        &self,
+        cfg: &QwenImageConfig,
         img: &Tensor,
         txt: &Tensor,
         temb: &Tensor,
@@ -833,7 +989,6 @@ impl QwenImageDit {
         weights: &HashMap<String, Tensor>,
         block_idx: usize,
     ) -> Result<(Tensor, Tensor)> {
-        let cfg = &self.config;
         let h = cfg.num_heads;
         let d = cfg.head_dim;
         let dim = cfg.inner_dim;
@@ -981,9 +1136,11 @@ impl QwenImageDit {
     /// `QwenImageEditPlusPipeline` / the 2511 Qwen-Image-Edit model:
     /// reference tokens are treated as clean (t=0) conditioning while target
     /// tokens use the noise-schedule sigma.
+    /// Phase 2 v5.1: associated function (no `&self`). See
+    /// `block_forward` rationale.
     #[allow(clippy::too_many_arguments)]
     fn block_forward_per_region(
-        &self,
+        cfg: &QwenImageConfig,
         img: &Tensor,
         txt: &Tensor,
         temb_target: &Tensor,
@@ -994,7 +1151,6 @@ impl QwenImageDit {
         weights: &HashMap<String, Tensor>,
         block_idx: usize,
     ) -> Result<(Tensor, Tensor)> {
-        let cfg = &self.config;
         let h = cfg.num_heads;
         let d = cfg.head_dim;
         let dim = cfg.inner_dim;
