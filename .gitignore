@@ -3,10 +3,18 @@
 *.py
 *.safetensors
 
-# Internal dev notes — kept locally, not on github
-AUDIT_*.md
-PERF_*.md
-LTX2_AV_BUGS.md
-alexltx.md
-debug/FINDINGS.md
-flame-swap/FLAME-CORE-PATCH.md
+# Internal dev notes — kept locally, not on github.
+#
+# Repo policy: only `README.md` (in any directory) may be committed.
+# All other markdown files are local-only dev notes / planning / handoff
+# docs / skeptic reviews / audit reports / phase specs / timing reports.
+#
+# If you need to add a new docs file, it MUST be named README.md. Put it
+# in its own subdirectory if you need multiple.
+#
+# This wildcard replaces the old piecemeal `AUDIT_*.md / PERF_*.md / ...`
+# patterns — skeptic batches, planning docs, port notes, etc. kept leaking
+# onto github because new filename prefixes weren't in the old list.
+*.md
+!README.md
+!**/README.md
