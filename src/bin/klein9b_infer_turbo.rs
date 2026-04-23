@@ -27,7 +27,19 @@ const OUTPUT_PATH: &str = "/home/alex/EriDiffusion/inference-flame/output/klein9
 const DEFAULT_PROMPT: &str = "Beautiful young woman sitting on a park bench in golden hour sunlight, professional model photoshoot for Maxim magazine advertisement, wearing a fitted summer dress, confident relaxed pose, soft bokeh background with green trees and warm light, editorial fashion photography, Canon EOS R5, 85mm f/1.4 lens, natural skin texture, magazine quality retouching, warm color grading";
 const DEFAULT_NEGATIVE: &str = "lowres, bad quality, worst quality, bad anatomy, blurry, watermark, simple background, transparent background, sketch, jpeg artifacts, ugly, poorly drawn, censor";
 
-const NUM_STEPS: usize = 30;
+const DEFAULT_NUM_STEPS: usize = 30;
+
+/// Step count, overridable via `KLEIN_STEPS` env var. Used by the
+/// `turbo_klein9b_offload` bench to run klein9b_infer and
+/// klein9b_infer_turbo at the same step count for an apples-to-apples
+/// comparison. When unset, defaults to `DEFAULT_NUM_STEPS`.
+fn resolved_num_steps() -> usize {
+    std::env::var("KLEIN_STEPS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_NUM_STEPS)
+}
 const GUIDANCE: f32 = 4.0;
 const SEED: u64 = 42;
 const WIDTH: usize = 1024;
@@ -62,10 +74,11 @@ fn main() -> anyhow::Result<()> {
     let t_total = Instant::now();
 
     let prompt = std::env::args().nth(1).unwrap_or_else(|| DEFAULT_PROMPT.to_string());
+    let num_steps = resolved_num_steps();
 
     println!("============================================================");
     println!("Klein 9B Base — Turbo Flame Phase 1 (VMM)");
-    println!("  {}x{}, {} steps, guidance {}, seed {}", WIDTH, HEIGHT, NUM_STEPS, GUIDANCE, SEED);
+    println!("  {}x{}, {} steps, guidance {}, seed {}", WIDTH, HEIGHT, num_steps, GUIDANCE, SEED);
     println!("============================================================");
 
     let device = global_cuda_device();
@@ -207,9 +220,9 @@ fn main() -> anyhow::Result<()> {
         .permute(&[0, 2, 3, 1])?
         .reshape(&[1, n_img, 128])?;
 
-    let timesteps = get_schedule(NUM_STEPS, n_img);
+    let timesteps = get_schedule(num_steps, n_img);
 
-    println!("\n--- Stage 3: Denoise ({} steps, guidance={}) ---", NUM_STEPS, GUIDANCE);
+    println!("\n--- Stage 3: Denoise ({} steps, guidance={}) ---", num_steps, GUIDANCE);
     let t0 = Instant::now();
 
     // Per-step progress: each call is one denoise step (both CFG forwards).
@@ -227,10 +240,10 @@ fn main() -> anyhow::Result<()> {
             let dt_step = step_t.elapsed().as_secs_f32();
             let elapsed = t0.elapsed().as_secs_f32();
             let avg = elapsed / (i + 1) as f32;
-            let remaining = avg * (NUM_STEPS.saturating_sub(i + 1)) as f32;
+            let remaining = avg * (num_steps.saturating_sub(i + 1)) as f32;
             println!(
                 "  step {:>3}/{:<3}  {:>5.2}s/it  avg {:>5.2}s  elapsed {:>6.1}s  eta {:>5.1}s",
-                i + 1, NUM_STEPS, dt_step, avg, elapsed, remaining
+                i + 1, num_steps, dt_step, avg, elapsed, remaining
             );
             use std::io::Write;
             let _ = std::io::stdout().flush();
@@ -243,7 +256,7 @@ fn main() -> anyhow::Result<()> {
     )?;
 
     let dt = t0.elapsed().as_secs_f32();
-    println!("  total {:.1}s ({:.2}s/step avg)", dt, dt / NUM_STEPS as f32);
+    println!("  total {:.1}s ({:.2}s/step avg)", dt, dt / num_steps as f32);
 
     // ------------------------------------------------------------------
     // Stage 4: VAE decode
