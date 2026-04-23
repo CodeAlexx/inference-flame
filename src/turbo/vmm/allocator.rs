@@ -576,25 +576,54 @@ impl SlabAllocator {
         for region in &mut slab.regions {
             let state = region.load_state();
             if state == RegionState::Resident || state == RegionState::MappedEmpty {
+                // Drain and synchronize any pending reader/writer events BEFORE
+                // cuMemUnmap. Without this, compute kernels still reading the
+                // slot when we unmap fault asynchronously, and the CUDA context
+                // enters an error state that makes every subsequent cudaFree
+                // (including on unrelated shared weights) return
+                // CUDA_ERROR_ILLEGAL_ADDRESS. Mirror the event-gated teardown
+                // that eviction.rs already does on its unmap path.
+                {
+                    let mut rm = region.mutable.lock().unwrap();
+                    if let Some(event) = rm.last_use_event.take() {
+                        // SAFETY: event from cuEventCreate/cuEventRecord in
+                        // ResidentHandle::Drop. Blocks host until the reader's
+                        // compute stream passes the recorded point.
+                        unsafe {
+                            let _ = cuda_ffi::cuEventSynchronize(event);
+                            let _ = cuda_ffi::cuEventDestroy_v2(event);
+                        }
+                    }
+                    if let Some(event) = rm.prefetch_event.take() {
+                        // SAFETY: event from prefetch worker.
+                        unsafe {
+                            let _ = cuda_ffi::cuEventSynchronize(event);
+                            let _ = cuda_ffi::cuEventDestroy_v2(event);
+                        }
+                    }
+                }
+
                 let unmap_ptr = slab.base_ptr + region.offset as u64;
-                // SAFETY: unmap_ptr/size from successful cuMemMap. Refcounts are 0.
+                // SAFETY: unmap_ptr/size from successful cuMemMap. Refcounts
+                // are 0 and reader/writer events have been synchronized above.
                 unsafe { let _ = cuda_ffi::cuMemUnmap(unmap_ptr, region.size); }
                 let mut rm = region.mutable.lock().unwrap();
                 if let Some(phys) = rm.phys_handle.take() {
-                    // SAFETY: phys from cuMemCreate.
+                    // SAFETY: phys from cuMemCreate. Unmap has completed.
                     unsafe { let _ = cuda_ffi::cuMemRelease(phys); }
                 }
                 bytes_freed += region.size;
-            }
-
-            let mut rm = region.mutable.lock().unwrap();
-            if let Some(event) = rm.last_use_event.take() {
-                // SAFETY: event from cuEventCreate.
-                unsafe { let _ = cuda_ffi::cuEventDestroy_v2(event); }
-            }
-            if let Some(event) = rm.prefetch_event.take() {
-                // SAFETY: event from cuEventCreate.
-                unsafe { let _ = cuda_ffi::cuEventDestroy_v2(event); }
+            } else {
+                // Non-resident region: no in-flight compute can be touching
+                // a VA we're about to free, but drain any lingering events
+                // so we don't leak handles.
+                let mut rm = region.mutable.lock().unwrap();
+                if let Some(event) = rm.last_use_event.take() {
+                    unsafe { let _ = cuda_ffi::cuEventDestroy_v2(event); }
+                }
+                if let Some(event) = rm.prefetch_event.take() {
+                    unsafe { let _ = cuda_ffi::cuEventDestroy_v2(event); }
+                }
             }
         }
 
@@ -690,26 +719,52 @@ impl Drop for AllocatorInner {
                     for region in &slab.regions {
                         let state = region.load_state();
                         if state == RegionState::Resident || state == RegionState::MappedEmpty {
+                            // Synchronize any pending reader/writer events
+                            // BEFORE cuMemUnmap. Matches destroy_slab's
+                            // event-gated teardown (see its comment for the
+                            // why). Holds even for best-effort cleanup: if
+                            // compute was still in flight when we hit Drop,
+                            // unmapping without a wait puts the context into
+                            // a sticky error state that breaks every later
+                            // CUDA call in the process.
+                            if let Ok(mut rm) = region.mutable.lock() {
+                                if let Some(event) = rm.last_use_event.take() {
+                                    unsafe {
+                                        let _ = cuda_ffi::cuEventSynchronize(event);
+                                        let _ = cuda_ffi::cuEventDestroy_v2(event);
+                                    }
+                                }
+                                if let Some(event) = rm.prefetch_event.take() {
+                                    unsafe {
+                                        let _ = cuda_ffi::cuEventSynchronize(event);
+                                        let _ = cuda_ffi::cuEventDestroy_v2(event);
+                                    }
+                                }
+                            }
+
                             let unmap_ptr = slab.base_ptr + region.offset as u64;
-                            // SAFETY: best-effort cleanup. All handles are dropped
-                            // (Arc refcount is 0), so no one references this memory.
+                            // SAFETY: best-effort cleanup. All handles are
+                            // dropped (Arc refcount is 0) and reader events
+                            // have been synchronized above.
                             unsafe { let _ = cuda_ffi::cuMemUnmap(unmap_ptr, region.size); }
-                            if let Ok(rm) = region.mutable.lock() {
-                                if let Some(phys) = rm.phys_handle {
+                            if let Ok(mut rm) = region.mutable.lock() {
+                                if let Some(phys) = rm.phys_handle.take() {
                                     unsafe { let _ = cuda_ffi::cuMemRelease(phys); }
                                 }
                             }
-                        }
-                        if let Ok(rm) = region.mutable.lock() {
-                            if let Some(event) = rm.last_use_event {
+                        } else if let Ok(mut rm) = region.mutable.lock() {
+                            // Non-resident: no VA to unmap, just drain events
+                            // so we don't leak driver handles.
+                            if let Some(event) = rm.last_use_event.take() {
                                 unsafe { let _ = cuda_ffi::cuEventDestroy_v2(event); }
                             }
-                            if let Some(event) = rm.prefetch_event {
+                            if let Some(event) = rm.prefetch_event.take() {
                                 unsafe { let _ = cuda_ffi::cuEventDestroy_v2(event); }
                             }
                         }
                     }
-                    // SAFETY: freeing VA reservation. No handles exist.
+                    // SAFETY: freeing VA reservation. No handles exist and all
+                    // mapped regions above have been unmapped.
                     unsafe { let _ = cuda_ffi::cuMemAddressFree(slab.base_ptr, slab.total_size); }
                 }
             }

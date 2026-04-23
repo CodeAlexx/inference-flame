@@ -117,6 +117,12 @@ fn main() -> anyhow::Result<()> {
         .to_dtype(DType::F32)?;
     drop(tensors);
 
+    // Pre-encoded input tensors (cond/uncond/image_latents + their duplicated
+    // map entries) are in the pool. Release before loading DiT — same pattern
+    // as other turbo bins.
+    flame_core::cuda_alloc_pool::clear_pool_cache();
+    flame_core::device::trim_cuda_mempool(0);
+
     let image_h_vec = image_h_t.to_vec_f32()?;
     let image_w_vec = image_w_t.to_vec_f32()?;
     if image_h_vec.is_empty() {
@@ -465,6 +471,12 @@ fn main() -> anyhow::Result<()> {
     drop(cond);
     drop(uncond);
     drop(image_latents);
+
+    // DiT shared weights + VMM slot physical back in the pool. Release to
+    // driver — keeps this bin's post-run footprint clean for any follow-up
+    // tool reading the saved latents.
+    flame_core::cuda_alloc_pool::clear_pool_cache();
+    flame_core::device::trim_cuda_mempool(0);
 
     // ------------------------------------------------------------------
     // Stage D: save latents

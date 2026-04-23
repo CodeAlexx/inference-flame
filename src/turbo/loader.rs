@@ -291,20 +291,29 @@ impl TurboBlockLoader {
 
         let layout = &self.blocks[block_idx];
 
-        let host_base = layout.host_buffer.as_ptr() as *const u8;
-        for (_key, w) in layout.weights.iter() {
-            let dst = slot_base + w.byte_offset as u64;
-            let src = unsafe { host_base.add(w.byte_offset) };
-            let bytes = w.num_elems * 2;
-            // SAFETY: src is inside the pinned host_buffer; dst is inside the
-            // VMM-mapped slot. cuMemcpyHtoDAsync_v2 accepts VMM-mapped
-            // device pointers as a regular CUdeviceptr after cuMemSetAccess.
-            let r = unsafe {
-                cuda_ffi::cuMemcpyHtoDAsync_v2(dst, src as *const c_void, bytes, copy_stream_ptr)
-            };
-            if r != cuda_ffi::CUDA_SUCCESS {
-                return Err(VmmError::CudaError(r));
-            }
+        // Bulk H2D: the pinned host_buffer is packed with all weights at the
+        // same 16-byte-aligned offsets that the slot uses, with padding bytes
+        // in between. One cuMemcpyHtoDAsync_v2 covering [0, total_bytes)
+        // writes every weight at its correct device offset. Padding bytes are
+        // copied too but never read — slot consumers index via
+        // w.byte_offset + num_elems which excludes padding. Replaces a loop
+        // of N per-weight memcpy calls with 1, eliminating ~15x host-side
+        // driver overhead per block.
+        //
+        // SAFETY: host_base is pinned; slot is VMM-mapped with write access;
+        // total_bytes <= slot.region.size by construction (slot sized to
+        // max_block_bytes, and layout.total_bytes <= max_block_bytes).
+        let host_base = layout.host_buffer.as_ptr() as *const c_void;
+        let r = unsafe {
+            cuda_ffi::cuMemcpyHtoDAsync_v2(
+                slot_base,
+                host_base,
+                layout.total_bytes,
+                copy_stream_ptr,
+            )
+        };
+        if r != cuda_ffi::CUDA_SUCCESS {
+            return Err(VmmError::CudaError(r));
         }
 
         // Record completion event on copy_stream for the consumer's
@@ -459,8 +468,10 @@ fn build_block_layouts(
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("safetensors metadata not an object"))?;
 
-    // Per-block accumulation: a Vec of (key → (raw bytes pointer, dtype_str, shape, num_elems)).
-    let mut per_block: Vec<Vec<(String, &str, Vec<usize>, usize, usize, usize)>> =
+    // Per-block accumulation: a Vec of (name, dtype, shape, num_elems, src_start, src_end).
+    // dtype held as owned String so fused post-pass can move entries around
+    // without borrow headaches on the JSON metadata's lifetime.
+    let mut per_block: Vec<Vec<(String, String, Vec<usize>, usize, usize, usize)>> =
         (0..block_prefixes.len()).map(|_| Vec::new()).collect();
 
     for (name, info) in metadata_obj {
@@ -489,7 +500,7 @@ fn build_block_layouts(
         let start = data_start + offsets[0].as_u64().unwrap_or(0) as usize;
         let end = data_start + offsets[1].as_u64().unwrap_or(0) as usize;
 
-        per_block[block_idx].push((name.clone(), dtype_str, shape, num_elems, start, end));
+        per_block[block_idx].push((name.clone(), dtype_str.to_string(), shape, num_elems, start, end));
     }
 
     let mut blocks = Vec::with_capacity(block_prefixes.len());
@@ -498,17 +509,36 @@ fn build_block_layouts(
         // packed offsets across runs).
         entries.sort_by(|a, b| a.0.cmp(&b.0));
 
+        // -- QKV fusion pass -----------------------------------------------
+        //
+        // The DiT hot path calls:
+        //   q = linear(x, W_q); k = linear(x, W_k); v = linear(x, W_v)
+        // 3 separate cuBLASLt GEMMs per attention per block. Concat the
+        // weights along output-dim at load time to one [3*Cout, Cin] tensor
+        // — then forward calls a single bigger GEMM and splits via the fused
+        // qkv_split_permute_bf16 kernel. Applies to every attention with
+        // separate Q/K/V weights: FLUX-lineage (attn.to_{q,k,v}),
+        // cross-attention (attn.add_{q,k,v}_proj), single-stream
+        // (attn.to_{q,k,v} after the `attn.` prefix already applied).
+        //
+        // Detect triples by key suffix, synthesize a fused entry with
+        // `parts: [q_range, k_range, v_range]` that the packer concatenates
+        // along dim 0. Originals are dropped — forward code is responsible
+        // for calling the fused name.
+        let entries_with_parts = fuse_qkv_entries(entries);
+        let entries = entries_with_parts;
+
         let mut layout_map: HashMap<String, WeightLayout> = HashMap::with_capacity(entries.len());
         let mut byte_offset = 0usize;
         // First pass: assign offsets (16-byte aligned per weight to keep
         // BF16 access well-aligned for cuBLASLt downstream).
-        let mut packed_entries: Vec<(String, &str, Vec<usize>, usize, usize, usize, usize)> =
+        let mut packed_entries: Vec<(String, String, Vec<usize>, usize, Vec<(usize, usize, usize)>, usize)> =
             Vec::with_capacity(entries.len());
-        for (name, dtype, shape, num_elems, start, end) in entries {
+        for (name, dtype, shape, num_elems, parts) in entries {
             byte_offset = (byte_offset + 15) & !15;
             let this_offset = byte_offset;
             byte_offset += num_elems * 2;
-            packed_entries.push((name, dtype, shape, num_elems, start, end, this_offset));
+            packed_entries.push((name, dtype, shape, num_elems, parts, this_offset));
         }
 
         let total_bytes = byte_offset;
@@ -526,29 +556,35 @@ fn build_block_layouts(
 
         {
             let dst = host_buffer.as_mut_slice();
-            for (name, dtype, shape, num_elems, start, end, this_offset) in packed_entries {
-                let raw = &mmap[start..end];
-                let dst_idx = this_offset / 2;
-                match dtype {
-                    "BF16" => {
-                        for (i, chunk) in raw.chunks_exact(2).enumerate().take(num_elems) {
-                            dst[dst_idx + i] = u16::from_le_bytes([chunk[0], chunk[1]]);
+            for (name, dtype, shape, num_elems, parts, this_offset) in packed_entries {
+                // Pack parts sequentially into the destination window. For a
+                // regular weight, `parts` has one entry; for a fused QKV,
+                // three (Q then K then V, along output-dim axis).
+                let mut cursor = this_offset / 2;
+                for (start, end, part_num_elems) in &parts {
+                    let raw = &mmap[*start..*end];
+                    match dtype.as_str() {
+                        "BF16" => {
+                            for (i, chunk) in raw.chunks_exact(2).enumerate().take(*part_num_elems) {
+                                dst[cursor + i] = u16::from_le_bytes([chunk[0], chunk[1]]);
+                            }
                         }
-                    }
-                    "F16" => {
-                        for (i, chunk) in raw.chunks_exact(2).enumerate().take(num_elems) {
-                            let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
-                            let f = f16_to_f32(bits);
-                            dst[dst_idx + i] = f32_to_bf16(f);
+                        "F16" => {
+                            for (i, chunk) in raw.chunks_exact(2).enumerate().take(*part_num_elems) {
+                                let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
+                                let f = f16_to_f32(bits);
+                                dst[cursor + i] = f32_to_bf16(f);
+                            }
                         }
-                    }
-                    "F32" => {
-                        for (i, chunk) in raw.chunks_exact(4).enumerate().take(num_elems) {
-                            let f = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                            dst[dst_idx + i] = f32_to_bf16(f);
+                        "F32" => {
+                            for (i, chunk) in raw.chunks_exact(4).enumerate().take(*part_num_elems) {
+                                let f = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                                dst[cursor + i] = f32_to_bf16(f);
+                            }
                         }
+                        _ => unreachable!(),
                     }
-                    _ => unreachable!(),
+                    cursor += part_num_elems;
                 }
                 layout_map.insert(
                     name,
@@ -573,6 +609,125 @@ fn build_block_layouts(
     }
 
     Ok(blocks)
+}
+
+/// QKV-triple detection + fusion.
+///
+/// Accepts the raw per-block entry list from the safetensors parse and
+/// returns a new list where Q/K/V weight triples (and their biases) sharing
+/// the same attention prefix are replaced by a single fused entry of shape
+/// `[3*Cout, Cin]` (weights) or `[3*Cout]` (bias). The three original
+/// entries are dropped — forward-side code must call the fused name.
+///
+/// Patterns handled (prefix up to and including the last `.`):
+///   `<p>.to_q.weight`, `<p>.to_k.weight`, `<p>.to_v.weight`         → `<p>.to_qkv.weight`
+///   `<p>.to_q.bias`,   `<p>.to_k.bias`,   `<p>.to_v.bias`           → `<p>.to_qkv.bias`
+///   `<p>.add_q_proj.weight` + k + v                                 → `<p>.add_qkv_proj.weight`
+///   (same for bias)
+///   `<p>.q.weight`, `<p>.k.weight`, `<p>.v.weight`                  → `<p>.qkv.weight`
+///   (legacy FLUX-style)
+fn fuse_qkv_entries(
+    entries: Vec<(String, String, Vec<usize>, usize, usize, usize)>,
+) -> Vec<(String, String, Vec<usize>, usize, Vec<(usize, usize, usize)>)> {
+    // First, lift each raw entry to the new shape (name, dtype, shape,
+    // num_elems, parts=[single (start, end, num_elems)]).
+    let lifted: Vec<(String, String, Vec<usize>, usize, Vec<(usize, usize, usize)>)> =
+        entries
+            .into_iter()
+            .map(|(n, dt, sh, ne, s, e)| (n, dt, sh, ne, vec![(s, e, ne)]))
+            .collect();
+
+    // Triple patterns: (q_suffix, k_suffix, v_suffix, fused_suffix)
+    // Applied to both `.weight` and `.bias` variants.
+    let triples = [
+        ("to_q", "to_k", "to_v", "to_qkv"),
+        ("add_q_proj", "add_k_proj", "add_v_proj", "add_qkv_proj"),
+        ("q", "k", "v", "qkv"),
+    ];
+
+    let mut fused_out: Vec<(String, String, Vec<usize>, usize, Vec<(usize, usize, usize)>)> =
+        Vec::with_capacity(lifted.len());
+    let mut consumed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+    // For each (q-suffix, weight-or-bias) index-find the triple.
+    for (i, (name_i, _, _, _, _)) in lifted.iter().enumerate() {
+        if consumed.contains(&i) { continue; }
+        let name = name_i.as_str();
+
+        // Try each triple pattern × {weight, bias}
+        let mut fused_ok = false;
+        for (qs, ks, vs, fused_suffix) in &triples {
+            for tail in &[".weight", ".bias"] {
+                let q_full = format!("{qs}{tail}");
+                if !name.ends_with(&q_full) { continue; }
+                // Extract prefix: everything before q_full
+                let prefix_end = name.len() - q_full.len();
+                let prefix = &name[..prefix_end];
+                let k_name = format!("{prefix}{ks}{tail}");
+                let v_name = format!("{prefix}{vs}{tail}");
+                let fused_name = format!("{prefix}{fused_suffix}{tail}");
+
+                // Locate k and v in lifted by name.
+                let k_idx = lifted.iter().enumerate()
+                    .find(|(j, (nm, _, _, _, _))| !consumed.contains(j) && nm == &k_name)
+                    .map(|(j, _)| j);
+                let v_idx = lifted.iter().enumerate()
+                    .find(|(j, (nm, _, _, _, _))| !consumed.contains(j) && nm == &v_name)
+                    .map(|(j, _)| j);
+
+                if let (Some(ki), Some(vi)) = (k_idx, v_idx) {
+                    // Validate: same dtype, compatible shapes (bias: [C],
+                    // weight: [Cout, Cin] with identical Cin).
+                    let (_, q_dt, q_sh, q_ne, q_parts) = &lifted[i];
+                    let (_, k_dt, k_sh, k_ne, k_parts) = &lifted[ki];
+                    let (_, v_dt, v_sh, v_ne, v_parts) = &lifted[vi];
+                    if q_dt != k_dt || q_dt != v_dt {
+                        break;
+                    }
+                    // Fused shape: append along dim 0.
+                    let mut fused_shape = q_sh.clone();
+                    if fused_shape.is_empty() {
+                        break;
+                    }
+                    if q_sh.len() != k_sh.len() || q_sh.len() != v_sh.len() {
+                        break;
+                    }
+                    // Tail dims must match
+                    if q_sh[1..] != k_sh[1..] || q_sh[1..] != v_sh[1..] {
+                        break;
+                    }
+                    fused_shape[0] = q_sh[0] + k_sh[0] + v_sh[0];
+                    let fused_ne = q_ne + k_ne + v_ne;
+                    let mut fused_parts: Vec<(usize, usize, usize)> =
+                        Vec::with_capacity(q_parts.len() + k_parts.len() + v_parts.len());
+                    fused_parts.extend(q_parts.iter().copied());
+                    fused_parts.extend(k_parts.iter().copied());
+                    fused_parts.extend(v_parts.iter().copied());
+
+                    let dt = q_dt.clone();
+                    fused_out.push((fused_name, dt, fused_shape, fused_ne, fused_parts));
+                    // Intentionally do NOT mark originals as consumed — they
+                    // are retained in the final layout so forward code that
+                    // still references `to_q`/`to_k`/`to_v` individually keeps
+                    // working. Forward code that wants the fast path looks up
+                    // the synthesized `to_qkv` entry instead. A future pass
+                    // can drop the originals once every forward migrates.
+                    fused_ok = true;
+                    break;
+                }
+            }
+            if fused_ok { break; }
+        }
+    }
+
+    // Keep any entry not consumed by a triple.
+    for (i, ent) in lifted.into_iter().enumerate() {
+        if !consumed.contains(&i) {
+            fused_out.push(ent);
+        }
+    }
+    fused_out.sort_by(|a, b| a.0.cmp(&b.0));
+    fused_out
 }
 
 // ---------------------------------------------------------------------------

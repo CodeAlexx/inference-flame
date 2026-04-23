@@ -27,7 +27,7 @@ const OUTPUT_PATH: &str = "/home/alex/EriDiffusion/inference-flame/output/klein9
 const DEFAULT_PROMPT: &str = "Beautiful young woman sitting on a park bench in golden hour sunlight, professional model photoshoot for Maxim magazine advertisement, wearing a fitted summer dress, confident relaxed pose, soft bokeh background with green trees and warm light, editorial fashion photography, Canon EOS R5, 85mm f/1.4 lens, natural skin texture, magazine quality retouching, warm color grading";
 const DEFAULT_NEGATIVE: &str = "lowres, bad quality, worst quality, bad anatomy, blurry, watermark, simple background, transparent background, sketch, jpeg artifacts, ugly, poorly drawn, censor";
 
-const NUM_STEPS: usize = 50;
+const NUM_STEPS: usize = 30;
 const GUIDANCE: f32 = 4.0;
 const SEED: u64 = 42;
 const WIDTH: usize = 1024;
@@ -98,6 +98,12 @@ fn main() -> anyhow::Result<()> {
         (pos_h, neg_h)
     };
     println!("  Encoded in {:.1}s", t0.elapsed().as_secs_f32());
+
+    // Qwen3-8B encoder weights are now sitting in flame-core's pool free
+    // lists (~16 GB). Release them to the driver before loading the DiT —
+    // same pattern as inference_ui/src/worker/klein.rs and ernie.rs.
+    flame_core::cuda_alloc_pool::clear_pool_cache();
+    flame_core::device::trim_cuda_mempool(0);
 
     // ------------------------------------------------------------------
     // Stage 2: Build VMM arena + TurboBlockLoader for Klein 9B
@@ -206,20 +212,38 @@ fn main() -> anyhow::Result<()> {
     println!("\n--- Stage 3: Denoise ({} steps, guidance={}) ---", NUM_STEPS, GUIDANCE);
     let t0 = Instant::now();
 
+    // Per-step progress: each call is one denoise step (both CFG forwards).
+    let step_counter = std::cell::Cell::new(0usize);
+    let mut step_t = Instant::now();
     let denoised = euler_denoise(
         |x, t_curr| {
             let t_vec = Tensor::from_f32_to_bf16(vec![t_curr], Shape::from_dims(&[1]), device.clone())?;
             let pred_cond = model.forward_with_turbo(x, &pos_hidden, &t_vec, &img_ids, &txt_ids, &mut loader)?;
             let pred_uncond = model.forward_with_turbo(x, &neg_hidden, &t_vec, &img_ids, &txt_ids, &mut loader)?;
             let diff = pred_cond.sub(&pred_uncond)?;
-            pred_uncond.add(&diff.mul_scalar(GUIDANCE)?)
+            let out = pred_uncond.add(&diff.mul_scalar(GUIDANCE)?)?;
+
+            let i = step_counter.get();
+            let dt_step = step_t.elapsed().as_secs_f32();
+            let elapsed = t0.elapsed().as_secs_f32();
+            let avg = elapsed / (i + 1) as f32;
+            let remaining = avg * (NUM_STEPS.saturating_sub(i + 1)) as f32;
+            println!(
+                "  step {:>3}/{:<3}  {:>5.2}s/it  avg {:>5.2}s  elapsed {:>6.1}s  eta {:>5.1}s",
+                i + 1, NUM_STEPS, dt_step, avg, elapsed, remaining
+            );
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+            step_counter.set(i + 1);
+            step_t = Instant::now();
+            Ok(out)
         },
         noise,
         &timesteps,
     )?;
 
     let dt = t0.elapsed().as_secs_f32();
-    println!("  {:.1}s ({:.2}s/step)", dt, dt / NUM_STEPS as f32);
+    println!("  total {:.1}s ({:.2}s/step avg)", dt, dt / NUM_STEPS as f32);
 
     // ------------------------------------------------------------------
     // Stage 4: VAE decode
@@ -228,6 +252,15 @@ fn main() -> anyhow::Result<()> {
     let t0 = Instant::now();
     drop(loader);
     drop(model);
+    drop(arena);  // arena was Arc<VmmArena>, also held by main — drop the last ref
+                  // before VAE so VMM teardown happens before the pool-allocated
+                  // VAE tensors come into scope.
+
+    // Klein shared weights + VMM slot physical are now back in the pool.
+    // Release to driver before VAE conv workspace allocations. Matches
+    // klein.rs worker's pre-VAE flush.
+    flame_core::cuda_alloc_pool::clear_pool_cache();
+    flame_core::device::trim_cuda_mempool(0);
 
     let latents = denoised.reshape(&[1, latent_h, latent_w, 128])?.permute(&[0, 3, 1, 2])?;
 

@@ -102,6 +102,12 @@ fn main() -> anyhow::Result<()> {
         (cond_hidden, uncond_hidden)
     };
     println!("  T5 weights evicted");
+
+    // T5-XXL weights are in flame-core's pool free lists (~10 GB). Release
+    // to driver before loading the DiT — same pattern as inference_ui's
+    // klein.rs worker.
+    flame_core::cuda_alloc_pool::clear_pool_cache();
+    flame_core::device::trim_cuda_mempool(0);
     println!();
 
     // ------------------------------------------------------------------
@@ -150,17 +156,16 @@ fn main() -> anyhow::Result<()> {
     }
 
     // TurboBlockLoader works on a single safetensors file (it mmaps + parses
-    // header). Chroma's diffusers checkpoint is sharded into two files. For
-    // the turbo path we need a single-file safetensors. The user can override
-    // via `CHROMA_TURBO_SAFETENSORS`; otherwise we error out cleanly with a
-    // hint, since merging shards on the fly is out of scope for Phase 2.
+    // header). Chroma's diffusers checkpoint is sharded into two files, so
+    // pointing at `CHROMA_DIT_SHARDS[0]` silently loads only half of each
+    // block's tensors — the `Missing: single_transformer_blocks.3.attn.to_q.weight`
+    // symptom. Default to the merged single-file BF16 checkpoint at
+    // `.serenity/models/checkpoints/chroma1_hd_bf16.safetensors`; the user
+    // can override via `CHROMA_TURBO_SAFETENSORS`.
+    const CHROMA_TURBO_DEFAULT_MERGED: &str =
+        "/home/alex/.serenity/models/checkpoints/chroma1_hd_bf16.safetensors";
     let model_path = std::env::var("CHROMA_TURBO_SAFETENSORS")
-        .unwrap_or_else(|_| {
-            // Default to the first shard; if the user's env doesn't have a
-            // single-file Chroma checkpoint this path will yield an empty
-            // block layout and TurboBlockLoader::new returns InvalidRegion.
-            CHROMA_DIT_SHARDS[0].to_string()
-        });
+        .unwrap_or_else(|_| CHROMA_TURBO_DEFAULT_MERGED.to_string());
 
     let mut loader = TurboBlockLoader::new(
         model_path.clone(),
@@ -280,6 +285,11 @@ fn main() -> anyhow::Result<()> {
     drop(dit);
     drop(t5_cond_hidden);
     drop(t5_uncond_hidden);
+
+    // DiT shared weights + VMM slot physical back in the pool. Release to
+    // driver before VAE conv workspace allocations.
+    flame_core::cuda_alloc_pool::clear_pool_cache();
+    flame_core::device::trim_cuda_mempool(0);
 
     // ------------------------------------------------------------------
     // Stage 4: Unpack + VAE decode

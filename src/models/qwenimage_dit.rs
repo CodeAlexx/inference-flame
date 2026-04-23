@@ -1056,22 +1056,46 @@ impl QwenImageDit {
             .mul(&txt_scale1.add_scalar(1.0)?.unsqueeze(1)?)?
             .add(&txt_shift1.unsqueeze(1)?)?;
 
-        // ── Separate Q/K/V projections per stream ──
-        let img_q = Self::linear_bias(&img_modulated, w("attn.to_q.weight")?, w("attn.to_q.bias")?)?;
-        let img_k = Self::linear_bias(&img_modulated, w("attn.to_k.weight")?, w("attn.to_k.bias")?)?;
-        let img_v = Self::linear_bias(&img_modulated, w("attn.to_v.weight")?, w("attn.to_v.bias")?)?;
+        // ── Q/K/V projections — fused fast path (turbo loader) else fallback ──
+        let img_qkv_w = weights.get(&format!("{prefix}.attn.to_qkv.weight"));
+        let txt_qkv_w = weights.get(&format!("{prefix}.attn.add_qkv_proj.weight"));
 
-        let txt_q = Self::linear_bias(&txt_modulated, w("attn.add_q_proj.weight")?, w("attn.add_q_proj.bias")?)?;
-        let txt_k = Self::linear_bias(&txt_modulated, w("attn.add_k_proj.weight")?, w("attn.add_k_proj.bias")?)?;
-        let txt_v = Self::linear_bias(&txt_modulated, w("attn.add_v_proj.weight")?, w("attn.add_v_proj.bias")?)?;
+        let (img_q, img_k, img_v) = if let Some(qkv_w) = img_qkv_w {
+            let qkv_b = weights.get(&format!("{prefix}.attn.to_qkv.bias"));
+            let qkv = match qkv_b {
+                Some(bb) => Self::linear_bias(&img_modulated, qkv_w, bb)?,
+                None => flame_core::ops::fused_inference::fused_linear3d_native(&img_modulated, qkv_w, None)?,
+            };
+            flame_core::bf16_ops::qkv_split_permute_bf16(&qkv, h, d)?
+        } else {
+            let img_q = Self::linear_bias(&img_modulated, w("attn.to_q.weight")?, w("attn.to_q.bias")?)?;
+            let img_k = Self::linear_bias(&img_modulated, w("attn.to_k.weight")?, w("attn.to_k.bias")?)?;
+            let img_v = Self::linear_bias(&img_modulated, w("attn.to_v.weight")?, w("attn.to_v.bias")?)?;
+            (
+                img_q.reshape(&[b, n_img, h, d])?.permute(&[0, 2, 1, 3])?,
+                img_k.reshape(&[b, n_img, h, d])?.permute(&[0, 2, 1, 3])?,
+                img_v.reshape(&[b, n_img, h, d])?.permute(&[0, 2, 1, 3])?,
+            )
+        };
 
-        // ── Reshape to [B, H, N, D] ──
-        let img_q = img_q.reshape(&[b, n_img, h, d])?.permute(&[0, 2, 1, 3])?;
-        let img_k = img_k.reshape(&[b, n_img, h, d])?.permute(&[0, 2, 1, 3])?;
-        let img_v = img_v.reshape(&[b, n_img, h, d])?.permute(&[0, 2, 1, 3])?;
-        let txt_q = txt_q.reshape(&[b, n_txt, h, d])?.permute(&[0, 2, 1, 3])?;
-        let txt_k = txt_k.reshape(&[b, n_txt, h, d])?.permute(&[0, 2, 1, 3])?;
-        let txt_v = txt_v.reshape(&[b, n_txt, h, d])?.permute(&[0, 2, 1, 3])?;
+        let (txt_q, txt_k, txt_v) = if let Some(qkv_w) = txt_qkv_w {
+            let qkv_b = weights.get(&format!("{prefix}.attn.add_qkv_proj.bias"));
+            let qkv = match qkv_b {
+                Some(bb) => Self::linear_bias(&txt_modulated, qkv_w, bb)?,
+                None => flame_core::ops::fused_inference::fused_linear3d_native(&txt_modulated, qkv_w, None)?,
+            };
+            flame_core::bf16_ops::qkv_split_permute_bf16(&qkv, h, d)?
+        } else {
+            let txt_q = Self::linear_bias(&txt_modulated, w("attn.add_q_proj.weight")?, w("attn.add_q_proj.bias")?)?;
+            let txt_k = Self::linear_bias(&txt_modulated, w("attn.add_k_proj.weight")?, w("attn.add_k_proj.bias")?)?;
+            let txt_v = Self::linear_bias(&txt_modulated, w("attn.add_v_proj.weight")?, w("attn.add_v_proj.bias")?)?;
+            (
+                txt_q.reshape(&[b, n_txt, h, d])?.permute(&[0, 2, 1, 3])?,
+                txt_k.reshape(&[b, n_txt, h, d])?.permute(&[0, 2, 1, 3])?,
+                txt_v.reshape(&[b, n_txt, h, d])?.permute(&[0, 2, 1, 3])?,
+            )
+        };
+        let _ = (b, n_img, n_txt);
 
         // ── QK RMSNorm ──
         let img_q = Self::rms_norm(&img_q, w("attn.norm_q.weight")?, 1e-6)?;
@@ -1088,11 +1112,10 @@ impl QwenImageDit {
         // ── Joint SDPA ──
         let attn_out = flame_core::attention::sdpa(&q, &k, &v, None)?;
 
-        // ── Split, permute, project out ──
-        let txt_attn = attn_out.narrow(2, 0, n_txt)?;
-        let img_attn = attn_out.narrow(2, n_txt, n_img)?;
-        let img_attn = img_attn.permute(&[0, 2, 1, 3])?.reshape(&[b, n_img, h * d])?;
-        let txt_attn = txt_attn.permute(&[0, 2, 1, 3])?.reshape(&[b, n_txt, h * d])?;
+        // ── Split, permute, project out — fused ──
+        let (txt_attn, img_attn) =
+            flame_core::bf16_ops::attn_split_txt_img_bf16(&attn_out, n_txt, n_img)?;
+        let _ = (b, n_img, n_txt, h, d);
 
         let img_attn = Self::linear_bias(&img_attn, w("attn.to_out.0.weight")?, w("attn.to_out.0.bias")?)?;
         let txt_attn = Self::linear_bias(&txt_attn, w("attn.to_add_out.weight")?, w("attn.to_add_out.bias")?)?;
@@ -1230,20 +1253,46 @@ impl QwenImageDit {
             .mul(&txt_scale1.add_scalar(1.0)?.unsqueeze(1)?)?
             .add(&txt_shift1.unsqueeze(1)?)?;
 
-        // ── QKV projections per stream ──
-        let img_q = Self::linear_bias(&img_modulated, w("attn.to_q.weight")?, w("attn.to_q.bias")?)?;
-        let img_k = Self::linear_bias(&img_modulated, w("attn.to_k.weight")?, w("attn.to_k.bias")?)?;
-        let img_v = Self::linear_bias(&img_modulated, w("attn.to_v.weight")?, w("attn.to_v.bias")?)?;
-        let txt_q = Self::linear_bias(&txt_modulated, w("attn.add_q_proj.weight")?, w("attn.add_q_proj.bias")?)?;
-        let txt_k = Self::linear_bias(&txt_modulated, w("attn.add_k_proj.weight")?, w("attn.add_k_proj.bias")?)?;
-        let txt_v = Self::linear_bias(&txt_modulated, w("attn.add_v_proj.weight")?, w("attn.add_v_proj.bias")?)?;
+        // ── QKV projections — fused fast path (turbo loader) else fallback ──
+        let img_qkv_w = weights.get(&format!("{prefix}.attn.to_qkv.weight"));
+        let txt_qkv_w = weights.get(&format!("{prefix}.attn.add_qkv_proj.weight"));
 
-        let img_q = img_q.reshape(&[b, n_img, h, d])?.permute(&[0, 2, 1, 3])?;
-        let img_k = img_k.reshape(&[b, n_img, h, d])?.permute(&[0, 2, 1, 3])?;
-        let img_v = img_v.reshape(&[b, n_img, h, d])?.permute(&[0, 2, 1, 3])?;
-        let txt_q = txt_q.reshape(&[b, n_txt, h, d])?.permute(&[0, 2, 1, 3])?;
-        let txt_k = txt_k.reshape(&[b, n_txt, h, d])?.permute(&[0, 2, 1, 3])?;
-        let txt_v = txt_v.reshape(&[b, n_txt, h, d])?.permute(&[0, 2, 1, 3])?;
+        let (img_q, img_k, img_v) = if let Some(qkv_w) = img_qkv_w {
+            let qkv_b = weights.get(&format!("{prefix}.attn.to_qkv.bias"));
+            let qkv = match qkv_b {
+                Some(bb) => Self::linear_bias(&img_modulated, qkv_w, bb)?,
+                None => flame_core::ops::fused_inference::fused_linear3d_native(&img_modulated, qkv_w, None)?,
+            };
+            flame_core::bf16_ops::qkv_split_permute_bf16(&qkv, h, d)?
+        } else {
+            let img_q = Self::linear_bias(&img_modulated, w("attn.to_q.weight")?, w("attn.to_q.bias")?)?;
+            let img_k = Self::linear_bias(&img_modulated, w("attn.to_k.weight")?, w("attn.to_k.bias")?)?;
+            let img_v = Self::linear_bias(&img_modulated, w("attn.to_v.weight")?, w("attn.to_v.bias")?)?;
+            (
+                img_q.reshape(&[b, n_img, h, d])?.permute(&[0, 2, 1, 3])?,
+                img_k.reshape(&[b, n_img, h, d])?.permute(&[0, 2, 1, 3])?,
+                img_v.reshape(&[b, n_img, h, d])?.permute(&[0, 2, 1, 3])?,
+            )
+        };
+
+        let (txt_q, txt_k, txt_v) = if let Some(qkv_w) = txt_qkv_w {
+            let qkv_b = weights.get(&format!("{prefix}.attn.add_qkv_proj.bias"));
+            let qkv = match qkv_b {
+                Some(bb) => Self::linear_bias(&txt_modulated, qkv_w, bb)?,
+                None => flame_core::ops::fused_inference::fused_linear3d_native(&txt_modulated, qkv_w, None)?,
+            };
+            flame_core::bf16_ops::qkv_split_permute_bf16(&qkv, h, d)?
+        } else {
+            let txt_q = Self::linear_bias(&txt_modulated, w("attn.add_q_proj.weight")?, w("attn.add_q_proj.bias")?)?;
+            let txt_k = Self::linear_bias(&txt_modulated, w("attn.add_k_proj.weight")?, w("attn.add_k_proj.bias")?)?;
+            let txt_v = Self::linear_bias(&txt_modulated, w("attn.add_v_proj.weight")?, w("attn.add_v_proj.bias")?)?;
+            (
+                txt_q.reshape(&[b, n_txt, h, d])?.permute(&[0, 2, 1, 3])?,
+                txt_k.reshape(&[b, n_txt, h, d])?.permute(&[0, 2, 1, 3])?,
+                txt_v.reshape(&[b, n_txt, h, d])?.permute(&[0, 2, 1, 3])?,
+            )
+        };
+        let _ = (b, n_img, n_txt);
 
         let img_q = Self::rms_norm(&img_q, w("attn.norm_q.weight")?, 1e-6)?;
         let img_k = Self::rms_norm(&img_k, w("attn.norm_k.weight")?, 1e-6)?;
@@ -1257,10 +1306,10 @@ impl QwenImageDit {
 
         let attn_out = flame_core::attention::sdpa(&q, &k, &v, None)?;
 
-        let txt_attn = attn_out.narrow(2, 0, n_txt)?;
-        let img_attn = attn_out.narrow(2, n_txt, n_img)?;
-        let img_attn = img_attn.permute(&[0, 2, 1, 3])?.reshape(&[b, n_img, h * d])?;
-        let txt_attn = txt_attn.permute(&[0, 2, 1, 3])?.reshape(&[b, n_txt, h * d])?;
+        // Fused split+permute.
+        let (txt_attn, img_attn) =
+            flame_core::bf16_ops::attn_split_txt_img_bf16(&attn_out, n_txt, n_img)?;
+        let _ = (b, n_img, n_txt, h, d);
 
         let img_attn = Self::linear_bias(&img_attn, w("attn.to_out.0.weight")?, w("attn.to_out.0.bias")?)?;
         let txt_attn = Self::linear_bias(&txt_attn, w("attn.to_add_out.weight")?, w("attn.to_add_out.bias")?)?;

@@ -330,22 +330,16 @@ fn double_block_forward(
     let b = img_qkv.shape().dims()[0];
     let n_img = img_qkv.shape().dims()[1];
     let n_txt = txt_qkv.shape().dims()[1];
+    let _ = b;
 
     // Split QKV: [B, N, 3*inner_dim] -> q, k, v each [B, H, N, D]
-    let split_qkv = |qkv: &Tensor, seq_len: usize| -> Result<(Tensor, Tensor, Tensor)> {
-        let inner = h * d;
-        let q = qkv.narrow(2, 0, inner)?;
-        let k = qkv.narrow(2, inner, inner)?;
-        let v = qkv.narrow(2, 2 * inner, inner)?;
-        // [B, N, H, D] -> permute [0, 2, 1, 3] -> [B, H, N, D]
-        let q = q.reshape(&[b, seq_len, h, d])?.permute(&[0, 2, 1, 3])?;
-        let k = k.reshape(&[b, seq_len, h, d])?.permute(&[0, 2, 1, 3])?;
-        let v = v.reshape(&[b, seq_len, h, d])?.permute(&[0, 2, 1, 3])?;
-        Ok((q, k, v))
-    };
-
-    let (mut img_q, mut img_k, img_v) = split_qkv(&img_qkv, n_img)?;
-    let (mut txt_q, mut txt_k, txt_v) = split_qkv(&txt_qkv, n_txt)?;
+    // Fused: one kernel replaces 3 narrows + 3 permutes per QKV group.
+    let (mut img_q, mut img_k, img_v) =
+        flame_core::bf16_ops::qkv_split_permute_bf16(&img_qkv, h, d)?;
+    let (mut txt_q, mut txt_k, txt_v) =
+        flame_core::bf16_ops::qkv_split_permute_bf16(&txt_qkv, h, d)?;
+    let _ = n_img;
+    let _ = n_txt;
 
     // QK norm (RMSNorm per head)
     img_q = head_rms_norm(
@@ -376,17 +370,11 @@ fn double_block_forward(
     // Scaled dot-product attention
     let attn_out = flame_core::attention::sdpa(&q, &k, &v, None)?; // [B, H, N_total, D]
 
-    // Split back: txt first, then img
-    let txt_out = attn_out.narrow(2, 0, n_txt)?;
-    let img_out = attn_out.narrow(2, n_txt, n_img)?;
-
-    // Reshape: [B, H, N, D] -> permute [0, 2, 1, 3] -> [B, N, H*D]
-    let img_out = img_out
-        .permute(&[0, 2, 1, 3])?
-        .reshape(&[b, n_img, h * d])?;
-    let txt_out = txt_out
-        .permute(&[0, 2, 1, 3])?
-        .reshape(&[b, n_txt, h * d])?;
+    // Split back: txt first, then img. Fused kernel replaces
+    // 2 narrow + 2 permute with a single pass over attn_out.
+    let (txt_out, img_out) =
+        flame_core::bf16_ops::attn_split_txt_img_bf16(&attn_out, n_txt, n_img)?;
+    let _ = b;
 
     // Output projection (NO bias)
     let img_out = lin(&img_out, &weights[&format!("{prefix}.img_attn.proj.weight")])?;
@@ -464,18 +452,9 @@ fn single_block_forward(
     let n = qkv.shape().dims()[1];
 
     // Split QKV -> q, k, v each [B, H, N, D]
-    let q = qkv
-        .narrow(2, 0, inner_dim)?
-        .reshape(&[b, n, h, d])?
-        .permute(&[0, 2, 1, 3])?;
-    let k = qkv
-        .narrow(2, inner_dim, inner_dim)?
-        .reshape(&[b, n, h, d])?
-        .permute(&[0, 2, 1, 3])?;
-    let v = qkv
-        .narrow(2, 2 * inner_dim, inner_dim)?
-        .reshape(&[b, n, h, d])?
-        .permute(&[0, 2, 1, 3])?;
+    // Fused: one kernel replaces 3 narrows + 3 permutes.
+    let _ = (b, n, inner_dim);
+    let (q, k, v) = flame_core::bf16_ops::qkv_split_permute_bf16(&qkv, h, d)?;
 
     // QK norm (RMSNorm per head)
     let q = head_rms_norm(&q, &weights[&format!("{prefix}.norm.query_norm.scale")])?;
