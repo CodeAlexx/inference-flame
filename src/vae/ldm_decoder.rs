@@ -59,18 +59,18 @@ use std::sync::Arc;
 // expected layout). The single `permute_021` call is real GPU work and
 // preserves BF16 storage.
 
-/// NCHW -> NHWC. Uses the 4D permute directly now that flame-core's
-/// general fallback routes through `GpuOps::permute_generic` (a real
-/// GPU scatter kernel) instead of the old CPU scalar loop. The previous
-/// 3D-reshape workaround is kept below as a reference for how we
-/// diagnosed the original bug; see PERF_VAE_PERMUTE.md.
+/// NCHW -> NHWC. `Tensor::permute` returns a strided VIEW, not a
+/// materialized tensor — feeding that view to `group_norm`/`Conv2d`
+/// gives garbage because they read storage as if contiguous. Use the
+/// dedicated GPU kernel that actually scatters to a contiguous NHWC
+/// buffer.
 fn to_nhwc(x: &Tensor) -> Result<Tensor> {
-    x.permute(&[0, 2, 3, 1])
+    flame_core::cuda_ops::GpuOps::permute_nchw_to_nhwc(x)
 }
 
 /// NHWC -> NCHW. Same rationale as `to_nhwc`.
 fn to_nchw(x: &Tensor) -> Result<Tensor> {
-    x.permute(&[0, 3, 1, 2])
+    flame_core::cuda_ops::GpuOps::permute_nhwc_to_nchw(x)
 }
 
 /// GroupNorm on NCHW tensor (converts to NHWC internally, converts back)
@@ -362,8 +362,11 @@ impl AttnBlock {
         // Output projection
         let out = linear_3d(&out, &self.proj_out_w, &self.proj_out_b)?;
 
-        // [B, N, C] -> [B, C, H, W]
-        let out = out.reshape(&[b, h, w, c])?.permute(&[0, 3, 1, 2])?;
+        // [B, N, C] -> [B, C, H, W]. permute() returns a strided view; call
+        // the dedicated NHWC->NCHW kernel so the residual `x + out` feeds
+        // `add` contiguous memory (else same class of bug as `to_nhwc`).
+        let out = out.reshape(&[b, h, w, c])?;
+        let out = flame_core::cuda_ops::GpuOps::permute_nhwc_to_nchw(&out)?;
 
         // Residual
         x.add(&out)
