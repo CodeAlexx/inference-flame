@@ -87,6 +87,10 @@ name = "sdxl_lora_infer"
 path = "src/bin/sdxl_lora_infer.rs"
 
 [[bin]]
+name = "sd3_lora_infer"
+path = "src/bin/sd3_lora_infer.rs"
+
+[[bin]]
 name = "klein_infer"
 path = "src/bin/klein_infer.rs"
 
