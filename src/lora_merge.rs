@@ -76,12 +76,28 @@ pub enum LoraFormat {
     /// ai-toolkit (FLUX/Klein convention): `diffusion_model.<key>.lora_A.weight`
     /// keys, direct base mapping with `.weight` appended, full overlay.
     AiToolkit,
+    /// kohya / sd-scripts SDXL: `lora_(unet|te1|te2)_<path_with_underscores>.lora_(down|up).weight`
+    /// + per-module `.alpha` scalar. UNet keys map to LDM-format base by
+    /// reversing the underscore-encoding back to dotted path; only the
+    /// `lora_unet_*` subset is merged (text-encoder LoRAs are applied at
+    /// encode time, not into the UNet weights).
+    KohyaSdxl,
 }
 
 /// Detect format from the LoRA key shape. ai-toolkit always uses
 /// `.lora_A.weight`. Klein-trainer uses `.qkv_proj`/`.out_proj` projection
 /// names. Z-Image trainer uses `attention.to_q/to_k/to_v` and `feed_forward.w*`.
+/// kohya SDXL uses `lora_(unet|te1|te2)_…lora_(down|up).weight`.
 pub fn detect_format(lora: &HashMap<String, Tensor>) -> LoraFormat {
+    if lora
+        .keys()
+        .any(|k| k.starts_with("lora_unet_") || k.starts_with("lora_te1_") || k.starts_with("lora_te2_"))
+        && lora
+            .keys()
+            .any(|k| k.ends_with(".lora_down.weight") || k.ends_with(".lora_up.weight"))
+    {
+        return LoraFormat::KohyaSdxl;
+    }
     if lora.keys().any(|k| k.ends_with(".lora_A.weight") || k.ends_with(".lora_B.weight")) {
         return LoraFormat::AiToolkit;
     }
@@ -130,6 +146,25 @@ fn map_prefix_aitoolkit(prefix: &str) -> Option<(String, Slot)> {
     // name suffix on the prefix. Strip it.
     let stripped = stripped.strip_suffix(".default").unwrap_or(stripped);
     Some((format!("{stripped}.weight"), Slot::Full))
+}
+
+/// Build a map from kohya-encoded LoRA prefix → base safetensors key.
+///
+/// kohya encodes module paths by replacing dots with underscores:
+///   `input_blocks.4.1.transformer_blocks.0.attn1.to_q` (LDM dotted)
+///   →  `lora_unet_input_blocks_4_1_transformer_blocks_0_attn1_to_q` (kohya).
+/// Reversing this mapping is ambiguous in general (`to_out_0` could be
+/// `to_out.0` or `to.out.0`), so we do a forward scan of base weight keys
+/// and build the reverse table once. Keys not present in base are simply
+/// skipped at merge time.
+fn build_kohya_unet_table(base: &HashMap<String, Tensor>) -> HashMap<String, String> {
+    let mut t = HashMap::new();
+    for k in base.keys() {
+        let Some(module) = k.strip_suffix(".weight") else { continue };
+        let kohya = module.replace('.', "_");
+        t.insert(format!("lora_unet_{kohya}"), k.clone());
+    }
+    t
 }
 
 /// Z-Image trainer prefix → base key + slot.
@@ -200,6 +235,14 @@ pub fn merge_klein_lora(
     let (suffix_a, suffix_b) = match format {
         LoraFormat::KleinTrainer | LoraFormat::ZImageTrainer => (".lora_A", ".lora_B"),
         LoraFormat::AiToolkit => (".lora_A.weight", ".lora_B.weight"),
+        LoraFormat::KohyaSdxl => (".lora_down.weight", ".lora_up.weight"),
+    };
+
+    // For kohya we resolve LoRA prefixes against the actual base key set.
+    let kohya_table = if matches!(format, LoraFormat::KohyaSdxl) {
+        Some(build_kohya_unet_table(base))
+    } else {
+        None
     };
 
     // Index LoRA pairs by prefix.
@@ -209,6 +252,7 @@ pub fn merge_klein_lora(
             prefixes.insert(p.to_string());
         }
     }
+    let mut n_skipped_te = 0usize;
 
     let mut n_merged = 0usize;
     let mut n_skipped_unknown = 0usize;
@@ -229,6 +273,19 @@ pub fn merge_klein_lora(
             LoraFormat::KleinTrainer => map_prefix_klein_trainer(prefix),
             LoraFormat::ZImageTrainer => map_prefix_zimage_trainer(prefix),
             LoraFormat::AiToolkit => map_prefix_aitoolkit(prefix),
+            LoraFormat::KohyaSdxl => {
+                if prefix.starts_with("lora_te1_") || prefix.starts_with("lora_te2_") {
+                    // Text-encoder LoRAs aren't merged into the UNet base;
+                    // the encoder pass would need separate adaptation.
+                    n_skipped_te += 1;
+                    None
+                } else {
+                    kohya_table
+                        .as_ref()
+                        .and_then(|t| t.get(prefix))
+                        .map(|b| (b.clone(), Slot::Full))
+                }
+            }
         };
         let Some((bkey, slot)) = mapped else {
             if prefix.starts_with("input_bridges.") {
@@ -240,11 +297,31 @@ pub fn merge_klein_lora(
             continue;
         };
 
+        // Per-module alpha override (kohya only). `<prefix>.alpha` is a
+        // SCALAR tensor that overrides the global alpha for that module:
+        //   delta = (alpha_module / rank) * multiplier * (B @ A)
+        // Kohya's lora_down has shape [rank, in], so rank is `a.shape()[0]`.
+        let module_scale = if matches!(format, LoraFormat::KohyaSdxl) {
+            let alpha_key = format!("{prefix}.alpha");
+            match lora.get(&alpha_key) {
+                Some(t) => {
+                    // Scalar tensor (shape [] in safetensors) — read its single value.
+                    let v = t.to_dtype(DType::F32)?.to_vec()?;
+                    let alpha_module = v.first().copied().unwrap_or(rank as f32);
+                    let module_rank = a.shape().dims()[0];
+                    (alpha_module / module_rank as f32) * multiplier
+                }
+                None => scale,
+            }
+        } else {
+            scale
+        };
+
         // Compute delta = scale * (B @ A) → [out, in] in the LoRA's dtype.
         // Trainer-saved LoRAs are typically F32 master copies; ai-toolkit
         // ships BF16. Either way we cast the delta to match base dtype
         // before the add — the matmul stays in the LoRA's native precision.
-        let delta_native = b.matmul(a)?.mul_scalar(scale)?;
+        let delta_native = b.matmul(a)?.mul_scalar(module_scale)?;
         let delta_dims = delta_native.shape().dims().to_vec();
 
         let Some(base_w) = base.get(&bkey) else {
@@ -349,6 +426,11 @@ pub fn merge_klein_lora(
     }
     if n_skipped_unknown > 0 {
         eprintln!("[lora] skipped {n_skipped_unknown} unknown prefixes");
+    }
+    if n_skipped_te > 0 {
+        eprintln!(
+            "[lora] skipped {n_skipped_te} text-encoder (lora_te1_/lora_te2_) modules — not merged into UNet"
+        );
     }
 
     Ok(n_merged)

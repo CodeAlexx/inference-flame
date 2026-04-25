@@ -154,6 +154,35 @@ impl ClipEncoder {
         )?.to_dtype(DType::BF16)
     }
 
+    /// Combined causal + key-padding mask.
+    ///
+    /// `valid_key_end` is the index of the LAST valid key (inclusive). Tokens
+    /// at positions `> valid_key_end` are pad and are masked out in the keys.
+    /// Queries at any position can attend to keys `j` iff `j <= i` (causal)
+    /// AND `j <= valid_key_end` (no pad keys). For SDXL CLIP-L/G with HF
+    /// `attention_mask` semantics, `valid_key_end` is the index of the first
+    /// EOS token (the "real" EOS, before the pad-EOS run).
+    fn build_pad_mask(
+        seq_len: usize,
+        valid_key_end: usize,
+        device: &Arc<CudaDevice>,
+    ) -> Result<Tensor> {
+        let mut data = vec![0.0f32; seq_len * seq_len];
+        for i in 0..seq_len {
+            for j in 0..seq_len {
+                if j <= i && j <= valid_key_end {
+                    data[i * seq_len + j] = 1.0;
+                }
+            }
+        }
+        Tensor::from_vec(
+            data,
+            Shape::from_dims(&[1, 1, seq_len, seq_len]),
+            device.clone(),
+        )?
+        .to_dtype(DType::BF16)
+    }
+
     /// Single CLIP transformer layer.
     ///
     /// ## PyTorch reference:
@@ -240,6 +269,72 @@ impl ClipEncoder {
     /// layer norm applied to the hidden state at the FIRST EOS token position.
     /// Pads/truncates `token_ids` to `max_position_embeddings` (77) to match
     /// `padding="max_length", max_length=77, truncation=True`.
+    /// SDXL-style encode: combines causal mask with HF's `attention_mask`
+    /// (key-padding mask) so pad-position outputs match HF's CLIPTextModel
+    /// when the cross-attention context includes ALL 77 positions.
+    ///
+    /// Without the pad mask, pad-position queries attend to other pad keys
+    /// and accumulate divergent context across layers — passes the pooled
+    /// cos_sim ≥ 0.9999 (real EOS) but the full context is cos~0.5 vs HF.
+    /// SDXL UNet attends to the full context, so this matters.
+    ///
+    /// Returns `(last_hidden_state [1, seq, dim], pooler_output [1, dim])`.
+    pub fn encode_sdxl(&self, token_ids: &[i32]) -> Result<(Tensor, Tensor)> {
+        let cfg = &self.config;
+        let max_len = cfg.max_position_embeddings;
+
+        let mut padded: Vec<i32> = token_ids.to_vec();
+        if padded.len() > max_len {
+            padded.truncate(max_len);
+        } else {
+            padded.resize(max_len, cfg.eos_token_id);
+        }
+        let seq_len = max_len;
+
+        // Find the real EOS — argmax over (id == eos_token_id) returns the
+        // FIRST 1, matching HF's pooler-output gather.
+        let real_eos = padded
+            .iter()
+            .position(|&id| id == cfg.eos_token_id)
+            .unwrap_or(seq_len - 1);
+
+        let token_w = self.w("text_model.embeddings.token_embedding.weight")?;
+        let pos_w = self.w("text_model.embeddings.position_embedding.weight")?;
+
+        let ids = Tensor::from_vec(
+            padded.iter().map(|&id| id as f32).collect(),
+            Shape::from_dims(&[seq_len]),
+            self.device.clone(),
+        )?
+        .to_dtype(DType::I32)?;
+        let token_embeds = token_w.index_select0(&ids)?;
+
+        let pos_ids = Tensor::from_vec(
+            (0..seq_len as i32).map(|i| i as f32).collect(),
+            Shape::from_dims(&[seq_len]),
+            self.device.clone(),
+        )?
+        .to_dtype(DType::I32)?;
+        let pos_embeds = pos_w.index_select0(&pos_ids)?;
+
+        let mut hidden = token_embeds.add(&pos_embeds)?.unsqueeze(0)?;
+
+        // Combined causal + key-padding mask (pad keys are tokens beyond the
+        // real EOS).
+        let mask = Self::build_pad_mask(seq_len, real_eos, &self.device)?;
+
+        for i in 0..cfg.num_layers {
+            hidden = self.layer_forward(&hidden, i, &mask)?;
+        }
+
+        let final_ln_w = self.w("text_model.final_layer_norm.weight")?;
+        let final_ln_b = self.w("text_model.final_layer_norm.bias")?;
+        let hidden = Self::layer_norm(&hidden, final_ln_w, final_ln_b, cfg.layer_norm_eps)?;
+        let pooled = hidden.narrow(1, real_eos, 1)?.squeeze(Some(1))?;
+
+        Ok((hidden, pooled))
+    }
+
     pub fn encode(&self, token_ids: &[i32]) -> Result<(Tensor, Tensor)> {
         let cfg = &self.config;
         let max_len = cfg.max_position_embeddings; // 77

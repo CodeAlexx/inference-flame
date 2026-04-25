@@ -1049,11 +1049,23 @@ impl SDXLUNet {
         path: &str,
         device: &Arc<cudarc::driver::CudaDevice>,
     ) -> Result<Self> {
-        let mut all_weights = flame_core::serialization::load_file(
+        let all_weights = flame_core::serialization::load_file(
             std::path::Path::new(path), device,
         )?;
         println!("[SDXLUNet] Loaded {} weight tensors (all-on-GPU)", all_weights.len());
+        Self::from_weights_all_gpu(path.to_string(), all_weights, device.clone())
+    }
 
+    /// Build an all-on-GPU UNet from pre-loaded weights.
+    ///
+    /// Use this when you need to pre-process weights (e.g. apply a LoRA
+    /// merge) before construction. The HWIO conv-weight permutation runs
+    /// here so the caller doesn't need to know about it.
+    pub fn from_weights_all_gpu(
+        model_path: String,
+        mut all_weights: HashMap<String, Tensor>,
+        device: Arc<cudarc::driver::CudaDevice>,
+    ) -> Result<Self> {
         // Pre-compute HWIO weight permutations for every conv weight.
         // OIHW [OC,IC,KH,KW] -> HWIO [KH,KW,IC,OC] — done once, used every forward pass.
         let conv_keys: Vec<String> = all_weights
@@ -1081,8 +1093,8 @@ impl SDXLUNet {
         let mut unet = Self {
             config,
             resident: all_weights,
-            model_path: path.to_string(),
-            device: device.clone(),
+            model_path,
+            device,
             block_cache: HashMap::new(),
             kernels,
             input_block_descs: Vec::new(),

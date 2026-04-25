@@ -14,7 +14,12 @@ use flame_core::{global_cuda_device, DType, Shape, Tensor};
 use std::time::Instant;
 
 const MODEL_PATH: &str = "/home/alex/EriDiffusion/Models/checkpoints/sdxl_unet_bf16.safetensors";
-const VAE_PATH: &str = "/home/alex/EriDiffusion/Models/checkpoints/sd_xl_base_1.0.safetensors"; // VAE from combined checkpoint
+// Standalone SDXL VAE. The combined `sd_xl_base_1.0.safetensors` ships
+// the VAE under `first_stage_model.*` but produces horizontal-stripe
+// garbage when decoded through the Rust LdmVAEDecoder for reasons we
+// haven't isolated (other VAE files in the same loader work fine — this
+// is checkpoint-format specific). Use the standalone weights.
+const VAE_PATH: &str = "/home/alex/.serenity/models/vaes/OfficialStableDiffusion/sdxl_vae.safetensors";
 const DEFAULT_EMB_PATH: &str = "/home/alex/EriDiffusion/inference-flame/output/sdxl_embeddings.safetensors";
 const OUTPUT_PATH: &str = "/home/alex/EriDiffusion/inference-flame/output/sdxl_rust.png";
 

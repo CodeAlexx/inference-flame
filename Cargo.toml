@@ -75,6 +75,18 @@ name = "zimage_lora_infer"
 path = "src/bin/zimage_lora_infer.rs"
 
 [[bin]]
+name = "sdxl_encode"
+path = "src/bin/sdxl_encode.rs"
+
+[[bin]]
+name = "sdxl_vae_decode_test"
+path = "src/bin/sdxl_vae_decode_test.rs"
+
+[[bin]]
+name = "sdxl_lora_infer"
+path = "src/bin/sdxl_lora_infer.rs"
+
+[[bin]]
 name = "klein_infer"
 path = "src/bin/klein_infer.rs"
 
