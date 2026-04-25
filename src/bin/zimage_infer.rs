@@ -187,10 +187,13 @@ fn main() -> Result<()> {
     let cap_feats = cap_feats.to_dtype(DType::BF16)?;
     println!("    cap_feats shape: {:?}", cap_feats.shape().dims());
 
-    let cap_feats_uncond = emb_tensors.get("cap_feats_uncond").map(|t| {
-        println!("    cap_feats_uncond shape: {:?}", t.shape().dims());
-        t.clone()
-    });
+    let cap_feats_uncond = match emb_tensors.get("cap_feats_uncond") {
+        Some(t) => {
+            println!("    cap_feats_uncond shape: {:?}", t.shape().dims());
+            Some(t.to_dtype(DType::BF16)?)
+        }
+        None => None,
+    };
     let cap_feats_uncond_ref = cap_feats_uncond.as_ref();
 
     // ==================================================================

@@ -1,0 +1,355 @@
+//! Pure-Rust LoRA merge for Klein 4B/9B. Handles two formats:
+//!
+//! ## Klein-trainer format (4B-tuned)
+//!
+//! Bare `<prefix>.lora_A` / `.lora_B` keys with internal projection names:
+//!
+//! | LoRA prefix                                          | Base key                                  | Slot         |
+//! |------------------------------------------------------|-------------------------------------------|--------------|
+//! | `double_blocks.<i>.img_attn.qkv_proj`                | `double_blocks.<i>.img_attn.qkv.weight`   | full overlay |
+//! | `double_blocks.<i>.img_attn.out_proj`                | `double_blocks.<i>.img_attn.proj.weight`  | full overlay |
+//! | `double_blocks.<i>.txt_attn.qkv_proj`                | `double_blocks.<i>.txt_attn.qkv.weight`   | full overlay |
+//! | `double_blocks.<i>.txt_attn.out_proj`                | `double_blocks.<i>.txt_attn.proj.weight`  | full overlay |
+//! | `single_blocks.<j>.qkv_proj`                         | `single_blocks.<j>.linear1.weight`        | rows[:9216]  |
+//! | `single_blocks.<j>.out_proj`                         | `single_blocks.<j>.linear2.weight`        | cols[:3072]  |
+//! | `input_bridges.{latent,text}_bridge.{weight,bias}`   | (not in base — skipped)                   | —            |
+//!
+//! Slot constants (9216, 3072) are 4B-specific. 9B-tuned klein-trainer
+//! LoRAs would need the equivalent (12288, 4096) values; not yet handled.
+//!
+//! ## ai-toolkit format (Klein 4B/9B)
+//!
+//! `diffusion_model.<base_key>.lora_A.weight` / `.lora_B.weight`. The
+//! base key is just the LoRA prefix with `diffusion_model.` stripped and
+//! `.weight` appended; full overlay everywhere. Covers:
+//!
+//! - `double_blocks.<i>.{img,txt}_attn.{qkv,proj}` → direct base name
+//! - `double_blocks.<i>.{img,txt}_mlp.{0,2}` → direct (klein-trainer
+//!   doesn't target mlp; ai-toolkit does)
+//! - `single_blocks.<j>.{linear1,linear2}` → direct (no slicing — the
+//!   LoRA `lora_B` is sized for the full matrix)
+//!
+//! ## LoRA math (both formats)
+//!
+//! `delta_W = scale * (lora_B @ lora_A)`, `scale = (alpha/rank) * multiplier`.
+//!   `lora_A`: `[rank, in_features]`
+//!   `lora_B`: `[out_features, rank]`
+//!
+//! Reference for klein-trainer: the now-deleted
+//! `klein-trainer/scripts/lora_merge.py`. A copy lives next to verified
+//! samples at
+//! `flame-diffusion/output/klein4b_2k_postbug4/verified_samples/lora_merge.py`.
+
+use flame_core::{trim_cuda_mempool, DType, Error, Result, Tensor};
+use std::collections::{BTreeSet, HashMap};
+
+const SINGLE_QKV_ROWS: usize = 9216;
+const SINGLE_OUT_COLS: usize = 3072;
+
+/// Z-Image fused QKV is `[3*dim, dim]` with Q/K/V stacked along dim 0.
+/// For dim=3840 the per-head ranges are 0..3840, 3840..7680, 7680..11520.
+const ZIMAGE_DIM: usize = 3840;
+
+#[derive(Clone, Copy, Debug)]
+enum Slot {
+    /// Full overlay: base shape == delta shape.
+    Full,
+    /// Top `n` rows of base get `delta`. base[..n, :] += delta.
+    Rows(usize),
+    /// Left `n` cols of base get `delta`. base[:, ..n] += delta.
+    Cols(usize),
+    /// Row-range `[start..start+len]` of base gets `delta`.
+    /// Used for Z-Image's split-Q/K/V LoRA delta into fused QKV base.
+    RowRange { start: usize, len: usize },
+}
+
+/// Detected LoRA file format.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoraFormat {
+    /// Klein-trainer: bare `<prefix>.lora_A` keys, custom projection names
+    /// (`*_proj`), needs row/col slicing for single_blocks.
+    KleinTrainer,
+    /// Z-Image trainer (this repo): bare `<prefix>.lora_A` keys with split
+    /// Q/K/V (`attention.to_q/to_k/to_v`). Q/K/V deltas merge into the
+    /// fused `attention.qkv.weight` row-range. Targets only `layers.<i>.*`.
+    ZImageTrainer,
+    /// ai-toolkit (FLUX/Klein convention): `diffusion_model.<key>.lora_A.weight`
+    /// keys, direct base mapping with `.weight` appended, full overlay.
+    AiToolkit,
+}
+
+/// Detect format from the LoRA key shape. ai-toolkit always uses
+/// `.lora_A.weight`. Klein-trainer uses `.qkv_proj`/`.out_proj` projection
+/// names. Z-Image trainer uses `attention.to_q/to_k/to_v` and `feed_forward.w*`.
+pub fn detect_format(lora: &HashMap<String, Tensor>) -> LoraFormat {
+    if lora.keys().any(|k| k.ends_with(".lora_A.weight") || k.ends_with(".lora_B.weight")) {
+        return LoraFormat::AiToolkit;
+    }
+    if lora
+        .keys()
+        .any(|k| k.contains(".attention.to_q.lora_") || k.contains(".feed_forward.w1.lora_"))
+    {
+        return LoraFormat::ZImageTrainer;
+    }
+    LoraFormat::KleinTrainer
+}
+
+fn map_prefix_klein_trainer(prefix: &str) -> Option<(String, Slot)> {
+    if prefix.starts_with("input_bridges.") {
+        // Bridges aren't in the base; trainer-only. Caller skips silently.
+        return None;
+    }
+    if let Some(rest) = prefix.strip_suffix(".img_attn.qkv_proj") {
+        return Some((format!("{rest}.img_attn.qkv.weight"), Slot::Full));
+    }
+    if let Some(rest) = prefix.strip_suffix(".img_attn.out_proj") {
+        return Some((format!("{rest}.img_attn.proj.weight"), Slot::Full));
+    }
+    if let Some(rest) = prefix.strip_suffix(".txt_attn.qkv_proj") {
+        return Some((format!("{rest}.txt_attn.qkv.weight"), Slot::Full));
+    }
+    if let Some(rest) = prefix.strip_suffix(".txt_attn.out_proj") {
+        return Some((format!("{rest}.txt_attn.proj.weight"), Slot::Full));
+    }
+    if prefix.starts_with("single_blocks.") {
+        if let Some(rest) = prefix.strip_suffix(".qkv_proj") {
+            return Some((format!("{rest}.linear1.weight"), Slot::Rows(SINGLE_QKV_ROWS)));
+        }
+        if let Some(rest) = prefix.strip_suffix(".out_proj") {
+            return Some((format!("{rest}.linear2.weight"), Slot::Cols(SINGLE_OUT_COLS)));
+        }
+    }
+    None
+}
+
+/// ai-toolkit prefix → base key. Strip leading `diffusion_model.` if
+/// present and append `.weight`. ai-toolkit always uses full overlay.
+fn map_prefix_aitoolkit(prefix: &str) -> Option<(String, Slot)> {
+    let stripped = prefix.strip_prefix("diffusion_model.").unwrap_or(prefix);
+    // Some ai-toolkit LoRAs (PEFT-style) include `.default` as the adapter
+    // name suffix on the prefix. Strip it.
+    let stripped = stripped.strip_suffix(".default").unwrap_or(stripped);
+    Some((format!("{stripped}.weight"), Slot::Full))
+}
+
+/// Z-Image trainer prefix → base key + slot.
+///
+/// Z-Image trainer LoRA targets the main `layers.<i>.*` blocks only:
+///
+/// | LoRA prefix                                  | Base key                                  | Slot                       |
+/// |----------------------------------------------|-------------------------------------------|----------------------------|
+/// | `layers.<i>.attention.to_q`                  | `layers.<i>.attention.qkv.weight`         | rows[0..3840]              |
+/// | `layers.<i>.attention.to_k`                  | `layers.<i>.attention.qkv.weight`         | rows[3840..7680]           |
+/// | `layers.<i>.attention.to_v`                  | `layers.<i>.attention.qkv.weight`         | rows[7680..11520]          |
+/// | `layers.<i>.attention.out`                   | `layers.<i>.attention.out.weight`         | full overlay               |
+/// | `layers.<i>.feed_forward.w{1,2,3}`           | `layers.<i>.feed_forward.w{1,2,3}.weight` | full overlay               |
+fn map_prefix_zimage_trainer(prefix: &str) -> Option<(String, Slot)> {
+    if let Some(rest) = prefix.strip_suffix(".attention.to_q") {
+        return Some((
+            format!("{rest}.attention.qkv.weight"),
+            Slot::RowRange { start: 0, len: ZIMAGE_DIM },
+        ));
+    }
+    if let Some(rest) = prefix.strip_suffix(".attention.to_k") {
+        return Some((
+            format!("{rest}.attention.qkv.weight"),
+            Slot::RowRange { start: ZIMAGE_DIM, len: ZIMAGE_DIM },
+        ));
+    }
+    if let Some(rest) = prefix.strip_suffix(".attention.to_v") {
+        return Some((
+            format!("{rest}.attention.qkv.weight"),
+            Slot::RowRange { start: 2 * ZIMAGE_DIM, len: ZIMAGE_DIM },
+        ));
+    }
+    if let Some(rest) = prefix.strip_suffix(".attention.out") {
+        return Some((format!("{rest}.attention.out.weight"), Slot::Full));
+    }
+    if prefix.ends_with(".feed_forward.w1")
+        || prefix.ends_with(".feed_forward.w2")
+        || prefix.ends_with(".feed_forward.w3")
+    {
+        return Some((format!("{prefix}.weight"), Slot::Full));
+    }
+    None
+}
+
+/// Merge a Klein LoRA into a base weight dict in-place.
+///
+/// `alpha / rank` is the scale factor (default training: alpha=16, rank=16
+/// → scale=1.0). Pass `multiplier` as a runtime knob to dial the LoRA
+/// strength up/down without retraining (multiplier=1.0 = trained strength,
+/// 0.0 = base only, 2.0 = double effect).
+///
+/// Returns the number of modules merged.
+pub fn merge_klein_lora(
+    base: &mut HashMap<String, Tensor>,
+    lora: &HashMap<String, Tensor>,
+    alpha: f32,
+    rank: usize,
+    multiplier: f32,
+) -> Result<usize> {
+    if rank == 0 {
+        return Err(Error::InvalidInput("rank must be > 0".into()));
+    }
+    let scale = (alpha / rank as f32) * multiplier;
+    let format = detect_format(lora);
+    eprintln!("[lora] detected format: {format:?}");
+
+    // Per-format suffixes for keying lora_A/lora_B pairs.
+    let (suffix_a, suffix_b) = match format {
+        LoraFormat::KleinTrainer | LoraFormat::ZImageTrainer => (".lora_A", ".lora_B"),
+        LoraFormat::AiToolkit => (".lora_A.weight", ".lora_B.weight"),
+    };
+
+    // Index LoRA pairs by prefix.
+    let mut prefixes: BTreeSet<String> = BTreeSet::new();
+    for k in lora.keys() {
+        if let Some(p) = k.strip_suffix(suffix_a) {
+            prefixes.insert(p.to_string());
+        }
+    }
+
+    let mut n_merged = 0usize;
+    let mut n_skipped_unknown = 0usize;
+    let mut n_skipped_bridge = 0usize;
+
+    for prefix in &prefixes {
+        let a = lora
+            .get(&format!("{prefix}{suffix_a}"))
+            .ok_or_else(|| Error::InvalidInput(format!("missing {prefix}{suffix_a}")))?;
+        let Some(b) = lora.get(&format!("{prefix}{suffix_b}")) else {
+            // Pair half-missing — log and continue.
+            eprintln!("[lora] {prefix}{suffix_b} missing, skipping");
+            continue;
+        };
+
+        // Map to base key + slot.
+        let mapped = match format {
+            LoraFormat::KleinTrainer => map_prefix_klein_trainer(prefix),
+            LoraFormat::ZImageTrainer => map_prefix_zimage_trainer(prefix),
+            LoraFormat::AiToolkit => map_prefix_aitoolkit(prefix),
+        };
+        let Some((bkey, slot)) = mapped else {
+            if prefix.starts_with("input_bridges.") {
+                n_skipped_bridge += 1;
+            } else {
+                eprintln!("[lora] unknown prefix '{prefix}'");
+                n_skipped_unknown += 1;
+            }
+            continue;
+        };
+
+        // Compute delta = scale * (B @ A) → [out, in] in the LoRA's dtype.
+        // Trainer-saved LoRAs are typically F32 master copies; ai-toolkit
+        // ships BF16. Either way we cast the delta to match base dtype
+        // before the add — the matmul stays in the LoRA's native precision.
+        let delta_native = b.matmul(a)?.mul_scalar(scale)?;
+        let delta_dims = delta_native.shape().dims().to_vec();
+
+        let Some(base_w) = base.get(&bkey) else {
+            eprintln!("[lora] base key missing for '{prefix}': '{bkey}'");
+            continue;
+        };
+
+        let base_dtype = base_w.dtype();
+        let base_dims = base_w.shape().dims().to_vec();
+        let delta = if delta_native.dtype() == base_dtype {
+            delta_native
+        } else {
+            delta_native.to_dtype(base_dtype)?
+        };
+
+        let merged = match slot {
+            Slot::Full => {
+                if base_dims != delta_dims {
+                    eprintln!(
+                        "[lora] shape mismatch on '{bkey}': base {base_dims:?} vs delta {delta_dims:?}"
+                    );
+                    continue;
+                }
+                base_w.add(&delta)?
+            }
+            Slot::Rows(n) => {
+                if base_dims.len() != 2
+                    || delta_dims != vec![n, base_dims[1]]
+                    || base_dims[0] < n
+                {
+                    eprintln!(
+                        "[lora] row-merge shape mismatch on '{bkey}': base {base_dims:?} vs delta {delta_dims:?} (rows={n})"
+                    );
+                    continue;
+                }
+                let top = base_w.narrow(0, 0, n)?.contiguous()?;
+                let bottom = base_w.narrow(0, n, base_dims[0] - n)?.contiguous()?;
+                let top_merged = top.add(&delta)?;
+                Tensor::cat(&[&top_merged, &bottom], 0)?
+            }
+            Slot::Cols(n) => {
+                if base_dims.len() != 2
+                    || delta_dims != vec![base_dims[0], n]
+                    || base_dims[1] < n
+                {
+                    eprintln!(
+                        "[lora] col-merge shape mismatch on '{bkey}': base {base_dims:?} vs delta {delta_dims:?} (cols={n})"
+                    );
+                    continue;
+                }
+                let left = base_w.narrow(1, 0, n)?.contiguous()?;
+                let right = base_w.narrow(1, n, base_dims[1] - n)?.contiguous()?;
+                let left_merged = left.add(&delta)?;
+                Tensor::cat(&[&left_merged, &right], 1)?
+            }
+            Slot::RowRange { start, len } => {
+                if base_dims.len() != 2
+                    || delta_dims != vec![len, base_dims[1]]
+                    || start + len > base_dims[0]
+                {
+                    eprintln!(
+                        "[lora] row-range shape mismatch on '{bkey}': base {base_dims:?} vs delta {delta_dims:?} (start={start} len={len})"
+                    );
+                    continue;
+                }
+                // Split base into [head | mid (the merge target) | tail]
+                // and rejoin after adding delta into mid.
+                let head_len = start;
+                let tail_len = base_dims[0] - start - len;
+                let mut parts: Vec<Tensor> = Vec::with_capacity(3);
+                if head_len > 0 {
+                    parts.push(base_w.narrow(0, 0, head_len)?.contiguous()?);
+                }
+                let mid = base_w.narrow(0, start, len)?.contiguous()?;
+                let mid_merged = mid.add(&delta)?;
+                parts.push(mid_merged);
+                if tail_len > 0 {
+                    parts.push(base_w.narrow(0, start + len, tail_len)?.contiguous()?);
+                }
+                let part_refs: Vec<&Tensor> = parts.iter().collect();
+                Tensor::cat(&part_refs, 0)?
+            }
+        };
+
+        let merged_native = if merged.dtype() == base_dtype {
+            merged.contiguous()?
+        } else {
+            merged.to_dtype(base_dtype)?.contiguous()?
+        };
+        base.insert(bkey, merged_native);
+        n_merged += 1;
+
+        // Trim every 16 modules to keep the cuda mempool from holding
+        // 9B-scale BF16 scratch (delta + merged) across the whole loop.
+        if n_merged % 16 == 0 {
+            trim_cuda_mempool(0);
+        }
+    }
+
+    if n_skipped_bridge > 0 {
+        eprintln!("[lora] skipped {n_skipped_bridge} input_bridges entries (trainer-only, not in base)");
+    }
+    if n_skipped_unknown > 0 {
+        eprintln!("[lora] skipped {n_skipped_unknown} unknown prefixes");
+    }
+
+    Ok(n_merged)
+}

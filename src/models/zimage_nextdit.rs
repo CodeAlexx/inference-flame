@@ -496,6 +496,41 @@ impl NextDiT {
         timestep: &Tensor,
         cap_feats: &Tensor,
     ) -> Result<Tensor> {
+        self.forward_inner(x, timestep, cap_feats, None)
+    }
+
+    /// Forward with optional intermediate capture for parity testing.
+    /// When `capture` is Some, named intermediates are inserted into the map
+    /// at the same boundaries used by `tools/zimage_pyref.py`.
+    pub fn forward_with_capture(
+        &mut self,
+        x: &Tensor,
+        timestep: &Tensor,
+        cap_feats: &Tensor,
+        capture: &mut HashMap<String, Tensor>,
+    ) -> Result<Tensor> {
+        self.forward_inner(x, timestep, cap_feats, Some(capture))
+    }
+
+    fn forward_inner(
+        &mut self,
+        x: &Tensor,
+        timestep: &Tensor,
+        cap_feats: &Tensor,
+        mut capture: Option<&mut HashMap<String, Tensor>>,
+    ) -> Result<Tensor> {
+        // Helper: clone-and-insert into capture map. Materializes via contiguous()
+        // so saved tensors are independent of any later view rewrites.
+        macro_rules! cap {
+            ($name:expr, $tensor:expr) => {
+                if let Some(c) = capture.as_deref_mut() {
+                    let t = $tensor;
+                    let owned = t.contiguous().unwrap_or_else(|_| t.clone());
+                    c.insert($name.to_string(), owned);
+                }
+            };
+        }
+
         let pad_mult = self.config.pad_tokens_multiple;
 
         // Invert timestep and scale
@@ -505,6 +540,7 @@ impl NextDiT {
             inv_data, timestep.shape().clone(), self.device.clone(), DType::BF16,
         )?;
         let t_cond = self.timestep_embed(&t_scaled)?;
+        cap!("t_emb", &t_cond);
 
         // Patchify and embed image
         let (x_patches, ph, pw) = self.patchify(x)?;
@@ -513,10 +549,12 @@ impl NextDiT {
         } else {
             self.linear_no_bias(&x_patches, "x_embedder.weight")?
         };
+        cap!("x_after_embedder", &x_emb);
         let img_len = x_emb.shape().dims()[1];
 
         // Embed captions
         let c = self.caption_embed(cap_feats)?;
+        cap!("cap_after_embedder", &c);
 
         // Pad caption and image to multiple of 32
         let (c, _) = self.pad_to_multiple(&c, "cap_pad_token", pad_mult)?;
@@ -540,6 +578,7 @@ impl NextDiT {
             self.load_block(&prefix)?;
             c = self.transformer_block(&c, &rope_cos_cap, &rope_sin_cap, None, &prefix)?;
             self.unload_block();
+            cap!(format!("cap_after_context_refiner_{:02}", i), &c);
         }
 
         // Noise refiner: image self-attention (conditioned)
@@ -549,10 +588,14 @@ impl NextDiT {
             self.load_block(&prefix)?;
             x_emb = self.transformer_block(&x_emb, &rope_cos_img, &rope_sin_img, Some(&t_cond), &prefix)?;
             self.unload_block();
+            cap!(format!("x_after_noise_refiner_{:02}", i), &x_emb);
         }
 
-        // Concatenate text + image for main layers
+        // Concatenate text + image for main layers.
+        // NOTE: flame-core order is [cap, image]; Python reference order is
+        // [image, cap]. The parity test slices both halves and compares per-half.
         let mut xc = Tensor::cat(&[&c, &x_emb], 1)?;
+        cap!("unified_initial", &xc);
 
         // Main transformer layers
         for i in 0..self.config.num_layers {
@@ -560,6 +603,7 @@ impl NextDiT {
             self.load_block(&prefix)?;
             xc = self.transformer_block(&xc, &rope_cos_full, &rope_sin_full, Some(&t_cond), &prefix)?;
             self.unload_block();
+            cap!(format!("unified_after_layer_{:02}", i), &xc);
         }
 
         // Extract image tokens (skip text, remove padding)
@@ -567,6 +611,7 @@ impl NextDiT {
 
         // Final layer
         let x_final = self.final_layer(&x_out, &t_cond)?;
+        cap!("after_final_layer_img", &x_final);
 
         // Unpatchify + negate (ZImage convention)
         let x_spatial = self.unpatchify(&x_final, ph, pw)?;

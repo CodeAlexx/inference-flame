@@ -67,8 +67,20 @@ name = "zimage_infer"
 path = "src/bin/zimage_infer.rs"
 
 [[bin]]
+name = "zimage_parity"
+path = "src/bin/zimage_parity.rs"
+
+[[bin]]
+name = "zimage_lora_infer"
+path = "src/bin/zimage_lora_infer.rs"
+
+[[bin]]
 name = "klein_infer"
 path = "src/bin/klein_infer.rs"
+
+[[bin]]
+name = "klein_lora_infer"
+path = "src/bin/klein_lora_infer.rs"
 
 [[bin]]
 name = "klein_edit_infer"
