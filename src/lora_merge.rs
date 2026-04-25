@@ -167,6 +167,198 @@ fn build_kohya_unet_table(base: &HashMap<String, Tensor>) -> HashMap<String, Str
     t
 }
 
+/// Rewrite a kohya UNet prefix from diffusers naming to LDM naming for SDXL.
+///
+/// Most SDXL LoRAs in the wild (sd-scripts, OneTrainer, ai-toolkit) ship
+/// with diffusers-style block names (`down_blocks/up_blocks/mid_block`,
+/// `attentions/resnets/upsamplers`, ResBlock submodules `norm1/conv1/...`).
+/// Our SDXL UNet checkpoint uses LDM naming (`input_blocks/output_blocks/
+/// middle_block`, ResBlock submodules `in_layers/out_layers/...`). This
+/// function converts the prefix; the kohya reverse-lookup table then
+/// matches the LDM base key.
+///
+/// SDXL block-index mapping (canonical, see e.g. diffusers'
+/// `convert_unet_state_dict_to_sd`):
+///
+/// | diffusers                            | LDM                       |
+/// |--------------------------------------|---------------------------|
+/// | down_blocks.0.resnets.{0,1}          | input_blocks.{1,2}.0      |
+/// | down_blocks.0.downsamplers.0         | input_blocks.3.0          |
+/// | down_blocks.1.{resnets,attentions}.{0,1} | input_blocks.{4,5}.{0,1} |
+/// | down_blocks.1.downsamplers.0         | input_blocks.6.0          |
+/// | down_blocks.2.{resnets,attentions}.{0,1} | input_blocks.{7,8}.{0,1} |
+/// | mid_block.resnets.0                  | middle_block.0            |
+/// | mid_block.attentions.0               | middle_block.1            |
+/// | mid_block.resnets.1                  | middle_block.2            |
+/// | up_blocks.0.{resnets,attentions}.{0,1,2} | output_blocks.{0,1,2}.{0,1} |
+/// | up_blocks.0.upsamplers.0             | output_blocks.2.2         |
+/// | up_blocks.1.{resnets,attentions}.{0,1,2} | output_blocks.{3,4,5}.{0,1} |
+/// | up_blocks.1.upsamplers.0             | output_blocks.5.2         |
+/// | up_blocks.2.resnets.{0,1,2}          | output_blocks.{6,7,8}.0   |
+///
+/// Within a ResBlock, diffusers→LDM submodule rename:
+///   norm1→in_layers_0, conv1→in_layers_2, time_emb_proj→emb_layers_1,
+///   norm2→out_layers_0, conv2→out_layers_3, conv_shortcut→skip_connection.
+///
+/// Other root paths:
+///   conv_in→input_blocks_0_0, time_embedding.linear_(1,2)→time_embed.(0,2),
+///   add_embedding.linear_(1,2)→label_emb.0.(0,2),
+///   conv_norm_out→out.0, conv_out→out.2.
+fn rewrite_kohya_diffusers_to_ldm(prefix: &str) -> Option<String> {
+    let suffix = prefix.strip_prefix("lora_unet_")?;
+
+    // ---- top-level standalone modules ----
+    if suffix == "conv_in" {
+        return Some("lora_unet_input_blocks_0_0".into());
+    }
+    if suffix == "conv_norm_out" {
+        return Some("lora_unet_out_0".into());
+    }
+    if suffix == "conv_out" {
+        return Some("lora_unet_out_2".into());
+    }
+    if let Some(n) = suffix.strip_prefix("time_embedding_linear_") {
+        let m = match n {
+            "1" => "0",
+            "2" => "2",
+            _ => return None,
+        };
+        return Some(format!("lora_unet_time_embed_{m}"));
+    }
+    if let Some(n) = suffix.strip_prefix("add_embedding_linear_") {
+        let m = match n {
+            "1" => "0",
+            "2" => "2",
+            _ => return None,
+        };
+        return Some(format!("lora_unet_label_emb_0_{m}"));
+    }
+
+    // ---- helpers ----
+    fn rewrite_resblock_submodule(rest: &str) -> String {
+        // rest is the part AFTER the resblock identifier, with leading underscore.
+        // Map diffusers ResBlock submodule names to LDM equivalents.
+        rest.replacen("_norm1_", "_in_layers_0_", 1)
+            .replacen("_conv1_", "_in_layers_2_", 1)
+            .replacen("_time_emb_proj_", "_emb_layers_1_", 1)
+            .replacen("_norm2_", "_out_layers_0_", 1)
+            .replacen("_conv2_", "_out_layers_3_", 1)
+            .replacen("_conv_shortcut_", "_skip_connection_", 1)
+            // Trailing forms (when the submodule terminates the prefix without a
+            // following underscore — e.g. for ResBlock's `.lora_down.weight`
+            // suffix on `time_emb_proj` itself, the rest is just the leaf name).
+            .replacen("_norm1", "_in_layers_0", 1)
+            .replacen("_conv1", "_in_layers_2", 1)
+            .replacen("_time_emb_proj", "_emb_layers_1", 1)
+            .replacen("_norm2", "_out_layers_0", 1)
+            .replacen("_conv2", "_out_layers_3", 1)
+            .replacen("_conv_shortcut", "_skip_connection", 1)
+    }
+
+    // ---- down_blocks ----
+    if let Some(rest) = suffix.strip_prefix("down_blocks_") {
+        // rest like "0_resnets_0_..." or "1_attentions_0_..." or "0_downsamplers_0_..."
+        let mut parts = rest.splitn(3, '_'); // ["0", "resnets", "0_..."] or "0_downsamplers_0..."
+        let blk = parts.next()?; // "0", "1", or "2"
+        let kind = parts.next()?; // "resnets" | "attentions" | "downsamplers"
+        let tail = parts.next().unwrap_or("");
+        // tail may start with the index, e.g. "0_norm1_..." or "0_transformer_blocks_..."
+        let mut tail_iter = tail.splitn(2, '_');
+        let idx = tail_iter.next()?; // "0", "1", "2"
+        let rest_after_idx = tail_iter.next().map(|s| format!("_{s}")).unwrap_or_default();
+        let (input_idx, sub_idx) = match (blk, kind, idx) {
+            ("0", "resnets", "0") => ("1", "0"),
+            ("0", "resnets", "1") => ("2", "0"),
+            ("0", "downsamplers", "0") => ("3", "0"),
+            ("1", "resnets", "0") => ("4", "0"),
+            ("1", "attentions", "0") => ("4", "1"),
+            ("1", "resnets", "1") => ("5", "0"),
+            ("1", "attentions", "1") => ("5", "1"),
+            ("1", "downsamplers", "0") => ("6", "0"),
+            ("2", "resnets", "0") => ("7", "0"),
+            ("2", "attentions", "0") => ("7", "1"),
+            ("2", "resnets", "1") => ("8", "0"),
+            ("2", "attentions", "1") => ("8", "1"),
+            _ => return None,
+        };
+        let rest_after_idx = if kind == "resnets" {
+            rewrite_resblock_submodule(&rest_after_idx)
+        } else if kind == "downsamplers" {
+            // downsamplers.0 (with .conv inside in diffusers) → input_blocks.N.0.op
+            rest_after_idx.replacen("_conv", "_op", 1)
+        } else {
+            // attentions: keep submodule name as-is (proj_in, proj_out,
+            // transformer_blocks.X.attn{1,2}.to_{q,k,v,out_0}, etc.)
+            rest_after_idx
+        };
+        return Some(format!("lora_unet_input_blocks_{input_idx}_{sub_idx}{rest_after_idx}"));
+    }
+
+    // ---- mid_block ----
+    if let Some(rest) = suffix.strip_prefix("mid_block_") {
+        let mut parts = rest.splitn(3, '_');
+        let kind = parts.next()?; // "resnets" | "attentions"
+        let idx = parts.next()?; // "0" | "1"
+        let tail = parts.next().map(|s| format!("_{s}")).unwrap_or_default();
+        let mid_idx = match (kind, idx) {
+            ("resnets", "0") => "0",
+            ("attentions", "0") => "1",
+            ("resnets", "1") => "2",
+            _ => return None,
+        };
+        let tail = if kind == "resnets" {
+            rewrite_resblock_submodule(&tail)
+        } else {
+            tail
+        };
+        return Some(format!("lora_unet_middle_block_{mid_idx}{tail}"));
+    }
+
+    // ---- up_blocks ----
+    if let Some(rest) = suffix.strip_prefix("up_blocks_") {
+        let mut parts = rest.splitn(3, '_');
+        let blk = parts.next()?; // "0", "1", "2"
+        let kind = parts.next()?; // "resnets" | "attentions" | "upsamplers"
+        let tail = parts.next().unwrap_or("");
+        let mut tail_iter = tail.splitn(2, '_');
+        let idx = tail_iter.next()?;
+        let rest_after_idx = tail_iter.next().map(|s| format!("_{s}")).unwrap_or_default();
+        let (out_idx, sub_idx) = match (blk, kind, idx) {
+            ("0", "resnets", "0") => ("0", "0"),
+            ("0", "attentions", "0") => ("0", "1"),
+            ("0", "resnets", "1") => ("1", "0"),
+            ("0", "attentions", "1") => ("1", "1"),
+            ("0", "resnets", "2") => ("2", "0"),
+            ("0", "attentions", "2") => ("2", "1"),
+            ("0", "upsamplers", "0") => ("2", "2"),
+            ("1", "resnets", "0") => ("3", "0"),
+            ("1", "attentions", "0") => ("3", "1"),
+            ("1", "resnets", "1") => ("4", "0"),
+            ("1", "attentions", "1") => ("4", "1"),
+            ("1", "resnets", "2") => ("5", "0"),
+            ("1", "attentions", "2") => ("5", "1"),
+            ("1", "upsamplers", "0") => ("5", "2"),
+            ("2", "resnets", "0") => ("6", "0"),
+            ("2", "resnets", "1") => ("7", "0"),
+            ("2", "resnets", "2") => ("8", "0"),
+            _ => return None,
+        };
+        let rest_after_idx = if kind == "resnets" {
+            rewrite_resblock_submodule(&rest_after_idx)
+        } else if kind == "upsamplers" {
+            // upsamplers.0.conv → output_blocks.<n>.<sub>.conv (LDM
+            // wraps the conv inside an Upsample module that forwards
+            // to .conv).
+            rest_after_idx
+        } else {
+            rest_after_idx
+        };
+        return Some(format!("lora_unet_output_blocks_{out_idx}_{sub_idx}{rest_after_idx}"));
+    }
+
+    None
+}
+
 /// Z-Image trainer prefix → base key + slot.
 ///
 /// Z-Image trainer LoRA targets the main `layers.<i>.*` blocks only:
@@ -278,12 +470,20 @@ pub fn merge_klein_lora(
                     // Text-encoder LoRAs aren't merged into the UNet base;
                     // the encoder pass would need separate adaptation.
                     n_skipped_te += 1;
-                    None
+                    continue;
+                }
+                let table = kohya_table.as_ref();
+                // Try direct (LDM-named) lookup first.
+                let direct = table.and_then(|t| t.get(prefix));
+                if let Some(bk) = direct {
+                    Some((bk.clone(), Slot::Full))
                 } else {
-                    kohya_table
-                        .as_ref()
-                        .and_then(|t| t.get(prefix))
-                        .map(|b| (b.clone(), Slot::Full))
+                    // Fall back: rewrite diffusers naming → LDM, retry.
+                    rewrite_kohya_diffusers_to_ldm(prefix)
+                        .and_then(|ldm_prefix| {
+                            table.and_then(|t| t.get(&ldm_prefix)).cloned()
+                        })
+                        .map(|bk| (bk, Slot::Full))
                 }
             }
         };
@@ -317,11 +517,37 @@ pub fn merge_klein_lora(
             scale
         };
 
-        // Compute delta = scale * (B @ A) → [out, in] in the LoRA's dtype.
-        // Trainer-saved LoRAs are typically F32 master copies; ai-toolkit
-        // ships BF16. Either way we cast the delta to match base dtype
-        // before the add — the matmul stays in the LoRA's native precision.
-        let delta_native = b.matmul(a)?.mul_scalar(module_scale)?;
+        // Compute delta = module_scale * (B @ A). Two cases:
+        //
+        // Linear LoRA: A is [rank, in], B is [out, rank], delta is [out, in].
+        // Conv2D LoRA (kohya): A is [rank, ic, kh, kw], B is [oc, rank, 1, 1].
+        //   Reshape: A → [rank, ic*kh*kw], B → [oc, rank]; matmul →
+        //   [oc, ic*kh*kw]; reshape back to [oc, ic, kh, kw] for the conv merge.
+        //   This matches kohya's `LoRAModule.merge_to` for `LoRAModuleConv2d`.
+        let delta_native = if a.shape().dims().len() == 4 || b.shape().dims().len() == 4 {
+            let a_dims = a.shape().dims().to_vec();
+            let b_dims = b.shape().dims().to_vec();
+            if a_dims.len() != 4 || b_dims.len() != 4 {
+                eprintln!(
+                    "[lora] conv LoRA needs both 4D on '{prefix}': A={a_dims:?} B={b_dims:?}"
+                );
+                continue;
+            }
+            let (r_a, ic, kh, kw) = (a_dims[0], a_dims[1], a_dims[2], a_dims[3]);
+            let (oc, r_b) = (b_dims[0], b_dims[1]);
+            if r_a != r_b {
+                eprintln!(
+                    "[lora] conv LoRA rank mismatch on '{prefix}': A rank={r_a} B rank={r_b}"
+                );
+                continue;
+            }
+            let a_2d = a.reshape(&[r_a, ic * kh * kw])?;
+            let b_2d = b.reshape(&[oc, r_b])?;
+            let delta_2d = b_2d.matmul(&a_2d)?.mul_scalar(module_scale)?;
+            delta_2d.reshape(&[oc, ic, kh, kw])?
+        } else {
+            b.matmul(a)?.mul_scalar(module_scale)?
+        };
         let delta_dims = delta_native.shape().dims().to_vec();
 
         let Some(base_w) = base.get(&bkey) else {
