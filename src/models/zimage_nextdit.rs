@@ -105,11 +105,19 @@ impl NextDiT {
             let is_2d = weights.get(key).map(|t| t.shape().dims().len() == 2).unwrap_or(false);
             if is_2d {
                 if let Some(t) = weights.remove(key) {
-                    if let Ok(tt) = t.permute(&[1, 0]) {
-                        weights.insert(key.clone(), tt);
-                        transposed += 1;
-                    } else {
-                        weights.insert(key.clone(), t);
+                    // permute() returns a strided view; gemm reads weights as
+                    // contiguous row-major and IGNORES custom_strides, so a
+                    // raw permute view becomes garbage on the kernel side.
+                    // Materialize via .contiguous() so the in/out layout the
+                    // kernel reads matches the post-transpose logical shape.
+                    match t.permute(&[1, 0]).and_then(|v| v.contiguous()) {
+                        Ok(tt) => {
+                            weights.insert(key.clone(), tt);
+                            transposed += 1;
+                        }
+                        Err(_) => {
+                            weights.insert(key.clone(), t);
+                        }
                     }
                 }
             }
