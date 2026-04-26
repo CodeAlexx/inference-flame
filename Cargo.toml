@@ -91,6 +91,10 @@ name = "sd3_lora_infer"
 path = "src/bin/sd3_lora_infer.rs"
 
 [[bin]]
+name = "ernie_lora_infer"
+path = "src/bin/ernie_lora_infer.rs"
+
+[[bin]]
 name = "klein_infer"
 path = "src/bin/klein_infer.rs"
 
