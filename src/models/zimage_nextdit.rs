@@ -19,6 +19,7 @@ use flame_core::{DType, Error, Result, Shape, Tensor};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::lora::LoraStack;
 use crate::offload::BlockLoader;
 
 // ---------------------------------------------------------------------------
@@ -76,6 +77,9 @@ pub struct NextDiT {
     resident: HashMap<String, Tensor>,
     loader: Option<BlockLoader>,
     device: Arc<cudarc::driver::CudaDevice>,
+    /// Optional runtime LoRA stack — applied at each `linear_no_bias` call.
+    /// Base weights are never mutated.
+    lora: Option<Arc<LoraStack>>,
 }
 
 impl NextDiT {
@@ -86,7 +90,7 @@ impl NextDiT {
         device: Arc<cudarc::driver::CudaDevice>,
     ) -> Self {
         let loader = Some(BlockLoader::new(model_path, device.clone()));
-        Self { config: NextDiTConfig::default(), resident, loader, device }
+        Self { config: NextDiTConfig::default(), resident, loader, device, lora: None }
     }
 
     /// All-resident mode: every weight on GPU, no disk I/O.
@@ -123,7 +127,14 @@ impl NextDiT {
             }
         }
         println!("    Pre-transposed {transposed} weight matrices");
-        Self { config: NextDiTConfig::default(), resident: weights, loader: None, device }
+        Self { config: NextDiTConfig::default(), resident: weights, loader: None, device, lora: None }
+    }
+
+    /// Attach a runtime LoRA stack. Subsequent `linear_no_bias` calls will
+    /// add `scale * up(down(x))` from any matching entries to the base
+    /// matmul output. Base weights are not modified.
+    pub fn set_lora(&mut self, lora: Arc<LoraStack>) {
+        self.lora = Some(lora);
     }
 
     fn load_block(&mut self, prefix: &str) -> Result<()> {
@@ -174,19 +185,25 @@ impl NextDiT {
             (weight, w_dims[1])
         } else {
             // Original: [out, in] -> transpose
-            return {
-                let out_features = w_dims[0];
-                let x_2d = x.reshape(&[batch, in_features])?;
-                let wt = weight.permute(&[1, 0])?;
-                let out_2d = x_2d.matmul(&wt)?;
-                let mut out_shape = x_dims[..x_dims.len() - 1].to_vec();
-                out_shape.push(out_features);
-                out_2d.reshape(&out_shape)
+            let out_features = w_dims[0];
+            let x_2d = x.reshape(&[batch, in_features])?;
+            let wt = weight.permute(&[1, 0])?;
+            let out_2d = x_2d.matmul(&wt)?;
+            let out_2d = match self.lora {
+                Some(ref lora) => lora.apply(weight_key, &x_2d, out_2d)?,
+                None => out_2d,
             };
+            let mut out_shape = x_dims[..x_dims.len() - 1].to_vec();
+            out_shape.push(out_features);
+            return out_2d.reshape(&out_shape);
         };
 
         let x_2d = x.reshape(&[batch, in_features])?;
         let out_2d = x_2d.matmul(wt)?;
+        let out_2d = match self.lora {
+            Some(ref lora) => lora.apply(weight_key, &x_2d, out_2d)?,
+            None => out_2d,
+        };
 
         let mut out_shape = x_dims[..x_dims.len() - 1].to_vec();
         out_shape.push(out_features);

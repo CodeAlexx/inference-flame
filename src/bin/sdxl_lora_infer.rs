@@ -1,12 +1,14 @@
-//! SDXL inference with a LoRA merged in — pure Rust.
+//! SDXL inference with a runtime-applied LoRA — pure Rust.
 //!
-//! Loads SDXL UNet base, applies a LoRA via `lora_merge::merge_klein_lora`
-//! (auto-detects KohyaSdxl / AiToolkit format), builds SDXLUNet from
-//! merged weights, and runs the standard SDXL Euler sampler.
+//! Loads SDXL UNet base, builds SDXLUNet, then attaches a `LoraStack` via
+//! `set_lora`. The base weights are NEVER mutated — at every linear
+//! chokepoint the model adds `scale * up(down(x))` from any matching LoRA
+//! entries to the base output. This matches how ai-toolkit, OneTrainer,
+//! and musubi-tuner all apply LoRAs at sampling time.
 //!
-//! Text-encoder LoRAs (`lora_te1_*`, `lora_te2_*`) are skipped at merge
-//! time — they'd need to be applied during `sdxl_encode` instead, which
-//! is a separate concern.
+//! Conv LoRAs (4D weights) are skipped at LoraStack load time — they
+//! would need a separate conv runtime path. Text-encoder LoRAs
+//! (`lora_te1_*`, `lora_te2_*`) are skipped at LoraStack load time too.
 //!
 //! Usage:
 //!     sdxl_lora_infer \
@@ -24,7 +26,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use inference_flame::lora_merge::merge_klein_lora;
+use inference_flame::lora::LoraStack;
 use inference_flame::models::sdxl_unet::SDXLUNet;
 use inference_flame::vae::ldm_decoder::LdmVAEDecoder;
 
@@ -198,46 +200,41 @@ fn run(args: Args, device: Arc<CudaDevice>) -> anyhow::Result<()> {
     // Stage 2: Load base + LoRA, merge, build SDXLUNet.
     println!("\n--- Stage 2: Load base + apply LoRA, build SDXLUNet ---");
     let t_load = Instant::now();
-    let mut all_weights =
+    let all_weights =
         flame_core::serialization::load_file(&args.base, &device)?;
     println!("  base: {} tensors", all_weights.len());
 
-    let lora = flame_core::serialization::load_file(&args.lora, &device)?;
-    println!("  lora: {} tensors", lora.len());
-
-    let inferred_rank = lora
-        .iter()
-        .filter_map(|(k, v)| {
-            if k.ends_with(".lora_A")
-                || k.ends_with(".lora_A.weight")
-                || k.ends_with(".lora_down.weight")
-            {
-                Some(v.shape().dims()[0])
-            } else {
-                None
-            }
-        })
-        .next();
-    let rank = args.rank.or(inferred_rank).unwrap_or(16);
-    let alpha = args.alpha.unwrap_or(rank as f32);
+    // Build the runtime LoRA stack BEFORE constructing the model.
+    // `LoraStack::load` reads per-module .alpha for every format, so
+    // --alpha / --rank CLI args are no longer load-bearing. The kohya
+    // SDXL diffusers→LDM rewriter inside LoraStack remaps prefixes when
+    // necessary.
+    if args.alpha.is_some() || args.rank.is_some() {
+        eprintln!(
+            "  note: --alpha/--rank are ignored when LoRA file ships per-module .alpha tensors"
+        );
+    }
+    let base_keys: std::collections::HashSet<String> = all_weights.keys().cloned().collect();
+    let lora_stack = LoraStack::load(
+        args.lora.to_str().expect("lora path utf8"),
+        &base_keys,
+        args.multiplier,
+        &device,
+    )?;
     println!(
-        "  alpha={:.1} rank={} multiplier={:.2}",
-        alpha, rank, args.multiplier,
-    );
-
-    let n_merged = merge_klein_lora(&mut all_weights, &lora, alpha, rank, args.multiplier)?;
-    drop(lora);
-    trim_cuda_mempool(0);
-    println!(
-        "  merged {n_merged} LoRA modules in {:.1}s",
+        "  lora: {} target weight(s), multiplier={:.2}, loaded in {:.1}s",
+        lora_stack.target_count(),
+        args.multiplier,
         t_load.elapsed().as_secs_f32()
     );
+    trim_cuda_mempool(0);
 
     let mut model = SDXLUNet::from_weights_all_gpu(
         args.base.to_string_lossy().to_string(),
         all_weights,
         device.clone(),
     )?;
+    model.set_lora(Arc::new(lora_stack));
 
     // Stage 3: Sample.
     println!(

@@ -1,7 +1,10 @@
 //! SD3.5 Medium LoRA inference — pure Rust.
 //!
-//! Same end-to-end pipeline as `sd3_medium_infer` but merges a sd3-trainer
-//! LoRA into the resident weights before constructing SD3MMDiT.
+//! Same end-to-end pipeline as `sd3_medium_infer` but applies a sd3-trainer
+//! LoRA at runtime via `SD3MMDiT::set_lora`. Base weights are NEVER mutated —
+//! at every `linear_no_bias` call the model adds `scale * up(down(x))` from
+//! any matching LoRA entries to the base output. This matches how
+//! ai-toolkit, OneTrainer, and musubi-tuner all apply LoRAs at sampling time.
 //!
 //! Usage:
 //!   sd3_lora_infer --lora /path/to/sd3_lora.safetensors \
@@ -22,10 +25,12 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
 use flame_core::{global_cuda_device, DType, Shape, Tensor};
 
+use inference_flame::lora::LoraStack;
 use inference_flame::models::clip_encoder::{ClipConfig, ClipEncoder};
 use inference_flame::models::sd3_mmdit::{load_sd3_all, SD3MMDiT};
 use inference_flame::models::t5_encoder::T5Encoder;
@@ -271,79 +276,6 @@ fn zero_pad_last_dim(x: &Tensor, target_dim: usize) -> anyhow::Result<Tensor> {
 }
 
 // ---------------------------------------------------------------------------
-// SD3 LoRA merge
-// ---------------------------------------------------------------------------
-
-/// Merge sd3-trainer LoRAs into a base-weight HashMap in place. Each pair
-/// `<base_path>.lora_A` + `<base_path>.lora_B` produces a delta
-///   delta = scale * (B @ A)         shape: [out, in]
-/// added to the base weight at `<base_path>.weight`.
-///
-/// Returns (modules_merged, modules_skipped, errors).
-fn merge_sd3_lora(
-    base_weights: &mut HashMap<String, Tensor>,
-    lora: HashMap<String, Tensor>,
-    scale: f32,
-) -> anyhow::Result<(usize, usize)> {
-    use std::collections::BTreeMap;
-
-    // Group by base prefix.
-    let mut groups: BTreeMap<String, (Option<Tensor>, Option<Tensor>)> = BTreeMap::new();
-    for (key, val) in lora {
-        if let Some(prefix) = key.strip_suffix(".lora_A") {
-            groups.entry(prefix.to_string()).or_default().0 = Some(val);
-        } else if let Some(prefix) = key.strip_suffix(".lora_B") {
-            groups.entry(prefix.to_string()).or_default().1 = Some(val);
-        } else {
-            // Silently skip unknown keys — older trainers may have aux state.
-        }
-    }
-
-    let mut merged = 0usize;
-    let mut skipped = 0usize;
-    for (prefix, (lora_a, lora_b)) in groups {
-        let (lora_a, lora_b) = match (lora_a, lora_b) {
-            (Some(a), Some(b)) => (a, b),
-            _ => {
-                eprintln!("[lora] {prefix}: missing A or B half — skipping");
-                skipped += 1;
-                continue;
-            }
-        };
-        let base_key = format!("{prefix}.weight");
-        let Some(base) = base_weights.get(&base_key) else {
-            eprintln!("[lora] {prefix}: base key {base_key} not in model — skipping");
-            skipped += 1;
-            continue;
-        };
-
-        // Compute delta in BF16 then add to base. lora_b @ lora_a with
-        // shapes [out, rank] @ [rank, in] = [out, in] matches base.
-        let a_bf16 = if lora_a.dtype() == DType::BF16 {
-            lora_a
-        } else {
-            lora_a.to_dtype(DType::BF16)?
-        };
-        let b_bf16 = if lora_b.dtype() == DType::BF16 {
-            lora_b
-        } else {
-            lora_b.to_dtype(DType::BF16)?
-        };
-        let delta = b_bf16.matmul(&a_bf16)?;
-        let delta = if (scale - 1.0).abs() > f32::EPSILON {
-            delta.mul_scalar(scale)?
-        } else {
-            delta
-        };
-        let merged_w = base.add(&delta)?;
-        base_weights.insert(base_key, merged_w);
-        merged += 1;
-    }
-
-    Ok((merged, skipped))
-}
-
-// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -370,22 +302,36 @@ fn main() -> anyhow::Result<()> {
         encode_text_pair(&prompt, &args.neg_prompt, &device)?;
     println!("  Total encode: {:.1}s", t0.elapsed().as_secs_f32());
 
-    // Stage 2: Load base + merge LoRA
-    println!("\n--- Stage 2: Load SD3.5 Medium + Merge LoRA ---");
+    // Stage 2: Load base + build runtime LoRA stack
+    println!("\n--- Stage 2: Load SD3.5 Medium + Build LoRA stack ---");
     let t0 = Instant::now();
-    let mut resident = load_sd3_all(args.model.to_str().unwrap(), &device)?;
+    let resident = load_sd3_all(args.model.to_str().unwrap(), &device)?;
     println!("  base: {} keys", resident.len());
 
-    let lora = flame_core::serialization::load_file(&args.lora, &device)?;
-    println!("  lora: {} keys", lora.len());
-    let (merged, skipped) = merge_sd3_lora(&mut resident, lora, args.lora_scale)?;
-    println!("  merge: {} modules merged, {} skipped", merged, skipped);
-    if merged == 0 {
-        anyhow::bail!("0 LoRA modules merged — check that the LoRA matches sd3-trainer naming \
+    // Build the runtime LoRA stack BEFORE constructing the model.
+    // `LoraStack::load` reads per-module .alpha for every format. The
+    // sd3-trainer save format uses bare `<prefix>.lora_A`/`.lora_B` keys
+    // whose prefix appended with `.weight` matches a base weight key —
+    // that's the AiToolkit-compatible path in LoraStack.
+    let base_keys: std::collections::HashSet<String> = resident.keys().cloned().collect();
+    let lora_stack = LoraStack::load(
+        args.lora.to_str().expect("lora path utf8"),
+        &base_keys,
+        args.lora_scale,
+        &device,
+    )?;
+    println!(
+        "  lora: {} target weight(s), scale={}",
+        lora_stack.target_count(),
+        args.lora_scale
+    );
+    if lora_stack.target_count() == 0 {
+        anyhow::bail!("0 LoRA target weights resolved — check that the LoRA matches sd3-trainer naming \
                        (joint_blocks.<i>.x_block.attn.qkv.lora_{{A,B}})");
     }
 
     let mut model = SD3MMDiT::new(args.model.to_str().unwrap().to_string(), resident, device.clone());
+    model.set_lora(Arc::new(lora_stack));
     println!(
         "  depth={}, hidden={}, heads={}, dual_attn={} ({:.1}s)",
         model.config.depth,

@@ -1,15 +1,19 @@
-//! Klein 4B/9B image generation with a klein-trainer LoRA merged in —
+//! Klein 4B/9B image generation with a runtime-applied klein-trainer LoRA —
 //! pure Rust, no Python.
 //!
-//! Loads the base checkpoint, applies a LoRA via
-//! `inference_flame::lora_merge::merge_klein_lora`, builds a
-//! `KleinTransformer` from the merged weights, and runs the standard
-//! Klein sampling pipeline (Qwen3 text encode → noise → Euler+CFG → VAE
-//! decode → PNG).
+//! Loads the base checkpoint, builds a `KleinTransformer`, then attaches a
+//! `LoraStack` via `set_lora`. The base weights are NEVER mutated — at
+//! every double/single-block linear chokepoint the model adds
+//! `scale * up(down(x))` from any matching LoRA entries to the base
+//! matmul output. This matches how ai-toolkit, OneTrainer, and
+//! musubi-tuner all apply LoRAs at sampling time.
 //!
-//! Replaces the deleted `klein-trainer/scripts/lora_merge.py` per the
-//! 04-25 architecture rule (LoRA-merge logic belongs in inference-flame,
-//! not in flame-diffusion).
+//! Klein-4B single-block linear1 is `[3*inner+2*mlp_hidden, inner_dim]`,
+//! but external LoRAs target only the QKV slice (first 3*inner_dim rows).
+//! `Slot::Rows(KLEIN_4B_SINGLE_QKV_ROWS)` in `lora.rs` handles that.
+//! Constants in `lora.rs` are Klein-4B specific; Klein-9B (inner_dim=4096)
+//! would need different `KLEIN_9B_*` constants and a slot variant per
+//! model size — not yet wired.
 //!
 //! Usage:
 //!     klein_lora_infer \
@@ -25,12 +29,13 @@
 //! --width, --height, --seed, --negative.
 
 use flame_core::{global_cuda_device, trim_cuda_mempool, DType, Shape, Tensor};
-use inference_flame::lora_merge::merge_klein_lora;
+use inference_flame::lora::LoraStack;
 use inference_flame::models::klein::KleinTransformer;
 use inference_flame::models::qwen3_encoder::Qwen3Encoder;
-use inference_flame::sampling::klein_sampling::{euler_denoise, get_schedule};
+use inference_flame::sampling::klein_sampling::{box_muller_noise, euler_denoise, get_schedule};
 use inference_flame::vae::klein_vae::KleinVaeDecoder;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
 const KLEIN_TEMPLATE_PRE: &str = "<|im_start|>user\n";
@@ -139,26 +144,6 @@ fn print_usage() {
     );
 }
 
-fn box_muller_noise(numel: usize, seed: u64) -> Vec<f32> {
-    use rand::prelude::*;
-    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-    let mut v = Vec::with_capacity(numel);
-    for _ in 0..numel / 2 {
-        let u1: f32 = rng.gen::<f32>().max(1e-10);
-        let u2: f32 = rng.gen::<f32>();
-        let r = (-2.0 * u1.ln()).sqrt();
-        let theta = 2.0 * std::f32::consts::PI * u2;
-        v.push(r * theta.cos());
-        v.push(r * theta.sin());
-    }
-    if numel % 2 == 1 {
-        let u1: f32 = rng.gen::<f32>().max(1e-10);
-        let u2: f32 = rng.gen::<f32>();
-        v.push((-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos());
-    }
-    v
-}
-
 fn main() -> anyhow::Result<()> {
     env_logger::init();
     let t_total = Instant::now();
@@ -260,38 +245,36 @@ fn main() -> anyhow::Result<()> {
     // Order matters: encoder is already dropped above, so we have the full
     // GPU available for base (~8 GB / 18 GB) + LoRA + merge intermediates.
     // ------------------------------------------------------------------
-    println!("\n--- Stage 3: Load base + apply LoRA, build model ---");
+    println!("\n--- Stage 3: Load base + build LoRA stack, build model ---");
     let t0 = Instant::now();
-    let mut base = flame_core::serialization::load_file(&args.base, &device)?;
+    let base = flame_core::serialization::load_file(&args.base, &device)?;
     println!("  base   : {} tensors", base.len());
-    let lora = flame_core::serialization::load_file(&args.lora, &device)?;
-    println!("  lora   : {} tensors", lora.len());
 
-    let inferred_rank = lora
-        .iter()
-        .filter_map(|(k, v)| {
-            if k.ends_with(".lora_A") || k.ends_with(".lora_A.weight") {
-                Some(v.shape().dims()[0])
-            } else {
-                None
-            }
-        })
-        .next();
-    let rank = args.rank.or(inferred_rank).unwrap_or(16);
-    let alpha = args.alpha.unwrap_or(rank as f32);
-    println!(
-        "  alpha={:.1} rank={} multiplier={:.2} → scale={:.4}",
-        alpha,
-        rank,
+    // Build the runtime LoRA stack. `LoraStack::load` reads per-module
+    // .alpha for every format, so --alpha / --rank CLI args are no longer
+    // load-bearing. Klein-trainer split-QKV → fused-QKV mapping is in
+    // map_prefix_klein_trainer.
+    if args.alpha.is_some() || args.rank.is_some() {
+        eprintln!(
+            "  note: --alpha/--rank are ignored when LoRA file ships per-module .alpha tensors"
+        );
+    }
+    let base_keys: std::collections::HashSet<String> = base.keys().cloned().collect();
+    let lora_stack = LoraStack::load(
+        args.lora.to_str().expect("lora path utf8"),
+        &base_keys,
         args.multiplier,
-        (alpha / rank as f32) * args.multiplier
+        &device,
+    )?;
+    println!(
+        "  lora   : {} target weight(s), multiplier={:.2}",
+        lora_stack.target_count(),
+        args.multiplier
     );
-    let n_merged = merge_klein_lora(&mut base, &lora, alpha, rank, args.multiplier)?;
-    drop(lora);
-    trim_cuda_mempool(0); // Release LoRA + F32 merge intermediates.
-    println!("  merged {n_merged} LoRA modules");
+    trim_cuda_mempool(0);
 
-    let model = KleinTransformer::from_weights(base)?;
+    let mut model = KleinTransformer::from_weights(base)?;
+    model.set_lora(Arc::new(lora_stack));
     println!("  Config: {:?}", model.config());
     println!("  Built in {:.1}s", t0.elapsed().as_secs_f32());
 

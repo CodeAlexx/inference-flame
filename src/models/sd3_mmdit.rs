@@ -167,6 +167,9 @@ pub struct SD3MMDiT {
     /// Block loader for on-demand weight streaming via mmap.
     loader: BlockLoader,
     device: Arc<cudarc::driver::CudaDevice>,
+    /// Optional runtime LoRA stack — applied at each `linear_no_bias` call.
+    /// Base weights are never mutated.
+    lora: Option<Arc<crate::lora::LoraStack>>,
 }
 
 impl SD3MMDiT {
@@ -182,6 +185,7 @@ impl SD3MMDiT {
             resident,
             loader,
             device,
+            lora: None,
         }
     }
 
@@ -200,6 +204,7 @@ impl SD3MMDiT {
             resident,
             loader,
             device,
+            lora: None,
         }
     }
 
@@ -220,6 +225,13 @@ impl SD3MMDiT {
 
     // -- Linear helpers -------------------------------------------------------
 
+    /// Attach a runtime LoRA stack. Subsequent `linear_no_bias` (and via it,
+    /// `linear_with_bias`) calls will add `scale * up(down(x))` from any
+    /// matching LoRA entries to the base output. Base weights are not mutated.
+    pub fn set_lora(&mut self, lora: Arc<crate::lora::LoraStack>) {
+        self.lora = Some(lora);
+    }
+
     /// x @ weight.T (weight shape: [out, in], no bias)
     fn linear_no_bias(&self, x: &Tensor, weight_key: &str) -> Result<Tensor> {
         let weight = self.w(weight_key)?;
@@ -231,6 +243,10 @@ impl SD3MMDiT {
         let x_2d = x.reshape(&[batch, in_features])?;
         let wt = transpose_2d(weight)?;
         let out_2d = x_2d.matmul(&wt)?;
+        let out_2d = match self.lora {
+            Some(ref lora) => lora.apply(weight_key, &x_2d, out_2d)?,
+            None => out_2d,
+        };
 
         let mut out_shape = x_dims[..x_dims.len() - 1].to_vec();
         out_shape.push(out_features);

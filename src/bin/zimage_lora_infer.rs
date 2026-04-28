@@ -1,9 +1,11 @@
-//! Z-Image inference with a LoRA merged in — pure Rust.
+//! Z-Image inference with a runtime-applied LoRA — pure Rust.
 //!
-//! Loads the Z-Image base checkpoint, applies a LoRA via
-//! `inference_flame::lora_merge::merge_klein_lora` (auto-detects
-//! ZImageTrainer / AiToolkit format), builds `NextDiT::new_resident` from
-//! the merged weights, and runs the standard Z-Image sampling pipeline.
+//! Loads the Z-Image base checkpoint, builds `NextDiT::new_resident`, then
+//! attaches a `LoraStack` via `set_lora`. The base weights are NEVER
+//! mutated — at every `linear_no_bias` call the model adds
+//! `scale * up(down(x))` from any matching LoRA entries to the base output.
+//! This matches how ai-toolkit, OneTrainer, and musubi-tuner all apply
+//! LoRAs at sampling time.
 //!
 //! Mirrors `zimage_infer` plus the merge step. Architecture rule honored:
 //! LoRA-merge logic lives in inference-flame, not in flame-diffusion.
@@ -28,7 +30,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use inference_flame::lora_merge::merge_klein_lora;
+use inference_flame::lora::LoraStack;
 use inference_flame::models::zimage_nextdit::NextDiT;
 use inference_flame::sampling::euler::euler_step;
 use inference_flame::sampling::schedules::build_sigma_schedule;
@@ -172,7 +174,7 @@ fn run(args: Args, device: Arc<CudaDevice>) -> anyhow::Result<()> {
     println!("\n--- Stage 2: Load base + apply LoRA, build NextDiT ---");
     let t_load = Instant::now();
     let base_p = args.base.as_path();
-    let mut all_weights = if base_p.is_dir() {
+    let all_weights = if base_p.is_dir() {
         let mut weights: std::collections::HashMap<String, Tensor> =
             std::collections::HashMap::new();
         let mut entries: Vec<_> = std::fs::read_dir(base_p)?
@@ -190,38 +192,35 @@ fn run(args: Args, device: Arc<CudaDevice>) -> anyhow::Result<()> {
     };
     println!("  base: {} tensors", all_weights.len());
 
-    let lora = flame_core::serialization::load_file(&args.lora, &device)?;
-    println!("  lora: {} tensors", lora.len());
-
-    let inferred_rank = lora
-        .iter()
-        .filter_map(|(k, v)| {
-            if k.ends_with(".lora_A") || k.ends_with(".lora_A.weight") {
-                Some(v.shape().dims()[0])
-            } else {
-                None
-            }
-        })
-        .next();
-    let rank = args.rank.or(inferred_rank).unwrap_or(16);
-    let alpha = args.alpha.unwrap_or(rank as f32);
-    println!(
-        "  alpha={:.1} rank={} multiplier={:.2} → scale={:.4}",
-        alpha,
-        rank,
+    // Build the runtime LoRA stack BEFORE constructing the model.
+    // `LoraStack::load` reads per-module .alpha for every format, so the
+    // --alpha / --rank CLI args are no longer load-bearing. They're kept
+    // for backwards compat but ignored unless the file genuinely has no
+    // .alpha entries (in which case scale defaults to alpha=rank → 1.0,
+    // matching our trainers' default).
+    if args.alpha.is_some() || args.rank.is_some() {
+        eprintln!(
+            "  note: --alpha/--rank are ignored when LoRA file ships per-module .alpha tensors"
+        );
+    }
+    let base_keys: std::collections::HashSet<String> =
+        all_weights.keys().cloned().collect();
+    let lora_stack = LoraStack::load(
+        args.lora.to_str().expect("lora path utf8"),
+        &base_keys,
         args.multiplier,
-        (alpha / rank as f32) * args.multiplier
-    );
-
-    let n_merged = merge_klein_lora(&mut all_weights, &lora, alpha, rank, args.multiplier)?;
-    drop(lora);
-    trim_cuda_mempool(0);
+        &device,
+    )?;
     println!(
-        "  merged {n_merged} LoRA modules in {:.1}s",
+        "  lora: {} target weight(s), multiplier={:.2}, loaded in {:.1}s",
+        lora_stack.target_count(),
+        args.multiplier,
         t_load.elapsed().as_secs_f32()
     );
+    trim_cuda_mempool(0);
 
     let mut model = NextDiT::new_resident(all_weights, device.clone());
+    model.set_lora(Arc::new(lora_stack));
 
     // Stage 3: Sample.
     println!("\n--- Stage 3: Denoise ({} steps, cfg={}) ---", args.steps, args.cfg_scale);

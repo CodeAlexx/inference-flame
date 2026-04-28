@@ -20,6 +20,8 @@ use flame_core::{DType, Result, Shape, Tensor};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::lora::LoraStack;
+
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
@@ -284,6 +286,55 @@ fn swiglu(gate_up_w: &Tensor, down_w: &Tensor, x: &Tensor, native_weights: bool)
     if native_weights { linear3d_nt(&activated, down_w) } else { linear3d(&activated, down_w) }
 }
 
+/// Apply LoRA contribution to the output of a 3D linear, if a LoRA stack
+/// is attached and has entries for `weight_key`. The flatten/unflatten is
+/// handled inside `LoraStack::apply` itself (it reshapes input/output to
+/// 2D internally and restores the original shape).
+fn apply_lora_3d(
+    base_out: Tensor,
+    weight_key: &str,
+    x_in: &Tensor,
+    lora: Option<&LoraStack>,
+) -> Result<Tensor> {
+    match lora {
+        Some(stack) => stack.apply(weight_key, x_in, base_out),
+        None => Ok(base_out),
+    }
+}
+
+/// SwiGLU variant aware of an attached LoRA stack. Applies LoRA to the
+/// fused gate+up projection and to the down projection by their full
+/// weight keys. Note: external Klein LoRAs typically target the FUSED
+/// `img_mlp.0.weight` / `img_mlp.2.weight` shapes directly via klein-trainer
+/// naming (`mlp_0` / `mlp_2`); split-half (gate vs up) LoRAs would not be
+/// natively supported here.
+#[allow(clippy::too_many_arguments)]
+fn swiglu_lora(
+    weights: &HashMap<String, Tensor>,
+    gate_up_key: &str,
+    down_key: &str,
+    x: &Tensor,
+    native_weights: bool,
+    lora: Option<&LoraStack>,
+) -> Result<Tensor> {
+    let gate_up_w = &weights[gate_up_key];
+    let down_w = &weights[down_key];
+    let gu_base = if native_weights { linear3d_nt(x, gate_up_w)? } else { linear3d(x, gate_up_w)? };
+    let gu = apply_lora_3d(gu_base, gate_up_key, x, lora)?;
+    let last_dim = *gu.shape().dims().last().unwrap();
+    let half_dim = last_dim / 2;
+    let ndim = gu.shape().dims().len();
+    let gate = gu.narrow(ndim - 1, 0, half_dim)?;
+    let up = gu.narrow(ndim - 1, half_dim, half_dim)?;
+    let activated = flame_core::bf16_ops::swiglu_fused_bf16(&gate, &up)?;
+    let down_base = if native_weights {
+        linear3d_nt(&activated, down_w)?
+    } else {
+        linear3d(&activated, down_w)?
+    };
+    apply_lora_3d(down_base, down_key, &activated, lora)
+}
+
 // ---------------------------------------------------------------------------
 // Double block
 // ---------------------------------------------------------------------------
@@ -292,6 +343,7 @@ fn swiglu(gate_up_w: &Tensor, down_w: &Tensor, x: &Tensor, native_weights: bool)
 ///
 /// `img_mods`: [shift1, scale1, gate1, shift2, scale2, gate2]
 /// `txt_mods`: same structure.
+#[allow(clippy::too_many_arguments)]
 fn double_block_forward(
     weights: &HashMap<String, Tensor>,
     block_idx: usize,
@@ -304,14 +356,18 @@ fn double_block_forward(
     num_heads: usize,
     head_dim: usize,
     native_weights: bool,
+    lora: Option<&LoraStack>,
 ) -> Result<(Tensor, Tensor)> {
     let prefix = format!("double_blocks.{block_idx}");
     let h = num_heads;
     let d = head_dim;
     // Linear dispatch: native_weights uses cuBLASLt TRANSA=T (swap path),
     // otherwise standard pre-transposed matmul (resident path).
-    let lin = |x: &Tensor, w: &Tensor| -> Result<Tensor> {
-        if native_weights { linear3d_nt(x, w) } else { linear3d(x, w) }
+    // After the base matmul we apply any LoRA contributions for `key`.
+    let lin = |x: &Tensor, key: &str| -> Result<Tensor> {
+        let w = &weights[key];
+        let base = if native_weights { linear3d_nt(x, w)? } else { linear3d(x, w)? };
+        apply_lora_3d(base, key, x, lora)
     };
     // Unpack modulation parameters
     let (img_shift1, img_scale1, img_gate1) = (&img_mods[0], &img_mods[1], &img_mods[2]);
@@ -324,8 +380,8 @@ fn double_block_forward(
     let txt_normed = modulate_pre(txt, txt_shift1, txt_scale1)?;
 
     // QKV projections
-    let img_qkv = lin(&img_normed, &weights[&format!("{prefix}.img_attn.qkv.weight")])?;
-    let txt_qkv = lin(&txt_normed, &weights[&format!("{prefix}.txt_attn.qkv.weight")])?;
+    let img_qkv = lin(&img_normed, &format!("{prefix}.img_attn.qkv.weight"))?;
+    let txt_qkv = lin(&txt_normed, &format!("{prefix}.txt_attn.qkv.weight"))?;
 
     let b = img_qkv.shape().dims()[0];
     let n_img = img_qkv.shape().dims()[1];
@@ -377,8 +433,8 @@ fn double_block_forward(
     let _ = b;
 
     // Output projection (NO bias)
-    let img_out = lin(&img_out, &weights[&format!("{prefix}.img_attn.proj.weight")])?;
-    let txt_out = lin(&txt_out, &weights[&format!("{prefix}.txt_attn.proj.weight")])?;
+    let img_out = lin(&img_out, &format!("{prefix}.img_attn.proj.weight"))?;
+    let txt_out = lin(&txt_out, &format!("{prefix}.txt_attn.proj.weight"))?;
 
     // Gate + residual (fused)
     let img = flame_core::bf16_ops::gate_residual_fused_bf16(&img, img_gate1, &img_out)?;
@@ -388,17 +444,21 @@ fn double_block_forward(
     let img_mlp_in = modulate_pre(&img, img_shift2, img_scale2)?;
     let txt_mlp_in = modulate_pre(&txt, txt_shift2, txt_scale2)?;
 
-    let img_mlp_out = swiglu(
-        &weights[&format!("{prefix}.img_mlp.0.weight")],
-        &weights[&format!("{prefix}.img_mlp.2.weight")],
+    let img_mlp_out = swiglu_lora(
+        weights,
+        &format!("{prefix}.img_mlp.0.weight"),
+        &format!("{prefix}.img_mlp.2.weight"),
         &img_mlp_in,
         native_weights,
+        lora,
     )?;
-    let txt_mlp_out = swiglu(
-        &weights[&format!("{prefix}.txt_mlp.0.weight")],
-        &weights[&format!("{prefix}.txt_mlp.2.weight")],
+    let txt_mlp_out = swiglu_lora(
+        weights,
+        &format!("{prefix}.txt_mlp.0.weight"),
+        &format!("{prefix}.txt_mlp.2.weight"),
         &txt_mlp_in,
         native_weights,
+        lora,
     )?;
 
     // Gate + residual (fused)
@@ -416,6 +476,15 @@ fn double_block_forward(
 ///
 /// `linear1` fuses: QKV (3*dim) + SwiGLU gate+up (2*mlp_hidden) = 9*dim
 /// `linear2` fuses: attn_proj (dim) + SwiGLU down (mlp_hidden) = 4*dim
+///
+/// LoRA support: external LoRAs targeting the narrow QKV slice (first
+/// 3*inner_dim rows of linear1) and narrow attn_proj slice (first inner_dim
+/// cols of linear2) are mapped via `Slot::Rows(3*inner_dim)` and
+/// `Slot::Cols(inner_dim)` inside `LoraStack`. Constants assumed are the
+/// Klein-4B values (KLEIN_4B_SINGLE_QKV_ROWS=9216, KLEIN_4B_SINGLE_OUT_COLS
+/// =3072) — see `inference-flame/src/lora.rs`. Klein-9B would need
+/// different constants; not yet wired.
+#[allow(clippy::too_many_arguments)]
 fn single_block_forward(
     weights: &HashMap<String, Tensor>,
     block_idx: usize,
@@ -428,12 +497,15 @@ fn single_block_forward(
     inner_dim: usize,
     mlp_hidden: usize,
     native_weights: bool,
+    lora: Option<&LoraStack>,
 ) -> Result<Tensor> {
     let prefix = format!("single_blocks.{block_idx}");
     let h = num_heads;
     let d = head_dim;
-    let lin = |x: &Tensor, w: &Tensor| -> Result<Tensor> {
-        if native_weights { linear3d_nt(x, w) } else { linear3d(x, w) }
+    let lin = |x: &Tensor, key: &str| -> Result<Tensor> {
+        let w = &weights[key];
+        let base = if native_weights { linear3d_nt(x, w)? } else { linear3d(x, w)? };
+        apply_lora_3d(base, key, x, lora)
     };
 
     let (shift, scale, gate) = (&mods[0], &mods[1], &mods[2]);
@@ -441,7 +513,7 @@ fn single_block_forward(
     let x_normed = modulate_pre(x, shift, scale)?;
 
     // Fused QKV + SwiGLU gate+up
-    let qkv_mlp = lin(&x_normed, &weights[&format!("{prefix}.linear1.weight")])?;
+    let qkv_mlp = lin(&x_normed, &format!("{prefix}.linear1.weight"))?;
 
     // Split: first 3*inner_dim = QKV, rest = gate+up
     let qkv_dim = 3 * inner_dim;
@@ -476,7 +548,7 @@ fn single_block_forward(
 
     // Fused output: cat [attn, mlp] -> linear2
     let fused = Tensor::cat(&[&attn_out, &mlp_out], 2)?;
-    let out = lin(&fused, &weights[&format!("{prefix}.linear2.weight")])?;
+    let out = lin(&fused, &format!("{prefix}.linear2.weight"))?;
 
     // Gate + residual (fused)
     flame_core::bf16_ops::gate_residual_fused_bf16(x, gate, &out)
@@ -543,9 +615,21 @@ fn vec_to_arr3(mut v: Vec<Tensor>) -> Result<[Tensor; 3]> {
 /// Flux 2 Klein DiT — pure flame_core implementation.
 ///
 /// Exact key-compatible with BFL .safetensors checkpoints.
+///
+/// `Clone` is intentionally cheap: `Tensor` is Arc-internal,
+/// `KleinConfig` is small POD, and `Arc<LoraStack>` is a refcount
+/// bump. Cloning a `KleinTransformer` shares all GPU storage with
+/// the original and only duplicates the `HashMap` spine + small
+/// metadata. Used by EriGui's node graph to apply a LoRA to a
+/// model handle without mutating the upstream `Arc` (see
+/// `erigui-nodes/src/builtin/load_lora.rs`).
+#[derive(Clone)]
 pub struct KleinTransformer {
     weights: HashMap<String, Tensor>,
     config: KleinConfig,
+    /// Optional runtime LoRA stack — applied at each linear inside the
+    /// double/single-block forwards. Base weights are never mutated.
+    lora: Option<Arc<LoraStack>>,
 }
 
 impl KleinTransformer {
@@ -621,7 +705,15 @@ impl KleinTransformer {
         }
         log::info!("[KleinTransformer] Weights pre-transposed.");
 
-        Ok(Self { weights, config })
+        Ok(Self { weights, config, lora: None })
+    }
+
+    /// Attach a runtime LoRA stack. Subsequent block forwards will add
+    /// `scale * up(down(x))` from any matching LoRA entries to the base
+    /// matmul outputs at every double/single-block linear chokepoint.
+    /// Base weights are not mutated.
+    pub fn set_lora(&mut self, lora: Arc<LoraStack>) {
+        self.lora = Some(lora);
     }
 
     /// Forward pass.
@@ -673,6 +765,7 @@ impl KleinTransformer {
         )?;
 
         // 5. Double blocks (reuse cached modulations)
+        let lora_ref = self.lora.as_deref();
         for i in 0..cfg.num_double {
             let (new_img, new_txt) = double_block_forward(
                 w,
@@ -686,6 +779,7 @@ impl KleinTransformer {
                 cfg.num_heads,
                 cfg.head_dim,
                 false,
+                lora_ref,
             )?;
             img = new_img;
             txt = new_txt;
@@ -709,6 +803,7 @@ impl KleinTransformer {
                 cfg.inner_dim,
                 cfg.mlp_hidden,
                 false,
+                lora_ref,
             )?;
         }
 
@@ -764,6 +859,9 @@ pub struct KleinOffloaded {
     /// Block weights in CPU RAM, pre-parsed as Vec<u16>.
     cpu_weights: HashMap<String, CpuWeight>,
     config: KleinConfig,
+    /// Optional runtime LoRA stack — applied at each linear inside the
+    /// double/single-block forwards. Base weights are never mutated.
+    lora: Option<Arc<LoraStack>>,
 }
 
 impl KleinOffloaded {
@@ -882,7 +980,15 @@ impl KleinOffloaded {
             cpu_weights.values().map(|w| w.data.len() * 2).sum::<usize>() as f64 / 1e9,
         );
 
-        Ok(Self { shared, cpu_weights, config })
+        Ok(Self { shared, cpu_weights, config, lora: None })
+    }
+
+    /// Attach a runtime LoRA stack. Subsequent block forwards will add
+    /// `scale * up(down(x))` from any matching LoRA entries to the base
+    /// matmul outputs at every double/single-block linear chokepoint.
+    /// Base weights are not mutated.
+    pub fn set_lora(&mut self, lora: Arc<LoraStack>) {
+        self.lora = Some(lora);
     }
 
     /// Convert raw safetensors bytes to BF16 Vec<u16> on CPU.
@@ -1010,6 +1116,7 @@ impl KleinOffloaded {
         )?;
 
         // 5. Double blocks — upload from CPU, run, drop
+        let lora_ref = self.lora.as_deref();
         for i in 0..cfg.num_double {
             let block_w = self.load_block_to_gpu(&format!("double_blocks.{i}."))?;
             let (new_img, new_txt) = double_block_forward(
@@ -1018,6 +1125,7 @@ impl KleinOffloaded {
                 &pe_cos, &pe_sin,
                 cfg.num_heads, cfg.head_dim,
                 false,
+                lora_ref,
             )?;
             img = new_img;
             txt = new_txt;
@@ -1037,6 +1145,7 @@ impl KleinOffloaded {
                 cfg.num_heads, cfg.head_dim,
                 cfg.inner_dim, cfg.mlp_hidden,
                 false,
+                lora_ref,
             )?;
         }
 
@@ -1132,6 +1241,7 @@ impl KleinOffloaded {
         // Kick off staging for the very first block (double_blocks.0).
         offloader.prefetch_block(0).map_err(|e| flame_core::Error::InvalidInput(format!("prefetch(0): {e}")))?;
 
+        let lora_ref = self.lora.as_deref();
         for i in 0..cfg.num_double {
             let raw = offloader.await_block(i)
                 .map_err(|e| flame_core::Error::InvalidInput(format!("await({i}): {e}")))?;
@@ -1148,6 +1258,7 @@ impl KleinOffloaded {
                 &pe_cos, &pe_sin,
                 cfg.num_heads, cfg.head_dim,
                 true,
+                lora_ref,
             )?;
             img = new_img;
             txt = new_txt;
@@ -1173,6 +1284,7 @@ impl KleinOffloaded {
                 cfg.num_heads, cfg.head_dim,
                 cfg.inner_dim, cfg.mlp_hidden,
                 true,
+                lora_ref,
             )?;
         }
 
@@ -1250,6 +1362,7 @@ impl KleinOffloaded {
             .prefetch_block(0)
             .map_err(|e| flame_core::Error::InvalidInput(format!("turbo prefetch(0): {e}")))?;
 
+        let lora_ref = self.lora.as_deref();
         for i in 0..cfg.num_double {
             let block = loader
                 .await_block(i)
@@ -1266,6 +1379,7 @@ impl KleinOffloaded {
                 &pe_cos, &pe_sin,
                 cfg.num_heads, cfg.head_dim,
                 true,
+                lora_ref,
             )?;
             img = new_img;
             txt = new_txt;
@@ -1292,6 +1406,7 @@ impl KleinOffloaded {
                 cfg.num_heads, cfg.head_dim,
                 cfg.inner_dim, cfg.mlp_hidden,
                 true,
+                lora_ref,
             )?;
         }
 

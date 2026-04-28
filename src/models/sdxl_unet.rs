@@ -252,6 +252,12 @@ pub struct SDXLUNet {
     input_block_channels: Vec<usize>,
     /// When true, all weights are in `resident` — skip load/unload
     all_on_gpu: bool,
+    /// Optional runtime LoRA stack — applied at each `linear_no_bias` call.
+    /// Base weights are never mutated. NOTE: SDXL conv weights (4D) are not
+    /// hit by this path — kohya conv-LoRAs are skipped at LoraStack::load
+    /// time per the comment in lora.rs. Only attention/MLP linears get the
+    /// LoRA branch through `linear_no_bias`.
+    lora: Option<Arc<crate::lora::LoraStack>>,
 }
 
 impl SDXLUNet {
@@ -280,6 +286,7 @@ impl SDXLUNet {
             output_block_descs: Vec::new(),
             input_block_channels: Vec::new(),
             all_on_gpu: false,
+            lora: None,
         };
         unet.build_block_descriptors();
         Ok(unet)
@@ -444,6 +451,10 @@ impl SDXLUNet {
         let x_2d = x.reshape(&[batch, in_features])?;
         let wt = transpose_2d(weight)?;
         let out_2d = x_2d.matmul(&wt)?;
+        let out_2d = match self.lora {
+            Some(ref lora) => lora.apply(weight_key, &x_2d, out_2d)?,
+            None => out_2d,
+        };
 
         let mut out_shape = x_dims[..x_dims.len() - 1].to_vec();
         out_shape.push(out_features);
@@ -1101,9 +1112,18 @@ impl SDXLUNet {
             output_block_descs: Vec::new(),
             input_block_channels: Vec::new(),
             all_on_gpu: true,
+            lora: None,
         };
         unet.build_block_descriptors();
         Ok(unet)
+    }
+
+    /// Attach a runtime LoRA stack. Subsequent `linear_no_bias` calls will
+    /// add `scale * up(down(x))` from any matching LoRA entries to the base
+    /// output. Base weights are not mutated. SDXL conv weights are not
+    /// touched by this path (LoraStack skips 4D weights at load time).
+    pub fn set_lora(&mut self, lora: Arc<crate::lora::LoraStack>) {
+        self.lora = Some(lora);
     }
 }
 

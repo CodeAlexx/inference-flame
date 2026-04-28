@@ -86,6 +86,39 @@ pub fn build_sigma_schedule(num_steps: usize, shift: f32) -> Vec<f32> {
 }
 
 // ---------------------------------------------------------------------------
+// Initial noise — Box–Muller transform with seeded StdRng
+// ---------------------------------------------------------------------------
+
+/// Generate `numel` standard-normal f32 samples from a `u64` seed using the
+/// Box–Muller transform over `rand::rngs::StdRng`. CPU-only; the caller
+/// uploads the result to GPU. Pure-Rust determinism: same seed → same
+/// samples on any host.
+///
+/// Verbatim port of the helper that used to live in
+/// `inference-flame/src/bin/klein_lora_infer.rs`. Promoted to a public
+/// function here so the EriGui `core/k_sampler` node and any future
+/// Klein-arch consumer can share it without duplicating CPU RNG code.
+pub fn box_muller_noise(numel: usize, seed: u64) -> Vec<f32> {
+    use rand::prelude::*;
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let mut v = Vec::with_capacity(numel);
+    for _ in 0..numel / 2 {
+        let u1: f32 = rng.gen::<f32>().max(1e-10);
+        let u2: f32 = rng.gen::<f32>();
+        let r = (-2.0 * u1.ln()).sqrt();
+        let theta = 2.0 * std::f32::consts::PI * u2;
+        v.push(r * theta.cos());
+        v.push(r * theta.sin());
+    }
+    if numel % 2 == 1 {
+        let u1: f32 = rng.gen::<f32>().max(1e-10);
+        let u2: f32 = rng.gen::<f32>();
+        v.push((-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos());
+    }
+    v
+}
+
+// ---------------------------------------------------------------------------
 // Euler ODE sampler — direct velocity integration
 // ---------------------------------------------------------------------------
 

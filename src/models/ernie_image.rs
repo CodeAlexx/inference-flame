@@ -360,9 +360,17 @@ pub struct ErnieImageModel {
     pub final_linear_bias: Tensor,
 
     device: Arc<cudarc::driver::CudaDevice>,
+
+    /// Optional runtime LoRA stack — applied at each per-block linear
+    /// (Q/K/V/out + gate/up/down). Base weights are never mutated.
+    lora: Option<Arc<crate::lora::LoraStack>>,
 }
 
 pub struct ErnieImageBlock {
+    /// Layer index (used to construct LoRA keys at runtime — base weights
+    /// are identified by `layers.<idx>.<module>.weight` paths).
+    pub idx: usize,
+
     // Self-attention
     pub sa_norm_weight: Tensor,  // RMSNorm [hidden]
     pub attn_q_wt: Tensor,      // PRE-TRANSPOSED [hidden, hidden]
@@ -402,6 +410,7 @@ impl ErnieImageModel {
         for i in 0..config.num_layers {
             let p = format!("layers.{i}");
             blocks.push(ErnieImageBlock {
+                idx: i,
                 sa_norm_weight: take(&mut w, &format!("{p}.adaLN_sa_ln.weight"))?,
                 attn_q_wt: take_t(&mut w, &format!("{p}.self_attention.to_q.weight"))?,
                 attn_k_wt: take_t(&mut w, &format!("{p}.self_attention.to_k.weight"))?,
@@ -433,7 +442,18 @@ impl ErnieImageModel {
             final_linear_bias: take(&mut w, "final_linear.bias")?,
             config,
             device,
+            lora: None,
         })
+    }
+
+    /// Attach a runtime LoRA stack. Subsequent attention/FFN forwards will
+    /// add `scale * up(down(x))` from any matching LoRA entries to the
+    /// per-block matmul outputs. Base weights are not mutated. Targets
+    /// expected: `layers.<i>.self_attention.{to_q,to_k,to_v,to_out.0}` and
+    /// `layers.<i>.mlp.{gate_proj,up_proj,linear_fc2}` plus their
+    /// `.weight` suffix when looked up via the AiToolkit format mapper.
+    pub fn set_lora(&mut self, lora: Arc<crate::lora::LoraStack>) {
+        self.lora = Some(lora);
     }
 
     /// Forward pass.
@@ -621,9 +641,18 @@ impl ErnieImageModel {
         let (b, s, _) = (dims[0], dims[1], dims[2]);
 
         // Q/K/V — no bias, weights pre-transposed
-        let q = x.matmul(&block.attn_q_wt)?;
-        let k = x.matmul(&block.attn_k_wt)?;
-        let v = x.matmul(&block.attn_v_wt)?;
+        let q_base = x.matmul(&block.attn_q_wt)?;
+        let k_base = x.matmul(&block.attn_k_wt)?;
+        let v_base = x.matmul(&block.attn_v_wt)?;
+        let (q, k, v) = if let Some(ref lora) = self.lora {
+            let i = block.idx;
+            let q = lora.apply(&format!("layers.{i}.self_attention.to_q.weight"), x, q_base)?;
+            let k = lora.apply(&format!("layers.{i}.self_attention.to_k.weight"), x, k_base)?;
+            let v = lora.apply(&format!("layers.{i}.self_attention.to_v.weight"), x, v_base)?;
+            (q, k, v)
+        } else {
+            (q_base, k_base, v_base)
+        };
 
         // Reshape to [B, S, H, D]
         let q = q.reshape(&[b, s, cfg.num_heads, cfg.head_dim])?;
@@ -648,15 +677,40 @@ impl ErnieImageModel {
         let attn_out = attn_out.permute(&[0, 2, 1, 3])?.reshape(&[b, s, cfg.hidden_size])?;
 
         // Output projection
-        attn_out.matmul(&block.attn_out_wt)
+        let out_base = attn_out.matmul(&block.attn_out_wt)?;
+        match self.lora {
+            Some(ref lora) => lora.apply(
+                &format!("layers.{}.self_attention.to_out.0.weight", block.idx),
+                &attn_out,
+                out_base,
+            ),
+            None => Ok(out_base),
+        }
     }
 
     fn ffn(&self, x: &Tensor, block: &ErnieImageBlock) -> Result<Tensor> {
         // SwiGLU: down(up(x) * gelu(gate(x))) — weights pre-transposed
-        let gate = x.matmul(&block.gate_proj_wt)?.gelu()?;
-        let up = x.matmul(&block.up_proj_wt)?;
+        let gate_base = x.matmul(&block.gate_proj_wt)?;
+        let up_base = x.matmul(&block.up_proj_wt)?;
+        let (gate_pre, up) = if let Some(ref lora) = self.lora {
+            let i = block.idx;
+            let g = lora.apply(&format!("layers.{i}.mlp.gate_proj.weight"), x, gate_base)?;
+            let u = lora.apply(&format!("layers.{i}.mlp.up_proj.weight"), x, up_base)?;
+            (g, u)
+        } else {
+            (gate_base, up_base)
+        };
+        let gate = gate_pre.gelu()?;
         let activated = up.mul(&gate)?;
-        activated.matmul(&block.down_proj_wt)
+        let down_base = activated.matmul(&block.down_proj_wt)?;
+        match self.lora {
+            Some(ref lora) => lora.apply(
+                &format!("layers.{}.mlp.linear_fc2.weight", block.idx),
+                &activated,
+                down_base,
+            ),
+            None => Ok(down_base),
+        }
     }
 
     fn unpatchify(&self, patches: &Tensor, hp: usize, wp: usize) -> Result<Tensor> {

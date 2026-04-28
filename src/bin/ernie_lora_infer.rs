@@ -1,7 +1,11 @@
 //! ERNIE-Image LoRA inference — pure Rust.
 //!
-//! Same pipeline as `ernie_image_infer` but merges an ernie-trainer LoRA
-//! into the resident DiT weights before constructing ErnieImageModel.
+//! Same pipeline as `ernie_image_infer` but applies an ernie-trainer LoRA
+//! at runtime via `ErnieImageModel::set_lora`. The base weights are NEVER
+//! mutated — at every per-block linear (Q/K/V/out + gate/up/down) the
+//! model adds `scale * up(down(x))` from any matching LoRA entries to
+//! the base output. This matches how ai-toolkit, OneTrainer, and
+//! musubi-tuner all apply LoRAs at sampling time.
 //!
 //! Usage:
 //!   ernie_lora_infer --lora /path/to/lora_step_NNNNNN.safetensors \
@@ -15,17 +19,15 @@
 //!   layers.<i>.self_attention.to_k.lora_{A,B}
 //!   layers.<i>.self_attention.to_v.lora_{A,B}
 //!   layers.<i>.self_attention.to_out.0.lora_{A,B}
-//!
-//! Each pair maps to base `<prefix>.weight` by appending `.weight`. The
-//! base weight is stored as [out, in] on disk — delta = (B @ A) is also
-//! [out, in], added in BF16. ErnieImageModel::load transposes after merge.
+//!   (and possibly mlp.{gate_proj,up_proj,linear_fc2}.lora_{A,B})
 
-use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
 use flame_core::{global_cuda_device, DType, Shape, Tensor};
 
+use inference_flame::lora::LoraStack;
 use inference_flame::models::ernie_image::{ErnieImageConfig, ErnieImageModel};
 use inference_flame::models::mistral3b_encoder::Mistral3bEncoder;
 use inference_flame::sampling::ernie_sampling::{ernie_euler_step, ernie_schedule, sigma_to_timestep};
@@ -99,58 +101,6 @@ fn parse_args() -> anyhow::Result<Args> {
     Ok(a)
 }
 
-/// Merge ernie-trainer LoRAs into a base-weight HashMap in place.
-fn merge_ernie_lora(
-    base_weights: &mut HashMap<String, Tensor>,
-    lora: HashMap<String, Tensor>,
-    scale: f32,
-) -> anyhow::Result<(usize, usize)> {
-    use std::collections::BTreeMap;
-
-    // Group by base prefix.
-    let mut groups: BTreeMap<String, (Option<Tensor>, Option<Tensor>)> = BTreeMap::new();
-    for (key, val) in lora {
-        if let Some(prefix) = key.strip_suffix(".lora_A") {
-            groups.entry(prefix.to_string()).or_default().0 = Some(val);
-        } else if let Some(prefix) = key.strip_suffix(".lora_B") {
-            groups.entry(prefix.to_string()).or_default().1 = Some(val);
-        }
-    }
-
-    let mut merged = 0usize;
-    let mut skipped = 0usize;
-    for (prefix, (lora_a, lora_b)) in groups {
-        let (lora_a, lora_b) = match (lora_a, lora_b) {
-            (Some(a), Some(b)) => (a, b),
-            _ => {
-                eprintln!("[lora] {prefix}: missing A or B half — skipping");
-                skipped += 1;
-                continue;
-            }
-        };
-        let base_key = format!("{prefix}.weight");
-        let Some(base) = base_weights.get(&base_key) else {
-            eprintln!("[lora] {prefix}: base key {base_key} not in model — skipping");
-            skipped += 1;
-            continue;
-        };
-
-        let a_bf16 = if lora_a.dtype() == DType::BF16 { lora_a } else { lora_a.to_dtype(DType::BF16)? };
-        let b_bf16 = if lora_b.dtype() == DType::BF16 { lora_b } else { lora_b.to_dtype(DType::BF16)? };
-        let delta = b_bf16.matmul(&a_bf16)?;
-        let delta = if (scale - 1.0).abs() > f32::EPSILON {
-            delta.mul_scalar(scale)?
-        } else {
-            delta
-        };
-        let merged_w = base.add(&delta)?;
-        base_weights.insert(base_key, merged_w);
-        merged += 1;
-    }
-
-    Ok((merged, skipped))
-}
-
 fn main() {
     env_logger::init();
     if let Err(e) = run() {
@@ -197,8 +147,8 @@ fn run() -> anyhow::Result<()> {
     };
     println!("  text encoding done in {:.1}s", t0.elapsed().as_secs_f32());
 
-    // Stage 2: Load base + merge LoRA.
-    println!("\n[2/4] Loading ERNIE-Image DiT + merging LoRA...");
+    // Stage 2: Load base + build runtime LoRA stack.
+    println!("\n[2/4] Loading ERNIE-Image DiT + building LoRA stack...");
     let t1 = Instant::now();
     let shard_paths: Vec<String> = {
         let mut paths = Vec::new();
@@ -211,23 +161,37 @@ fn run() -> anyhow::Result<()> {
         paths.sort();
         paths
     };
-    let mut all_weights = HashMap::new();
+    let mut all_weights = std::collections::HashMap::new();
     for path in &shard_paths {
         let partial = flame_core::serialization::load_file(path, &device)?;
         for (k, v) in partial { all_weights.insert(k, v); }
     }
     println!("  base: {} keys", all_weights.len());
 
-    let lora = flame_core::serialization::load_file(&args.lora, &device)?;
-    println!("  lora: {} keys", lora.len());
-    let (merged, skipped) = merge_ernie_lora(&mut all_weights, lora, args.lora_scale)?;
-    println!("  merge: {} modules merged, {} skipped", merged, skipped);
-    if merged == 0 {
-        anyhow::bail!("0 LoRA modules merged — check that the LoRA matches ernie-trainer naming");
+    // Build the runtime LoRA stack from the base key set BEFORE constructing
+    // the model (the model's `load` consumes the weights HashMap). The
+    // ernie-trainer save format uses bare `<prefix>.lora_A`/`.lora_B` whose
+    // prefix appended with `.weight` matches a base key — that's the
+    // AiToolkit-compatible code path inside LoraStack.
+    let base_keys: std::collections::HashSet<String> = all_weights.keys().cloned().collect();
+    let lora_stack = LoraStack::load(
+        args.lora.to_str().expect("lora path utf8"),
+        &base_keys,
+        args.lora_scale,
+        &device,
+    )?;
+    println!(
+        "  lora: {} target weight(s), scale={}",
+        lora_stack.target_count(),
+        args.lora_scale
+    );
+    if lora_stack.target_count() == 0 {
+        anyhow::bail!("0 LoRA modules resolved — check that the LoRA matches ernie-trainer naming");
     }
 
     let config = ErnieImageConfig::default();
-    let model = ErnieImageModel::load(all_weights, config.clone())?;
+    let mut model = ErnieImageModel::load(all_weights, config.clone())?;
+    model.set_lora(Arc::new(lora_stack));
     println!("  DiT loaded in {:.1}s ({} blocks)", t1.elapsed().as_secs_f32(), config.num_layers);
 
     // Stage 3: Denoise with sequential CFG.
