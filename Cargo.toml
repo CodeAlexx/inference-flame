@@ -59,6 +59,10 @@ name = "qwenimage_gen"
 path = "src/bin/qwenimage_gen.rs"
 
 [[bin]]
+name = "qwenimage_lora_gen"
+path = "src/bin/qwenimage_lora_gen.rs"
+
+[[bin]]
 name = "qwenimage_edit_gen"
 path = "src/bin/qwenimage_edit_gen.rs"
 

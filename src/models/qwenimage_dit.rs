@@ -73,6 +73,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::lora::LoraStack;
+
 // ---------------------------------------------------------------------------
 // BlockFacilitator for Qwen-Image: `transformer_blocks.{i}.*` → block i
 // ---------------------------------------------------------------------------
@@ -139,6 +141,11 @@ pub struct QwenImageDit {
     offloader: BlockOffloader,
     config: QwenImageConfig,
     device: Arc<CudaDevice>,
+    /// Optional runtime LoRA stack. Applied at every linear chokepoint
+    /// inside `block_forward` after the base matmul. Base weights are
+    /// never mutated. Edit-path forwards (`block_forward_per_region`)
+    /// do not yet honor this.
+    lora: Option<Arc<LoraStack>>,
 }
 
 impl QwenImageDit {
@@ -188,11 +195,24 @@ impl QwenImageDit {
             offloader,
             config,
             device: device.clone(),
+            lora: None,
         })
     }
 
     pub fn config(&self) -> &QwenImageConfig {
         &self.config
+    }
+
+    /// Attach a runtime LoRA stack. Subsequent `forward` passes will add
+    /// `scale * up(down(x))` from any matching LoRA entries to the base
+    /// matmul outputs at every per-block linear chokepoint. Base weights
+    /// are not mutated.
+    ///
+    /// Note: only the plain `forward` path honors this. Edit-path
+    /// forwards (`forward_edit*`) currently pass `None` into the block
+    /// dispatch — wiring those is a separate session.
+    pub fn set_lora(&mut self, lora: Arc<LoraStack>) {
+        self.lora = Some(lora);
     }
 
     // -----------------------------------------------------------------------
@@ -640,8 +660,9 @@ impl QwenImageDit {
             }
             let raw = Self::untranspose_block_weights(&raw_arc)?;
 
+            let lora_ref = self.lora.as_deref();
             let (new_img, new_txt) =
-                Self::block_forward(&cfg, &img, &txt, &temb, &pe_cos, &pe_sin, &raw, i)?;
+                Self::block_forward(&cfg, &img, &txt, &temb, &pe_cos, &pe_sin, &raw, i, lora_ref)?;
             img = new_img;
             txt = new_txt;
 
@@ -860,7 +881,7 @@ impl QwenImageDit {
                     &img, &txt, temb, tr, target_seq_len,
                     pe_cos, pe_sin, &raw, i,
                 )?,
-                None => Self::block_forward(cfg, &img, &txt, temb, pe_cos, pe_sin, &raw, i)?,
+                None => Self::block_forward(cfg, &img, &txt, temb, pe_cos, pe_sin, &raw, i, None)?,
             };
             img = new_img;
             txt = new_txt;
@@ -988,6 +1009,7 @@ impl QwenImageDit {
         pe_sin: &Tensor,
         weights: &HashMap<String, Tensor>,
         block_idx: usize,
+        lora: Option<&LoraStack>,
     ) -> Result<(Tensor, Tensor)> {
         let h = cfg.num_heads;
         let d = cfg.head_dim;
@@ -1001,6 +1023,31 @@ impl QwenImageDit {
             })
         };
 
+        // LoRA-aware linear: do the base matmul, then add any matching LoRA
+        // contribution keyed by the FULL base weight key
+        // (`transformer_blocks.{i}.{w_suffix}`). External ai-toolkit /
+        // OneTrainer / musubi LoRAs trained against this DiT all use that
+        // exact key after the `diffusion_model.` prefix is stripped, which
+        // the generic ai-toolkit fallback in `lora.rs` handles.
+        //
+        // Caveat: only the SPLIT-Q/K/V base path goes through this helper.
+        // The fused-QKV "turbo loader" path leaves LoRA unapplied because
+        // the standard split LoRAs would need a `Slot::RowRange` mapping
+        // against the fused base key — wiring that is a separate session
+        // (see HANDOFF_2026-04-28_INFERENCE_FLAME_LORA_ROLLOUT.md Step 4).
+        let lin_lora = |x: &Tensor, w_suffix: &str, b_suffix: &str| -> Result<Tensor> {
+            let weight = w(w_suffix)?;
+            let bias = w(b_suffix)?;
+            let base = Self::linear_bias(x, weight, bias)?;
+            match lora {
+                Some(stack) => {
+                    let full_key = format!("{prefix}.{w_suffix}");
+                    stack.apply(&full_key, x, base)
+                }
+                None => Ok(base),
+            }
+        };
+
         let b = img.shape().dims()[0];
         let n_img = img.shape().dims()[1];
         let n_txt = txt.shape().dims()[1];
@@ -1011,13 +1058,9 @@ impl QwenImageDit {
         // `temb` arrives as [B, dim]. The Linear expects 3D input; unsqueeze to
         // [B, 1, dim] and squeeze back.
         let temb_silu = temb.silu()?;
-        let img_mod_w = w("img_mod.1.weight")?;
-        let img_mod_b = w("img_mod.1.bias")?;
-        let txt_mod_w = w("txt_mod.1.weight")?;
-        let txt_mod_b = w("txt_mod.1.bias")?;
-        let img_mods = Self::linear_bias(&temb_silu.unsqueeze(1)?, img_mod_w, img_mod_b)?
+        let img_mods = lin_lora(&temb_silu.unsqueeze(1)?, "img_mod.1.weight", "img_mod.1.bias")?
             .squeeze(Some(1))?;
-        let txt_mods = Self::linear_bias(&temb_silu.unsqueeze(1)?, txt_mod_w, txt_mod_b)?
+        let txt_mods = lin_lora(&temb_silu.unsqueeze(1)?, "txt_mod.1.weight", "txt_mod.1.bias")?
             .squeeze(Some(1))?;
         // Split each into two halves (norm1, norm2), each 3*dim:
         //   [shift, scale, gate] for norm1 and then [shift, scale, gate] for norm2.
@@ -1061,6 +1104,10 @@ impl QwenImageDit {
         let txt_qkv_w = weights.get(&format!("{prefix}.attn.add_qkv_proj.weight"));
 
         let (img_q, img_k, img_v) = if let Some(qkv_w) = img_qkv_w {
+            // Fused-base path: standard split-Q/K/V LoRAs would need
+            // Slot::RowRange against `attn.to_qkv.weight` (deferred — see
+            // recipe Step 4). For now, no LoRA is applied here. Standard
+            // 2512 checkpoints use the split path below.
             let qkv_b = weights.get(&format!("{prefix}.attn.to_qkv.bias"));
             let qkv = match qkv_b {
                 Some(bb) => Self::linear_bias(&img_modulated, qkv_w, bb)?,
@@ -1068,9 +1115,9 @@ impl QwenImageDit {
             };
             flame_core::bf16_ops::qkv_split_permute_bf16(&qkv, h, d)?
         } else {
-            let img_q = Self::linear_bias(&img_modulated, w("attn.to_q.weight")?, w("attn.to_q.bias")?)?;
-            let img_k = Self::linear_bias(&img_modulated, w("attn.to_k.weight")?, w("attn.to_k.bias")?)?;
-            let img_v = Self::linear_bias(&img_modulated, w("attn.to_v.weight")?, w("attn.to_v.bias")?)?;
+            let img_q = lin_lora(&img_modulated, "attn.to_q.weight", "attn.to_q.bias")?;
+            let img_k = lin_lora(&img_modulated, "attn.to_k.weight", "attn.to_k.bias")?;
+            let img_v = lin_lora(&img_modulated, "attn.to_v.weight", "attn.to_v.bias")?;
             (
                 img_q.reshape(&[b, n_img, h, d])?.permute(&[0, 2, 1, 3])?,
                 img_k.reshape(&[b, n_img, h, d])?.permute(&[0, 2, 1, 3])?,
@@ -1079,6 +1126,7 @@ impl QwenImageDit {
         };
 
         let (txt_q, txt_k, txt_v) = if let Some(qkv_w) = txt_qkv_w {
+            // Fused-base path: same caveat as the img branch above.
             let qkv_b = weights.get(&format!("{prefix}.attn.add_qkv_proj.bias"));
             let qkv = match qkv_b {
                 Some(bb) => Self::linear_bias(&txt_modulated, qkv_w, bb)?,
@@ -1086,9 +1134,9 @@ impl QwenImageDit {
             };
             flame_core::bf16_ops::qkv_split_permute_bf16(&qkv, h, d)?
         } else {
-            let txt_q = Self::linear_bias(&txt_modulated, w("attn.add_q_proj.weight")?, w("attn.add_q_proj.bias")?)?;
-            let txt_k = Self::linear_bias(&txt_modulated, w("attn.add_k_proj.weight")?, w("attn.add_k_proj.bias")?)?;
-            let txt_v = Self::linear_bias(&txt_modulated, w("attn.add_v_proj.weight")?, w("attn.add_v_proj.bias")?)?;
+            let txt_q = lin_lora(&txt_modulated, "attn.add_q_proj.weight", "attn.add_q_proj.bias")?;
+            let txt_k = lin_lora(&txt_modulated, "attn.add_k_proj.weight", "attn.add_k_proj.bias")?;
+            let txt_v = lin_lora(&txt_modulated, "attn.add_v_proj.weight", "attn.add_v_proj.bias")?;
             (
                 txt_q.reshape(&[b, n_txt, h, d])?.permute(&[0, 2, 1, 3])?,
                 txt_k.reshape(&[b, n_txt, h, d])?.permute(&[0, 2, 1, 3])?,
@@ -1117,8 +1165,8 @@ impl QwenImageDit {
             flame_core::bf16_ops::attn_split_txt_img_bf16(&attn_out, n_txt, n_img)?;
         let _ = (b, n_img, n_txt, h, d);
 
-        let img_attn = Self::linear_bias(&img_attn, w("attn.to_out.0.weight")?, w("attn.to_out.0.bias")?)?;
-        let txt_attn = Self::linear_bias(&txt_attn, w("attn.to_add_out.weight")?, w("attn.to_add_out.bias")?)?;
+        let img_attn = lin_lora(&img_attn, "attn.to_out.0.weight", "attn.to_out.0.bias")?;
+        let txt_attn = lin_lora(&txt_attn, "attn.to_add_out.weight", "attn.to_add_out.bias")?;
 
         // ── Gated residual (using gate1) ──
         let img = img.add(&img_gate1.unsqueeze(1)?.mul(&img_attn)?)?;
@@ -1129,9 +1177,9 @@ impl QwenImageDit {
         let img_mlp_in = img_normed2
             .mul(&img_scale2.add_scalar(1.0)?.unsqueeze(1)?)?
             .add(&img_shift2.unsqueeze(1)?)?;
-        let img_mlp = Self::linear_bias(&img_mlp_in, w("img_mlp.net.0.proj.weight")?, w("img_mlp.net.0.proj.bias")?)?;
+        let img_mlp = lin_lora(&img_mlp_in, "img_mlp.net.0.proj.weight", "img_mlp.net.0.proj.bias")?;
         let img_mlp = img_mlp.gelu()?;
-        let img_mlp = Self::linear_bias(&img_mlp, w("img_mlp.net.2.weight")?, w("img_mlp.net.2.bias")?)?;
+        let img_mlp = lin_lora(&img_mlp, "img_mlp.net.2.weight", "img_mlp.net.2.bias")?;
         let img = img.add(&img_gate2.unsqueeze(1)?.mul(&img_mlp)?)?;
 
         // ── FFN path for txt ──
@@ -1139,9 +1187,9 @@ impl QwenImageDit {
         let txt_mlp_in = txt_normed2
             .mul(&txt_scale2.add_scalar(1.0)?.unsqueeze(1)?)?
             .add(&txt_shift2.unsqueeze(1)?)?;
-        let txt_mlp = Self::linear_bias(&txt_mlp_in, w("txt_mlp.net.0.proj.weight")?, w("txt_mlp.net.0.proj.bias")?)?;
+        let txt_mlp = lin_lora(&txt_mlp_in, "txt_mlp.net.0.proj.weight", "txt_mlp.net.0.proj.bias")?;
         let txt_mlp = txt_mlp.gelu()?;
-        let txt_mlp = Self::linear_bias(&txt_mlp, w("txt_mlp.net.2.weight")?, w("txt_mlp.net.2.bias")?)?;
+        let txt_mlp = lin_lora(&txt_mlp, "txt_mlp.net.2.weight", "txt_mlp.net.2.bias")?;
         let txt = txt.add(&txt_gate2.unsqueeze(1)?.mul(&txt_mlp)?)?;
 
         let _ = Self::linear_nobias; // silence unused
