@@ -596,8 +596,20 @@ fn build_kohya_unet_table(base_keys: &HashSet<String>) -> HashMap<String, String
     let mut t = HashMap::new();
     for k in base_keys {
         let Some(module) = k.strip_suffix(".weight") else { continue };
+        // Standard form: full module path with dots → underscores.
         let kohya = module.replace('.', "_");
         t.insert(format!("lora_unet_{kohya}"), k.clone());
+        // Some trainers (e.g. Anima) target the model with a top-level
+        // umbrella prefix stripped — the LoRA's `lora_unet_*` doesn't
+        // include `net_` even though the base weight key is
+        // `net.<module>.weight`. Register that variant too. First-seen
+        // wins via `.entry().or_insert_with(...)` to avoid silently
+        // overwriting an exact match.
+        if let Some(stripped) = module.strip_prefix("net.") {
+            let kohya_no_net = stripped.replace('.', "_");
+            t.entry(format!("lora_unet_{kohya_no_net}"))
+                .or_insert_with(|| k.clone());
+        }
     }
     t
 }

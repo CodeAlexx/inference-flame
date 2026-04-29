@@ -23,6 +23,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::offload::BlockLoader;
+use crate::lora::LoraStack;
 
 // ---------------------------------------------------------------------------
 // Config
@@ -87,6 +88,10 @@ pub struct Anima {
     /// When true, all weights are in `resident` — skip load_block/unload_block
     all_on_gpu: bool,
     device: Arc<cudarc::driver::CudaDevice>,
+    /// Optional runtime LoRA stack. Applied at the `linear_no_bias`
+    /// chokepoint after every base matmul. Base weights are never
+    /// mutated.
+    lora: Option<Arc<LoraStack>>,
 }
 
 impl Anima {
@@ -102,6 +107,7 @@ impl Anima {
             loader,
             all_on_gpu: false,
             device,
+            lora: None,
         }
     }
 
@@ -119,7 +125,16 @@ impl Anima {
             loader,
             all_on_gpu: true,
             device,
+            lora: None,
         }
+    }
+
+    /// Attach a runtime LoRA stack. Subsequent forwards add
+    /// `scale * up(down(x))` from any matching LoRA entries to the
+    /// base output of every linear in the model. Base weights are
+    /// not mutated.
+    pub fn set_lora(&mut self, lora: Arc<LoraStack>) {
+        self.lora = Some(lora);
     }
 
     /// Load a block's weights from disk (mmap) into GPU.
@@ -154,7 +169,16 @@ impl Anima {
 
         let mut out_shape = x_dims[..x_dims.len() - 1].to_vec();
         out_shape.push(out_features);
-        out_2d.reshape(&out_shape)
+        let out = out_2d.reshape(&out_shape)?;
+
+        // Apply LoRA at the chokepoint. `LoraStack::apply` returns
+        // `out` unchanged when `weight_key` has no registered entry,
+        // so this stays inert for non-target linears (RMSNorm scales
+        // are loaded via `self.w` directly, not this function).
+        match &self.lora {
+            Some(stack) => stack.apply(weight_key, x, out),
+            None => Ok(out),
+        }
     }
 
     /// x @ weight.T + bias
