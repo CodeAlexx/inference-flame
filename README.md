@@ -72,7 +72,57 @@ Denoise is **10% faster per-step** than PyTorch. Fits entirely on a single 24GB 
 | Motif-Video 2B | 12 dual + 24 single DiT (T5Gemma2 text encoder, Wan 2.1 VAE) | Working end-to-end (prompt → MP4). 1280×720×49 @ 24fps, APG with norm-threshold clipping + momentum EMA matching reference. VAE decode currently via Python bridge (Rust `Wan21VaeDecoder` uses different safetensors key layout than diffusers-style motif checkpoint — `MOTIF_HANDOFF.md` has the diff). |
 | Anima 2B | Cosmos Predict2 DiT | Working |
 | Stable Cascade | Würstchen v3 — Stage C prior (2 levels, 8+24 blocks) + Stage B decoder (4 levels, 2/6/28/6 blocks, patch_size=2) + Paella VQ-GAN decoder | Working — 1024², 30+20 steps, ~93s on 3090 Ti. BF16 bilinear upsample, native `ConvTranspose2d`, CLIP-ViT-bigG-14 text encoder. Step-0 parity vs diffusers: Stage C 0.999966, Stage B 0.999980. Weights under the Stability AI Non-Commercial Research Community License. |
-| SenseNova-U1 8B-MoT | Qwen3-8B backbone in dual base/`_mot_gen` MoT mode (42 layers × 26 weights = 1092 per-layer + 24 shared/vision = 1116 total tensors), 3-axis RoPE (t θ=5e6, h+w θ=1e4), gen-side patch+merge embedder (Conv2d k=16/s=16 + interleaved 2D RoPE + Conv2d k=2/s=2), fm_modules (timestep + noise_scale embedders + fm_head 4096→3072 GELU) | Working — 1024²/50 in ~3.5 min on a 24 GB 3090 Ti, 2.6 s/step, 11 GB GPU peak. Model is 32.7 GB BF16 (resident loader OOMs on 24 GB) → BlockOffloader streams 42 layers from pinned host RAM. Qwen3 BPE tokenizer constructed in-process from `vocab.json` + `merges.txt` + `added_tokens.json` (no `tokenizer.json` ships). T2I non-think path; editing/think-mode/interleaved are separate. |
+| SenseNova-U1 8B-MoT | Qwen3-8B backbone in dual base/`_mot_gen` MoT mode (42 layers × 26 weights = 1092 per-layer + 24 shared/vision = 1116 total tensors), 3-axis RoPE (t θ=5e6, h+w θ=1e4), gen-side patch+merge embedder (Conv2d k=16/s=16 + interleaved 2D RoPE + Conv2d k=2/s=2), fm_modules (timestep + noise_scale embedders + fm_head 4096→3072 GELU) | Working — 1024²/50 in ~3.5 min on a 24 GB 3090 Ti, 2.6 s/step, 11 GB GPU peak. Model is 32.7 GB BF16 (resident loader OOMs on 24 GB) → BlockOffloader streams 42 layers from pinned host RAM. Qwen3 BPE tokenizer constructed in-process from `vocab.json` + `merges.txt` + `added_tokens.json` (no `tokenizer.json` ships). T2I, think-mode, and VQA / chat all ship; image-edit (`sensenova_u1_edit`) compiles but currently produces tiled artifacts. |
+
+## SenseNova-U1 multi-modal modes
+
+Three of the model's four modes are wired in `inference-flame` and verified end-to-end on a 24 GB 3090 Ti, all driven by the same 32.7 GB BF16 weights dir:
+
+| Mode | Bin | Verified |
+|------|-----|----------|
+| Text → image                          | `sensenova_u1_gen`            | ✅ |
+| Text + reasoning → image (chain-of-thought) | `sensenova_u1_gen --think` | ✅ |
+| Image → text (VQA / describe / chat)  | `sensenova_u1_chat`           | ✅ |
+| Image + prompt → image (it2i)         | `sensenova_u1_edit`           | ❌ tiled artifacts, bisect plan in handoff |
+
+### 1. VQA — "what's special about her fingernails?"
+
+| Input | Question | Model answer (excerpt) |
+|-------|----------|------------------------|
+| ![nails](docs/sensenova_u1_vqa_input_nails.png) | *What is special about her fingernails?* | "long, dark (black) nails with white decorative/ornamental patterns (swirls, small white details) on them, … long, pointed/almond shaped, and have that custom nail art." |
+
+```bash
+cargo run --release --bin sensenova_u1_chat -- \
+  --image nails.png \
+  --question "What is special about her fingernails?" \
+  --max_new_tokens 200
+```
+
+Got the basics right (long, black base, white art on top, almond shape); missed the specific motif (the white shapes are crescent moons matching the moon tattoo on her forehead). Decode is currently 1.5 s/token greedy — a known perf item.
+
+### 2. Caption → T2I round-trip
+
+Feed an image to `sensenova_u1_chat`, take whatever it writes, paste it verbatim into `sensenova_u1_gen`. No human editing of the prompt.
+
+| Source image | Model's caption (verbatim, truncated) | Generated at 1024² |
+|--------------|---------------------------------------|--------------------|
+| ![source](docs/sensenova_u1_chat_input_astronaut.jpg) | *"The image features a woman in an astronaut helmet surrounded by flowers, set against a starry background. **Subject:** A young woman with dark, curly hair … **Attire/Equipment:** … vintage-style astronaut helmet, white with a dark rim and a clear visor … **Surroundings:** dense arrangement of peach or light orange flowers … **Background:** deep space with dark blues and purples, stars and nebulae. **Style:** Photorealistic, cinematic, 8k. **Drafting the Prompt:** A close-up portrait of a young woman with dark, curly hair wearing a vintage"* | ![regen](docs/sensenova_u1_chat_to_t2i.png) |
+
+The model defaults to a meta-analysis style (numbered "Key Elements" + "Drafting the Prompt:"), not a clean comma-separated tag list — but `sensenova_u1_gen` consumes the whole thing as a single Qwen3 prompt and renders it without complaint.
+
+### 3. Think-mode design — "a warm stylish jacket for cold weather, ice weather"
+
+```bash
+cargo run --release --bin sensenova_u1_gen -- \
+  --think --max_think_tokens 512 \
+  --width 1024 --height 1024 \
+  --output jacket.png \
+  --prompt "a warm stylish jacket for cold weather, ice weather"
+```
+
+![jacket](docs/sensenova_u1_think_jacket.png)
+
+`--think` runs a `<think>…</think>` reasoning decode pass first; the resulting tokens condition the image generation. For a short, abstract design brief like this one the reasoning lets the model fill in concrete attributes (colour palette, materials, silhouette, environment) that a one-shot non-think pass would have to invent from the prompt alone.
 
 ## Desktop UI (`inference_ui/`)
 
