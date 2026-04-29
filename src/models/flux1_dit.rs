@@ -42,6 +42,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::lora::LoraStack;
+
 // ---------------------------------------------------------------------------
 // BlockFacilitator for FLUX 1:
 //   double_blocks.{i} → block i
@@ -132,6 +134,9 @@ pub struct Flux1DiT {
     offloader: BlockOffloader,
     config: Flux1Config,
     device: Arc<CudaDevice>,
+    /// Optional runtime LoRA stack — applied at every linear chokepoint
+    /// inside double/single-block forwards. Base weights are never mutated.
+    lora: Option<Arc<LoraStack>>,
 }
 
 impl Flux1DiT {
@@ -187,7 +192,16 @@ impl Flux1DiT {
             offloader,
             config,
             device: device.clone(),
+            lora: None,
         })
+    }
+
+    /// Attach a runtime LoRA stack. Subsequent forwards add
+    /// `scale * up(down(x))` from any matching LoRA entries to the base
+    /// matmul outputs at every double/single-block linear chokepoint.
+    /// Base weights are not mutated.
+    pub fn set_lora(&mut self, lora: Arc<LoraStack>) {
+        self.lora = Some(lora);
     }
 
     // -----------------------------------------------------------------------
@@ -744,6 +758,24 @@ impl Flux1DiT {
             })
         };
 
+        // LoRA-aware linear: do the base matmul, then add any matching LoRA
+        // contribution keyed by the FULL base weight key. Standard kohya
+        // LoRAs (lora_unet_double_blocks_*) route here via the kohya_table
+        // built from base_keys in lora.rs.
+        let lora_ref = self.lora.as_deref();
+        let lin_lora = |x: &Tensor, w_suffix: &str, b_suffix: &str| -> Result<Tensor> {
+            let weight = w(w_suffix)?;
+            let bias = w(b_suffix)?;
+            let base = Self::linear_bias(x, weight, bias)?;
+            match lora_ref {
+                Some(stack) => {
+                    let full_key = format!("{prefix}.{w_suffix}");
+                    stack.apply(&full_key, x, base)
+                }
+                None => Ok(base),
+            }
+        };
+
         let dims_img = img.shape().dims().to_vec();
         let dims_txt = txt.shape().dims().to_vec();
         let (b, n_img) = (dims_img[0], dims_img[1]);
@@ -751,14 +783,10 @@ impl Flux1DiT {
 
         // ── 1. modulation projection (silu + 2 linears + 12 narrows) ──
         let t = std::time::Instant::now();
-        let img_mod_w = w("img_mod.lin.weight")?;
-        let img_mod_b = w("img_mod.lin.bias")?;
-        let txt_mod_w = w("txt_mod.lin.weight")?;
-        let txt_mod_b = w("txt_mod.lin.bias")?;
         let vec_act = vec.silu()?;
-        let img_mods = Self::linear_bias(&vec_act.unsqueeze(1)?, img_mod_w, img_mod_b)?
+        let img_mods = lin_lora(&vec_act.unsqueeze(1)?, "img_mod.lin.weight", "img_mod.lin.bias")?
             .squeeze(Some(1))?;
-        let txt_mods = Self::linear_bias(&vec_act.unsqueeze(1)?, txt_mod_w, txt_mod_b)?
+        let txt_mods = lin_lora(&vec_act.unsqueeze(1)?, "txt_mod.lin.weight", "txt_mod.lin.bias")?
             .squeeze(Some(1))?;
         let chunk_size = cfg.inner_dim;
         let img_shift1 = img_mods.narrow(1, 0, chunk_size)?;
@@ -783,8 +811,8 @@ impl Flux1DiT {
 
         // ── 2b. qkv linears × 2 ──
         let t = std::time::Instant::now();
-        let img_qkv = Self::linear_bias(&img_normed, w("img_attn.qkv.weight")?, w("img_attn.qkv.bias")?)?;
-        let txt_qkv = Self::linear_bias(&txt_normed, w("txt_attn.qkv.weight")?, w("txt_attn.qkv.bias")?)?;
+        let img_qkv = lin_lora(&img_normed, "img_attn.qkv.weight", "img_attn.qkv.bias")?;
+        let txt_qkv = lin_lora(&txt_normed, "txt_attn.qkv.weight", "txt_attn.qkv.bias")?;
         mark("2b.qkv_linears", t);
 
         // ── 2c. split_qkv × 2 ──
@@ -823,8 +851,8 @@ impl Flux1DiT {
         let img_attn = attn_out.narrow(2, n_txt, n_img)?;
         let img_attn = img_attn.permute(&[0, 2, 1, 3])?.reshape(&[b, n_img, h * d])?;
         let txt_attn = txt_attn.permute(&[0, 2, 1, 3])?.reshape(&[b, n_txt, h * d])?;
-        let img_attn = Self::linear_bias(&img_attn, w("img_attn.proj.weight")?, w("img_attn.proj.bias")?)?;
-        let txt_attn = Self::linear_bias(&txt_attn, w("txt_attn.proj.weight")?, w("txt_attn.proj.bias")?)?;
+        let img_attn = lin_lora(&img_attn, "img_attn.proj.weight", "img_attn.proj.bias")?;
+        let txt_attn = lin_lora(&txt_attn, "txt_attn.proj.weight", "txt_attn.proj.bias")?;
         mark("6.attn_out+oproj", t);
 
         // ── 7. gated residual 1 ──
@@ -837,12 +865,12 @@ impl Flux1DiT {
         let t = std::time::Instant::now();
         let img_mlp_in = Self::modulate_pre(&img, &img_shift2, &img_scale2)?;
         let txt_mlp_in = Self::modulate_pre(&txt, &txt_shift2, &txt_scale2)?;
-        let img_mlp = Self::linear_bias(&img_mlp_in, w("img_mlp.0.weight")?, w("img_mlp.0.bias")?)?;
+        let img_mlp = lin_lora(&img_mlp_in, "img_mlp.0.weight", "img_mlp.0.bias")?;
         let img_mlp = img_mlp.gelu()?;
-        let img_mlp = Self::linear_bias(&img_mlp, w("img_mlp.2.weight")?, w("img_mlp.2.bias")?)?;
-        let txt_mlp = Self::linear_bias(&txt_mlp_in, w("txt_mlp.0.weight")?, w("txt_mlp.0.bias")?)?;
+        let img_mlp = lin_lora(&img_mlp, "img_mlp.2.weight", "img_mlp.2.bias")?;
+        let txt_mlp = lin_lora(&txt_mlp_in, "txt_mlp.0.weight", "txt_mlp.0.bias")?;
         let txt_mlp = txt_mlp.gelu()?;
-        let txt_mlp = Self::linear_bias(&txt_mlp, w("txt_mlp.2.weight")?, w("txt_mlp.2.bias")?)?;
+        let txt_mlp = lin_lora(&txt_mlp, "txt_mlp.2.weight", "txt_mlp.2.bias")?;
         mark("8.modulate2+mlp", t);
 
         // ── 9. gated residual 2 ──
@@ -894,13 +922,27 @@ impl Flux1DiT {
             })
         };
 
+        let lora_ref = self.lora.as_deref();
+        let lin_lora = |x: &Tensor, w_suffix: &str, b_suffix: &str| -> Result<Tensor> {
+            let weight = w(w_suffix)?;
+            let bias = w(b_suffix)?;
+            let base = Self::linear_bias(x, weight, bias)?;
+            match lora_ref {
+                Some(stack) => {
+                    let full_key = format!("{prefix}.{w_suffix}");
+                    stack.apply(&full_key, x, base)
+                }
+                None => Ok(base),
+            }
+        };
+
         let dims = x.shape().dims().to_vec();
         let (b, n) = (dims[0], dims[1]);
 
         // ── 1. modulation ──
         let t = std::time::Instant::now();
         let vec_act = vec.silu()?;
-        let mods = Self::linear_bias(&vec_act.unsqueeze(1)?, w("modulation.lin.weight")?, w("modulation.lin.bias")?)?
+        let mods = lin_lora(&vec_act.unsqueeze(1)?, "modulation.lin.weight", "modulation.lin.bias")?
             .squeeze(Some(1))?;
         let shift = mods.narrow(1, 0, dim)?;
         let scale = mods.narrow(1, dim, dim)?;
@@ -914,7 +956,7 @@ impl Flux1DiT {
 
         // ── 3. fused linear1 (QKV + MLP_up) ──
         let t = std::time::Instant::now();
-        let qkv_mlp = Self::linear_bias(&x_normed, w("linear1.weight")?, w("linear1.bias")?)?;
+        let qkv_mlp = lin_lora(&x_normed, "linear1.weight", "linear1.bias")?;
         let qkv = qkv_mlp.narrow(2, 0, 3 * dim)?;
         let mlp_in = qkv_mlp.narrow(2, 3 * dim, mlp_hidden)?;
         mark("3.linear1", t);
@@ -949,7 +991,7 @@ impl Flux1DiT {
         // ── 9. fused linear2 (attn_proj + mlp_down via cat) ──
         let t = std::time::Instant::now();
         let fused_in = Tensor::cat(&[&attn_out, &mlp_out], 2)?;
-        let out = Self::linear_bias(&fused_in, w("linear2.weight")?, w("linear2.bias")?)?;
+        let out = lin_lora(&fused_in, "linear2.weight", "linear2.bias")?;
         mark("9.linear2", t);
 
         // ── 10. gated residual ──
