@@ -340,7 +340,7 @@ fn run_inner_body(
             device.clone(),
         )
         .map_err(|e| RunError::Other(format!("SDXL GGUF load: {e:?}")))?;
-        SDXLUNet::from_weights_all_gpu(weights, model_path.to_string(), &device)
+        SDXLUNet::from_weights_all_gpu(model_path.to_string(), weights, device.clone())
             .map_err(|e| RunError::Other(format!("UNet build: {e:?}")))?
     } else {
         SDXLUNet::from_safetensors_all_gpu(model_path, &device)

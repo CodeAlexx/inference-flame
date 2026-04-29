@@ -157,5 +157,13 @@ pub fn resolve_image_model_path(filename: &str, kind: ModelKind) -> Option<Strin
         // (GGUF Cascade is supported by load_cascade_unet per-stage but needs
         // three separate overrides which the current UI doesn't surface.)
         ModelKind::Cascade => None,
+
+        // SenseNova-U1: default is a DIRECTORY scan
+        // (/home/alex/.serenity/models/sensenova_u1) holding 8 sharded
+        // safetensors plus tokenizer JSON files. The placeholder filename
+        // surfaced in IMAGE_MODELS is informational; the worker uses its
+        // hardcoded SENSENOVA_WEIGHTS_DIR const. Return None so we don't
+        // mislead the worker into treating the placeholder as a real path.
+        ModelKind::SenseNovaU1 => None,
     }
 }

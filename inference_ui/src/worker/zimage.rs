@@ -174,7 +174,8 @@ impl ZImageVariant {
             | ModelKind::Anima
             | ModelKind::Sdxl
             | ModelKind::Sd15
-            | ModelKind::Cascade => None,
+            | ModelKind::Cascade
+            | ModelKind::SenseNovaU1 => None,
         }
     }
 

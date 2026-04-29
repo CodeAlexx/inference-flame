@@ -644,13 +644,16 @@ fn load_cascade_unet(
     device: &Arc<CudaDevice>,
 ) -> Result<WuerstchenUNet, flame_core::Error> {
     if path.to_ascii_lowercase().ends_with(".gguf") {
-        log::info!("Cascade: loading GGUF UNet from {path}");
-        let weights = inference_flame::gguf::load_file_gguf(
-            std::path::Path::new(path),
-            device.clone(),
-        )
-        .map_err(|e| flame_core::Error::InvalidInput(format!("GGUF load: {e}")))?;
-        WuerstchenUNet::from_weights(weights, config, device)
+        // Cascade GGUF route is currently unavailable: the lib previously
+        // exposed `WuerstchenUNet::from_weights(weights, config, device)`
+        // (HashMap input) but only `WuerstchenUNet::load(path, config, device)`
+        // (safetensors path) remains today. Fail-fast — same pattern as the
+        // FLUX / Chroma / SD15 workers' GGUF gates.
+        Err(flame_core::Error::InvalidInput(format!(
+            "Cascade UNet GGUF not yet supported in the UI: the lib no \
+             longer exposes a HashMap-input loader for WuerstchenUNet. \
+             Use a .safetensors stage for Cascade. (path={path})"
+        )))
     } else {
         WuerstchenUNet::load(path, config, device)
     }
@@ -661,13 +664,15 @@ fn load_cascade_paella(
     device: &Arc<CudaDevice>,
 ) -> Result<PaellaVQDecoder, flame_core::Error> {
     if path.to_ascii_lowercase().ends_with(".gguf") {
-        log::info!("Cascade: loading GGUF Paella VQ-GAN from {path}");
-        let weights = inference_flame::gguf::load_file_gguf(
-            std::path::Path::new(path),
-            device.clone(),
-        )
-        .map_err(|e| flame_core::Error::InvalidInput(format!("GGUF load: {e}")))?;
-        PaellaVQDecoder::from_weights(weights, device)
+        // Same lib drift as load_cascade_unet: `PaellaVQDecoder::from_weights`
+        // (HashMap input) was removed; only `PaellaVQDecoder::load(path,
+        // device)` (safetensors path) remains. Fail-fast.
+        Err(flame_core::Error::InvalidInput(format!(
+            "Cascade Paella VQ-GAN GGUF not yet supported in the UI: the \
+             lib no longer exposes a HashMap-input loader for \
+             PaellaVQDecoder. Use a .safetensors decoder for Cascade. \
+             (path={path})"
+        )))
     } else {
         PaellaVQDecoder::load(path, device)
     }

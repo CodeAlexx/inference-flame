@@ -304,14 +304,19 @@ fn run_inner_body(
     log::info!("SD 1.5: loading UNet from {unet_p}");
     let t0 = Instant::now();
     let mut model = if unet_p.to_ascii_lowercase().ends_with(".gguf") {
-        log::info!("SD 1.5: loading GGUF from {unet_p}");
-        let weights = inference_flame::gguf::load_file_gguf(
-            Path::new(&unet_p),
-            device.clone(),
-        )
-        .map_err(|e| RunError::Other(format!("SD 1.5 GGUF load: {e:?}")))?;
-        SD15UNet::from_weights_all_gpu(weights, unet_p.clone(), &device)
-            .map_err(|e| RunError::Other(format!("UNet build: {e:?}")))?
+        // SD 1.5 GGUF route is currently unavailable: the lib previously
+        // exposed `SD15UNet::from_weights_all_gpu(weights, path, &device)`
+        // which did the diffusers→LDM remap + HWIO precompute internally,
+        // but that constructor was removed when the SD15 loader was
+        // refactored. The remaining `SD15UNet::from_safetensors_all_gpu` is
+        // safetensors-only. Fail-fast for now — same pattern as the FLUX /
+        // Chroma workers' "GGUF + BlockOffloader not supported" errors.
+        return Err(RunError::Other(
+            "SD 1.5 GGUF not yet supported in the UI: the lib no longer \
+             exposes a HashMap-input loader that does the diffusers→LDM \
+             remap. Use a .safetensors checkpoint for SD 1.5."
+                .to_string(),
+        ));
     } else {
         SD15UNet::from_safetensors_all_gpu(&unet_p, &device)
             .map_err(|e| RunError::Other(format!("UNet load: {e:?}")))?

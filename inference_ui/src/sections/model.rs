@@ -85,6 +85,11 @@ const IMAGE_MODELS: &[&str] = &[
     "stable-cascade.safetensors",
     "stable-cascade-Q4_K_M.gguf",
     "stable-cascade-Q8_0.gguf",
+    // SenseNova-U1 8B-MoT (T2I non-think). Filename is a UI placeholder —
+    // the actual on-disk layout is a directory at
+    // /home/alex/.serenity/models/sensenova_u1; `worker/sensenova.rs` ignores
+    // any path override from the ComboBox and uses its hardcoded const dir.
+    "sensenova-u1.safetensors",
 ];
 
 const VIDEO_MODELS: &[&str] = &[

@@ -31,6 +31,7 @@ pub mod qwenimage;
 pub mod sd15;
 pub mod sd3;
 pub mod sdxl;
+pub mod sensenova;
 pub mod zimage;
 
 /// Which model the worker should run for a given job. The mock generator is
@@ -94,6 +95,13 @@ pub enum ModelKind {
     /// sequentially-loaded stages: Stage C prior → Stage B decoder →
     /// Paella VQ-GAN. DDIM-style eps step per ddpm_wuerstchen.
     Cascade,
+    /// SenseNova-U1 8B-MoT — 50 steps default, real two-pass CFG via the
+    /// model's own forward_und/forward_gen MoT path. Single weights dir at
+    /// `/home/alex/.serenity/models/sensenova_u1` (~32 GB BF16, 8 shards).
+    /// BlockOffloader streams blocks from pinned host RAM; peak GPU memory
+    /// stays ~11 GB. T2I non-think only — chat/think-mode/it2i are out of
+    /// scope for this UI worker (use the standalone CLI bins).
+    SenseNovaU1,
 }
 
 impl ModelKind {
@@ -119,7 +127,14 @@ impl ModelKind {
             .or_else(|| raw_lower.strip_suffix(".safetensors"))
             .unwrap_or(&raw_lower);
         let lower = trimmed;
-        if lower.contains("z-image-turbo") || lower.contains("zimage-turbo") {
+        // SenseNova-U1 — match "sensenova" anywhere. Placed first so it can't
+        // collide with the other Qwen3-derived family (Klein) or any of the
+        // SD-family arms below. The placeholder filename in IMAGE_MODELS is
+        // `sensenova-u1.safetensors`; the actual on-disk layout is a directory
+        // (handled inside `worker/sensenova.rs`).
+        if lower.contains("sensenova") {
+            Self::SenseNovaU1
+        } else if lower.contains("z-image-turbo") || lower.contains("zimage-turbo") {
             Self::ZImageTurbo
         } else if lower.contains("z-image-base") || lower.contains("zimage-base") {
             Self::ZImageBase

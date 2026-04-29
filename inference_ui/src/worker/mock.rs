@@ -16,8 +16,8 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use egui::{Color32, ColorImage};
 
 use super::{
-    anima, cascade, chroma, ernie, flux, klein, qwenimage, sd15, sd3, sdxl, zimage, GenerateJob,
-    ModelKind, UiMsg, WorkerEvent,
+    anima, cascade, chroma, ernie, flux, klein, qwenimage, sd15, sd3, sdxl, sensenova, zimage,
+    GenerateJob, ModelKind, UiMsg, WorkerEvent,
 };
 
 /// Per-step sleep for the mock generator. 80ms × 28 steps ≈ 2.2s — long
@@ -90,6 +90,14 @@ pub fn run(ui_rx: Receiver<UiMsg>, ev_tx: Sender<WorkerEvent>, ctx: egui::Contex
     // stages (Stage C prior, Stage B decoder, Paella VQ-GAN) all loaded
     // sequentially per-job. Most VRAM-fragmented of all workers.
     let mut cascade_state: Option<cascade::CascadeState> = None;
+
+    // SenseNova-U1 state — same lazy-init pattern. Unlike most workers above,
+    // BOTH the tokenizer and the model are kept resident across jobs because
+    // the model load (BlockOffloader populating ~32 GB into pinned host RAM)
+    // is ~80 s on first call and re-doing it per job would be unusable in a
+    // UI. Steady-state GPU footprint is ~11 GB regardless of resident model
+    // size — see `worker/sensenova.rs` for the rationale.
+    let mut sensenova_state: Option<sensenova::SenseNovaState> = None;
 
     loop {
         // Drain any messages that the inner loop captured during the last
@@ -317,6 +325,23 @@ pub fn run(ui_rx: Receiver<UiMsg>, ev_tx: Sender<WorkerEvent>, ctx: egui::Contex
                     }
                     let state = cascade_state.as_mut().unwrap();
                     cascade::run(&job, state, &ui_rx, &ev_tx, &ctx, &mut pending);
+                }
+                ModelKind::SenseNovaU1 => {
+                    if sensenova_state.is_none() {
+                        match sensenova::SenseNovaState::new() {
+                            Ok(s) => sensenova_state = Some(s),
+                            Err(e) => {
+                                let _ = ev_tx.send(WorkerEvent::Failed {
+                                    id: job.id,
+                                    error: format!("SenseNova-U1 CUDA init failed: {e}"),
+                                });
+                                ctx.request_repaint();
+                                continue;
+                            }
+                        }
+                    }
+                    let state = sensenova_state.as_mut().unwrap();
+                    sensenova::run(&job, state, &ui_rx, &ev_tx, &ctx, &mut pending);
                 }
             }
             // After a job ends (done OR cancelled), continue the outer loop
