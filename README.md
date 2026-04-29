@@ -62,7 +62,7 @@ Denoise is **10% faster per-step** than PyTorch. Fits entirely on a single 24GB 
 | Z-Image | NextDiT (6.15B) | Working |
 | Chroma 8.9B | FLUX-schnell DiT + distilled guidance (19+38 blocks) | Working — real CFG, 1024²/40 on a 24 GB card via BlockOffloader |
 | SD3.5 Medium | MMDiT (24 blocks, dual attention) | Working — full prompt-to-PNG, CLIP-L + CLIP-G + T5-XXL, 1024² resident |
-| SD3.5 Large | MMDiT (38 blocks) | Built, needs full pipeline |
+| SD3.5 Large | MMDiT (38 blocks, single attention) | Working — full pipeline (CLIP-L + CLIP-G + T5-XXL → DiT → SD3 VAE → PNG), 1024²/28 steps in ~4 min on a 24 GB 3090 Ti, 16.3 GB BF16 DiT loaded resident block-by-block via `load_sd3_all_chunked`. Same `sd3_infer` bin and `SD3MMDiT` model code as Medium — depth/dual-attention auto-detected from the weight shapes via `SD3Config::from_weights`. |
 | SDXL | LDM UNet | Working |
 | SD 1.5 | UNet2DConditionModel (860M) + CLIP-L only | Working — 512²/30, CFG 7.5, ~58s on 3090 Ti, diffusers→LDM key remap, shares LdmVAEDecoder + ClipEncoder with the rest of the stack |
 | QwenImage-2512 | 60-layer DiT + 3D VAE (Qwen2.5-VL-7B text encoder) | Working — 1024²/30, true CFG with norm rescale, 3-axis RoPE, BlockOffloader |

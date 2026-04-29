@@ -27,9 +27,9 @@ const CLIP_G_TOKENIZER: &str = "/home/alex/.serenity/models/text_encoders/clip_g
 const T5_PATH: &str = "/home/alex/.serenity/models/text_encoders/t5xxl_fp16.safetensors";
 const T5_TOKENIZER: &str = "/home/alex/.serenity/models/text_encoders/t5xxl_fp16.tokenizer.json";
 
-const MODEL_PATH: &str = "/home/alex/.serenity/models/checkpoints/sd3.5_medium.safetensors";
+const MODEL_PATH: &str = "/home/alex/.serenity/models/checkpoints/sd3.5_large.safetensors";
 
-const OUTPUT_PATH: &str = "/home/alex/EriDiffusion/inference-flame/output/sd3_medium_rust.png";
+const OUTPUT_PATH: &str = "/home/alex/EriDiffusion/inference-flame/output/sd3_large_rust.png";
 
 // ---------------------------------------------------------------------------
 // Sampling parameters
