@@ -32,3 +32,4 @@ pub mod acestep_dit;
 pub mod wuerstchen_blocks;
 pub mod wuerstchen_unet;
 pub mod paella_vq;
+pub mod sensenova_u1;
