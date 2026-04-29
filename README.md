@@ -22,10 +22,10 @@ Pure Rust diffusion model inference using [flame-core](https://github.com/CodeAl
 | ![FLUX.1-dev](docs/flux1_sample.png) | ![Motif](docs/motif_sample.png) | ![SD 1.5](docs/sd15_sample.png) |
 | *20 steps, guidance 3.5, 1024²* | *50 steps, APG cfg 8.0, 1280×720×49 @ 24fps — [sample.mp4](docs/motif_sample.mp4)* | *30 steps, CFG 7.5, 512², 58s* |
 
-| Stable Cascade |  |  |
+| Stable Cascade | SenseNova-U1 8B-MoT |  |
 |---|---|---|
-| ![Stable Cascade](docs/cascade_sample.png) |  |  |
-| *Stage C 30 + Stage B 20 steps, CFG 5.0/1.1, 1024², 93s — two-stage Würstchen v3 (Stage C prior + Stage B decoder + Paella VQ-GAN)* |  |  |
+| ![Stable Cascade](docs/cascade_sample.png) | ![SenseNova-U1](docs/sensenova_u1_sample.png) |  |
+| *Stage C 30 + Stage B 20 steps, CFG 5.0/1.1, 1024², 93s — two-stage Würstchen v3 (Stage C prior + Stage B decoder + Paella VQ-GAN)* | *50 steps, CFG 4.0, shift 3.0, 1024², ~3.5 min on 3090 Ti via BlockOffloader* |  |
 
 ### Image editing — "change her dress to blue"
 
@@ -72,6 +72,7 @@ Denoise is **10% faster per-step** than PyTorch. Fits entirely on a single 24GB 
 | Motif-Video 2B | 12 dual + 24 single DiT (T5Gemma2 text encoder, Wan 2.1 VAE) | Working end-to-end (prompt → MP4). 1280×720×49 @ 24fps, APG with norm-threshold clipping + momentum EMA matching reference. VAE decode currently via Python bridge (Rust `Wan21VaeDecoder` uses different safetensors key layout than diffusers-style motif checkpoint — `MOTIF_HANDOFF.md` has the diff). |
 | Anima 2B | Cosmos Predict2 DiT | Working |
 | Stable Cascade | Würstchen v3 — Stage C prior (2 levels, 8+24 blocks) + Stage B decoder (4 levels, 2/6/28/6 blocks, patch_size=2) + Paella VQ-GAN decoder | Working — 1024², 30+20 steps, ~93s on 3090 Ti. BF16 bilinear upsample, native `ConvTranspose2d`, CLIP-ViT-bigG-14 text encoder. Step-0 parity vs diffusers: Stage C 0.999966, Stage B 0.999980. Weights under the Stability AI Non-Commercial Research Community License. |
+| SenseNova-U1 8B-MoT | Qwen3-8B backbone in dual base/`_mot_gen` MoT mode (42 layers × 26 weights = 1092 per-layer + 24 shared/vision = 1116 total tensors), 3-axis RoPE (t θ=5e6, h+w θ=1e4), gen-side patch+merge embedder (Conv2d k=16/s=16 + interleaved 2D RoPE + Conv2d k=2/s=2), fm_modules (timestep + noise_scale embedders + fm_head 4096→3072 GELU) | Working — 1024²/50 in ~3.5 min on a 24 GB 3090 Ti, 2.6 s/step, 11 GB GPU peak. Model is 32.7 GB BF16 (resident loader OOMs on 24 GB) → BlockOffloader streams 42 layers from pinned host RAM. Qwen3 BPE tokenizer constructed in-process from `vocab.json` + `merges.txt` + `added_tokens.json` (no `tokenizer.json` ships). T2I non-think path; editing/think-mode/interleaved are separate. |
 
 ## Desktop UI (`inference_ui/`)
 
