@@ -60,6 +60,8 @@ struct Args {
     timestep_shift: f32,
     num_steps: u32,
     seed: u64,
+    think_mode: bool,
+    max_think_tokens: usize,
 }
 
 impl Args {
@@ -74,6 +76,8 @@ impl Args {
             timestep_shift: 3.0,
             num_steps: 50,
             seed: 42,
+            think_mode: false,
+            max_think_tokens: 1024,
         }
     }
 }
@@ -121,6 +125,12 @@ fn parse_args() -> std::result::Result<Args, String> {
             }
             "--seed" => {
                 a.seed = next()?
+                    .parse()
+                    .map_err(|e: std::num::ParseIntError| e.to_string())?
+            }
+            "--think" => a.think_mode = true,
+            "--max_think_tokens" => {
+                a.max_think_tokens = next()?
                     .parse()
                     .map_err(|e: std::num::ParseIntError| e.to_string())?
             }
@@ -399,25 +409,60 @@ fn run_t2i(
     let b: usize = 1;
 
     // ---- Tokenize cond/uncond ----
-    let cond_query = build_t2i_query(
-        SYSTEM_MESSAGE_FOR_GEN,
-        &args.prompt,
-        "<think>\n\n</think>\n\n<img>",
-    );
+    // The conditional query branches on think_mode:
+    //   - non-think: append `<think>\n\n</think>\n\n<img>` so the assistant
+    //     emits an empty think block then the <img> sentinel.
+    //   - think:     append `<think>\n` only — the model autoregressively fills
+    //     the think block, we stop on `</think>`, then push `\n\n<img>` into
+    //     the cache. Mirrors the python `t2i_generate(think_mode=True)` path.
+    let cond_append = if args.think_mode {
+        "<think>\n"
+    } else {
+        "<think>\n\n</think>\n\n<img>"
+    };
+    let cond_query = build_t2i_query(SYSTEM_MESSAGE_FOR_GEN, &args.prompt, cond_append);
     let uncond_query = build_t2i_query("", "", "<img>");
     let cond_ids = encode_query(tok, &cond_query)?;
     let uncond_ids = encode_query(tok, &uncond_query)?;
     eprintln!(
-        "[sensenova_u1] cond tokens={}  uncond tokens={}",
+        "[sensenova_u1] cond tokens={}  uncond tokens={}{}",
         cond_ids.len(),
-        uncond_ids.len()
+        uncond_ids.len(),
+        if args.think_mode { "  [think mode]" } else { "" }
     );
 
     // ---- Prefix forwards (one-time per generation) ----
     let t0 = std::time::Instant::now();
-    let (cond_cache, _) = model.forward_und(&cond_ids)?;
+    let (mut cond_cache, cond_last_hidden) = model.forward_und(&cond_ids)?;
     let (uncond_cache, _) = model.forward_und(&uncond_ids)?;
     eprintln!("[sensenova_u1] prefix forward: {:.2}s", t0.elapsed().as_secs_f32());
+
+    // ---- Optional: think-mode autoregressive generation, then append the
+    // literal "\n\n<img>" tokens to the cache. The image-gen loop below works
+    // off the EXTENDED cond_cache; uncond_cache is unaffected. ----
+    if args.think_mode {
+        let t_think = std::time::Instant::now();
+        let think_ids = model.decode_autoregressive(
+            &mut cond_cache,
+            &cond_last_hidden,
+            args.max_think_tokens,
+            &[151668 /* </think> */, 151645 /* <|im_end|> */],
+        )?;
+        let think_text = {
+            let u32s: Vec<u32> = think_ids.iter().map(|&i| i as u32).collect();
+            tok.decode(&u32s, true).unwrap_or_default()
+        };
+        eprintln!(
+            "[sensenova_u1] think: {} tokens in {:.2}s\n--- think ---\n{}\n---",
+            think_ids.len(),
+            t_think.elapsed().as_secs_f32(),
+            think_text
+        );
+        // Push the literal "\n\n<img>" continuation into the cache.
+        let append_str = "\n\n<img>";
+        let append_ids = encode_query(tok, append_str)?;
+        let _ = model.extend_cache_with_text_tokens(&mut cond_cache, &append_ids)?;
+    }
 
     // ---- Init noise image ----
     let noise_scale = model.compute_noise_scale(grid_h, grid_w);
@@ -479,11 +524,13 @@ fn run_t2i(
 
         // CFG cond + uncond passes through forward_gen. forward_gen takes
         // &mut self (it drives the offloader), so we sequence the two passes
-        // through the same `model` borrow.
+        // through the same `model` borrow. `text_len` here is the t-axis
+        // position to assign to image tokens — equal to `next_t_index` of the
+        // KV cache (post-extension if think-mode appended literals).
         let h_cond = forward_gen_for(
             model,
             &image_embeds,
-            cond_ids.len(),
+            cond_cache.next_t_index,
             token_h,
             token_w,
             &cond_cache,
@@ -491,7 +538,7 @@ fn run_t2i(
         let h_uncond = forward_gen_for(
             model,
             &image_embeds,
-            uncond_ids.len(),
+            uncond_cache.next_t_index,
             token_h,
             token_w,
             &uncond_cache,

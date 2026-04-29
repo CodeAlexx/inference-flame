@@ -339,6 +339,18 @@ required-features = ["turbo"]
 name = "sensenova_u1_gen"
 path = "src/bin/sensenova_u1_gen.rs"
 
+[[bin]]
+name = "sensenova_u1_chat"
+path = "src/bin/sensenova_u1_chat.rs"
+
+[[bin]]
+name = "sensenova_u1_edit"
+path = "src/bin/sensenova_u1_edit.rs"
+
+[[bin]]
+name = "sensenova_u1_interleaved"
+path = "src/bin/sensenova_u1_interleaved.rs"
+
 # ---------------------------------------------------------------------------
 # Integration tests (tests/*.rs) — enumerated manually because autotests=false.
 # ---------------------------------------------------------------------------

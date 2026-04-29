@@ -341,8 +341,14 @@ pub struct KvCache {
     /// `K`: [B, num_kv_heads, prefix_len, head_dim], BF16.
     /// `V`: [B, num_kv_heads, prefix_len, head_dim], BF16.
     pub layers: Vec<(Tensor, Tensor)>,
-    /// Number of text tokens that produced the cache (== K.shape(2)).
+    /// Number of tokens that produced the cache (== K.shape(2)).
     pub prefix_len: usize,
+    /// `t_index` (in the model's spatiotemporal RoPE sense) to assign to the
+    /// FIRST decoded token after this prefix. For a text-only prefix
+    /// `next_t_index == prefix_len`. For a mixed prefix it equals
+    /// `max(t_indexes_of_prefix) + 1`, which is `prefix_len - L_image_context`
+    /// because each `<IMG_CONTEXT>` block consumes only one t-axis slot.
+    pub next_t_index: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -606,6 +612,7 @@ impl SenseNovaU1 {
             KvCache {
                 layers: cache_layers,
                 prefix_len: seq_len,
+                next_t_index: seq_len,
             },
             hidden,
         ))
@@ -1266,6 +1273,104 @@ impl SenseNovaU1 {
     }
 
     // -----------------------------------------------------------------------
+    // Phase 2 (cap. 1/2): understanding-side image feature extractor.
+    //
+    // Mirror of `extract_feature_gen` using the BASE vision-embedder weights
+    // at `vision_model.embeddings.*` (no `_mot_gen` suffix). Same structure:
+    // Conv2d-as-matmul patch embedder, GELU, interleaved 2D RoPE, then
+    // Conv2d-as-matmul 2×2 spatial merge into hidden_size=4096.
+    //
+    // Reference: `modeling_neo_vit.py::NEOVisionEmbeddings.forward` for the
+    // patch+rope+merge math, and `modeling_neo_chat.py::extract_feature`
+    // (line 304) which switches between the two (`gen_model=True` vs False).
+    // -----------------------------------------------------------------------
+
+    /// Extract understanding-side image features. Inputs and shapes match
+    /// `extract_feature_gen` — only the loaded weight prefix differs.
+    pub fn extract_feature_und(
+        &self,
+        pixel_values: &Tensor,
+        grid_h: usize,
+        grid_w: usize,
+    ) -> Result<Tensor> {
+        let dims = pixel_values.shape().dims();
+        if dims.len() != 2 || dims[1] != 3 * self.config.patch_size * self.config.patch_size {
+            return Err(Error::InvalidInput(format!(
+                "extract_feature_und: expected [B*N, {}], got {:?}",
+                3 * self.config.patch_size * self.config.patch_size,
+                dims
+            )));
+        }
+        let n = grid_h * grid_w;
+        let bn = dims[0];
+        if n == 0 || bn % n != 0 {
+            return Err(Error::InvalidInput(format!(
+                "extract_feature_und: B*N={bn} not divisible by grid_h*grid_w={n}"
+            )));
+        }
+        let b = bn / n;
+        let merge = self.config.merge_size();
+        if grid_h % merge != 0 || grid_w % merge != 0 {
+            return Err(Error::InvalidInput(format!(
+                "extract_feature_und: grid {grid_h}x{grid_w} must be divisible by merge_size {merge}"
+            )));
+        }
+        let token_h = grid_h / merge;
+        let token_w = grid_w / merge;
+
+        let pe_w = self.shared_get("vision_model.embeddings.patch_embedding.weight")?;
+        let pe_b = self.shared_get("vision_model.embeddings.patch_embedding.bias")?;
+        let de_w = self.shared_get("vision_model.embeddings.dense_embedding.weight")?;
+        let de_b = self.shared_get("vision_model.embeddings.dense_embedding.bias")?;
+
+        let patch_flat = 3 * self.config.patch_size * self.config.patch_size;
+        let pe_w_flat = pe_w.reshape(&[self.config.vision_hidden_size, patch_flat])?;
+        let pixel_3d = pixel_values.reshape(&[1, bn, patch_flat])?;
+        let h = flame_core::ops::fused_inference::fused_linear3d_native(
+            &pixel_3d,
+            &pe_w_flat,
+            Some(pe_b),
+        )?
+        .reshape(&[bn, self.config.vision_hidden_size])?;
+
+        let h = h.gelu()?;
+
+        let half = self.config.vision_hidden_size / 2;
+        let theta = self.config.rope_theta_vision;
+        let mut pos_x: Vec<i32> = Vec::with_capacity(bn);
+        let mut pos_y: Vec<i32> = Vec::with_capacity(bn);
+        for _ in 0..b {
+            for i in 0..n {
+                pos_x.push((i % grid_w) as i32);
+                pos_y.push((i / grid_w) as i32);
+            }
+        }
+        let (cos_x, sin_x) = build_rope_for_positions(&pos_x, half, theta, &self.device)?;
+        let (cos_y, sin_y) = build_rope_for_positions(&pos_y, half, theta, &self.device)?;
+        let (h_x, h_y) = Self::chunk_last_half(&h)?;
+        let h_x = h_x.reshape(&[1, 1, bn, half])?;
+        let h_y = h_y.reshape(&[1, 1, bn, half])?;
+        let h_x = flame_core::bf16_ops::rope_fused_bf16(&h_x, &cos_x, &sin_x)?;
+        let h_y = flame_core::bf16_ops::rope_fused_bf16(&h_y, &cos_y, &sin_y)?;
+        let h_x = h_x.reshape(&[bn, half])?;
+        let h_y = h_y.reshape(&[bn, half])?;
+        let h = Tensor::cat(&[&h_x, &h_y], 1)?;
+
+        let h = h.reshape(&[b, grid_h, grid_w, self.config.vision_hidden_size])?;
+        let h = h.reshape(&[b, token_h, merge, token_w, merge, self.config.vision_hidden_size])?;
+        let h = h.permute(&[0, 1, 3, 5, 2, 4])?;
+        let merge_flat = self.config.vision_hidden_size * merge * merge;
+        let h = h.reshape(&[1, b * token_h * token_w, merge_flat])?;
+        let de_w_flat = de_w.reshape(&[self.config.hidden_size, merge_flat])?;
+        let h = flame_core::ops::fused_inference::fused_linear3d_native(
+            &h,
+            &de_w_flat,
+            Some(de_b),
+        )?;
+        h.reshape(&[b, token_h * token_w, self.config.hidden_size])
+    }
+
+    // -----------------------------------------------------------------------
     // Phase 4: fm_modules
     // -----------------------------------------------------------------------
     //
@@ -1406,6 +1511,835 @@ impl SenseNovaU1 {
         let raw = ((n_tokens / (merge * merge) / base).sqrt()) * self.config.noise_scale;
         raw.min(self.config.noise_scale_max_value)
     }
+
+    // -----------------------------------------------------------------------
+    // Phase 5 (cap. 1/3/4): autoregressive decode primitives.
+    // -----------------------------------------------------------------------
+    //
+    // Reference Python: `_generate_think` and `_append_text_tokens_to_cache`
+    // in `modeling_neo_chat.py:507`/`:478`. The shared kernel is single-token
+    // self-attention with past-K/V concat — we reuse the existing `und_layer`
+    // shape contract (BF16, base path) and just append along the seq dim.
+
+    /// Single-token (or short batch) base-mode forward through one decoder
+    /// layer with past-K/V concat. Returns `(new_hidden, k_full, v_full)`
+    /// where the K/V are at `num_kv_heads` (BEFORE GQA repeat) and span
+    /// `past_len + cur_len` along the seq dim — i.e., the new cache entry.
+    ///
+    /// Mirrors `und_layer` (see line ~621) but takes a `past_k`/`past_v` to
+    /// concatenate before SDPA, the same pattern `gen_layer` uses for the
+    /// gen path.
+    #[allow(clippy::too_many_arguments)]
+    fn und_layer_step(
+        cfg: &SenseNovaU1Config,
+        i: usize,
+        lw: &HashMap<String, Tensor>,
+        hidden: &Tensor,
+        cos_t: &Tensor,
+        sin_t: &Tensor,
+        past_k: &Tensor,
+        past_v: &Tensor,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        let h_total = cfg.num_heads;
+        let h_kv = cfg.num_kv_heads;
+        let d = cfg.head_dim;
+        let n_rep = h_total / h_kv;
+        let dims = hidden.shape().dims().to_vec();
+        let b = dims[0];
+        let n = dims[1];
+
+        let lget = |k: &str| -> Result<&Tensor> {
+            lw.get(k).ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "SenseNovaU1: missing layer-{i} weight {k}"
+                ))
+            })
+        };
+
+        let normed = Self::rms_norm_apply(
+            hidden,
+            lget(&format!("language_model.model.layers.{i}.input_layernorm.weight"))?,
+            cfg.rms_norm_eps,
+        )?;
+
+        let q = Self::linear_no_bias(
+            &normed,
+            lget(&format!("language_model.model.layers.{i}.self_attn.q_proj.weight"))?,
+        )?;
+        let k = Self::linear_no_bias(
+            &normed,
+            lget(&format!("language_model.model.layers.{i}.self_attn.k_proj.weight"))?,
+        )?;
+        let v = Self::linear_no_bias(
+            &normed,
+            lget(&format!("language_model.model.layers.{i}.self_attn.v_proj.weight"))?,
+        )?;
+
+        let q = q.reshape(&[b, n, h_total, d])?.permute(&[0, 2, 1, 3])?;
+        let k = k.reshape(&[b, n, h_kv, d])?.permute(&[0, 2, 1, 3])?;
+        let v = v.reshape(&[b, n, h_kv, d])?.permute(&[0, 2, 1, 3])?;
+
+        let q_norm = lget(&format!("language_model.model.layers.{i}.self_attn.q_norm.weight"))?;
+        let q_norm_hw = lget(&format!("language_model.model.layers.{i}.self_attn.q_norm_hw.weight"))?;
+        let k_norm = lget(&format!("language_model.model.layers.{i}.self_attn.k_norm.weight"))?;
+        let k_norm_hw = lget(&format!("language_model.model.layers.{i}.self_attn.k_norm_hw.weight"))?;
+
+        // Decoded text tokens carry h_idx = w_idx = 0 (identity RoPE) so we
+        // skip the h/w rotations entirely. Same shortcut `und_layer` takes.
+        let (q_t, q_hw) = Self::chunk_last_half(&q)?;
+        let q_t = Self::head_rms_norm(&q_t, q_norm, cfg.rms_norm_eps)?;
+        let q_hw = Self::head_rms_norm(&q_hw, q_norm_hw, cfg.rms_norm_eps)?;
+        let q_t = flame_core::bf16_ops::rope_halfsplit_bf16(&q_t, cos_t, sin_t)?;
+        let q = Tensor::cat(&[&q_t, &q_hw], 3)?;
+
+        let (k_t, k_hw) = Self::chunk_last_half(&k)?;
+        let k_t = Self::head_rms_norm(&k_t, k_norm, cfg.rms_norm_eps)?;
+        let k_hw = Self::head_rms_norm(&k_hw, k_norm_hw, cfg.rms_norm_eps)?;
+        let k_t = flame_core::bf16_ops::rope_halfsplit_bf16(&k_t, cos_t, sin_t)?;
+        let k = Tensor::cat(&[&k_t, &k_hw], 3)?;
+
+        // Concat with past — full attention, no mask needed (single new token
+        // attending to everything is the autoregressive contract).
+        let k_full = Tensor::cat(&[past_k, &k], 2)?;
+        let v_full = Tensor::cat(&[past_v, &v], 2)?;
+
+        let k_g = Self::repeat_kv(&k_full, n_rep)?;
+        let v_g = Self::repeat_kv(&v_full, n_rep)?;
+        let attn = flame_core::attention::sdpa(&q, &k_g, &v_g, None)?;
+        let attn = attn.permute(&[0, 2, 1, 3])?.reshape(&[b, n, h_total * d])?;
+        let attn = Self::linear_no_bias(
+            &attn,
+            lget(&format!("language_model.model.layers.{i}.self_attn.o_proj.weight"))?,
+        )?;
+        let hidden = hidden.add(&attn)?;
+
+        let post_norm_w = lget(&format!(
+            "language_model.model.layers.{i}.post_attention_layernorm.weight"
+        ))?;
+        let n2 = Self::rms_norm_apply(&hidden, post_norm_w, cfg.rms_norm_eps)?;
+        let gate_w = lget(&format!("language_model.model.layers.{i}.mlp.gate_proj.weight"))?;
+        let up_w = lget(&format!("language_model.model.layers.{i}.mlp.up_proj.weight"))?;
+        let down_w = lget(&format!("language_model.model.layers.{i}.mlp.down_proj.weight"))?;
+        let gate = Self::linear_no_bias(&n2, gate_w)?;
+        let up = Self::linear_no_bias(&n2, up_w)?;
+        let mlp = gate.silu()?.mul(&up)?;
+        let mlp = Self::linear_no_bias(&mlp, down_w)?;
+        let hidden = hidden.add(&mlp)?;
+
+        Ok((hidden, k_full, v_full))
+    }
+
+    /// Apply lm_head to a `[1, N, hidden]` tensor and return logits
+    /// `[1, N, vocab_size]`. The lm_head weight in `shared` is in PyTorch
+    /// `[vocab, hidden]` layout (`load_file_filtered` does not transpose).
+    fn lm_head_logits(&self, hidden: &Tensor) -> Result<Tensor> {
+        let w = self.shared_get("language_model.lm_head.weight")?;
+        flame_core::ops::fused_inference::fused_linear3d_native(hidden, w, None)
+    }
+
+    /// Greedy argmax over the last dim of a `[1, 1, vocab]` BF16 logit tensor,
+    /// returning the chosen token id as `i32`. Done host-side because flame-core
+    /// has no argmax kernel and we only do one ~600 KB transfer per token.
+    fn argmax_last_token(logits: &Tensor) -> Result<i32> {
+        let dims = logits.shape().dims();
+        if dims.len() != 3 || dims[0] != 1 {
+            return Err(Error::InvalidInput(format!(
+                "argmax_last_token: expected [1, N, vocab], got {dims:?}"
+            )));
+        }
+        let n = dims[1];
+        let v = dims[2];
+        // Take only the LAST row [1, 1, vocab] to minimize the dtoh copy.
+        let last = logits.narrow(1, n - 1, 1)?;
+        let host = last.to_vec_f32()?; // BF16 → F32 on device, then dtoh
+        if host.len() != v {
+            return Err(Error::InvalidInput(format!(
+                "argmax_last_token: expected {v} elements, got {}",
+                host.len()
+            )));
+        }
+        let mut best_i: usize = 0;
+        let mut best_x: f32 = host[0];
+        for (i, &x) in host.iter().enumerate().skip(1) {
+            if x > best_x {
+                best_x = x;
+                best_i = i;
+            }
+        }
+        Ok(best_i as i32)
+    }
+
+    /// Embed a single token id into `[1, 1, hidden]` via `embed_tokens`.
+    fn embed_one(&self, token_id: i32) -> Result<Tensor> {
+        let embed_w = self.shared_get("language_model.model.embed_tokens.weight")?;
+        let ids = Tensor::from_vec(
+            vec![token_id as f32],
+            Shape::from_dims(&[1]),
+            self.device.clone(),
+        )?
+        .to_dtype(DType::I32)?;
+        embed_w.index_select0(&ids)?.unsqueeze(0)
+    }
+
+    /// Greedy autoregressive decode after a base-mode prefix forward.
+    ///
+    /// `cache` is mutated in place — each layer's K/V is replaced with the
+    /// post-decode (concat'd) tensor, and `cache.prefix_len` /
+    /// `cache.next_t_index` advance by `out.len()`.
+    ///
+    /// `last_hidden` is the FINAL-NORMED hidden returned by the prefix forward
+    /// (`forward_und` or `forward_mixed_prefix`). Only its last row is used.
+    /// Returns the generated token ids in order. EOS tokens ARE included in
+    /// the output so callers can record the literal stop token if desired.
+    pub fn decode_autoregressive(
+        &mut self,
+        cache: &mut KvCache,
+        last_hidden: &Tensor,
+        max_new_tokens: usize,
+        eos_token_ids: &[i32],
+    ) -> Result<Vec<i32>> {
+        if cache.layers.len() != self.config.num_layers {
+            return Err(Error::InvalidInput(format!(
+                "decode_autoregressive: cache has {} layers, expected {}",
+                cache.layers.len(),
+                self.config.num_layers
+            )));
+        }
+        let dims = last_hidden.shape().dims().to_vec();
+        if dims.len() != 3 || dims[0] != 1 {
+            return Err(Error::InvalidInput(format!(
+                "decode_autoregressive: last_hidden must be [1, N, hidden], got {dims:?}"
+            )));
+        }
+        let prefix_n = dims[1];
+        // Take only the last position; it's already final-normed.
+        let mut next_normed = last_hidden.narrow(1, prefix_n - 1, 1)?;
+
+        let cfg_clone = self.config.clone();
+        let cfg = &cfg_clone;
+        let total = cfg.num_layers;
+        let (dim_t, _dim_h, _dim_w) = cfg.rope_dims();
+        let final_norm_w = self
+            .shared
+            .get("language_model.model.norm.weight")
+            .ok_or_else(|| {
+                Error::InvalidInput(
+                    "decode_autoregressive: missing language_model.model.norm.weight".into(),
+                )
+            })?
+            .clone();
+
+        let mut out: Vec<i32> = Vec::with_capacity(max_new_tokens);
+        for _step in 0..max_new_tokens {
+            // 1) lm_head + greedy sample.
+            let logits = self.lm_head_logits(&next_normed)?;
+            let next_id = Self::argmax_last_token(&logits)?;
+            out.push(next_id);
+            if eos_token_ids.contains(&next_id) {
+                break;
+            }
+
+            // 2) Embed and run through 42 layers; append K/V to cache.
+            let mut hidden = self.embed_one(next_id)?; // [1, 1, hidden]
+            // RoPE for the new token's t-position.
+            let pos = cache.next_t_index as i32;
+            let (cos_t, sin_t) = build_rope_for_positions(
+                &[pos],
+                dim_t,
+                cfg.rope_theta,
+                &self.device,
+            )?;
+
+            // Step the offloader through all 42 base-path blocks.
+            self.offloader
+                .prefetch_block(0)
+                .map_err(|e| Error::InvalidInput(format!("prefetch block 0: {e}")))?;
+            for i in 0..total {
+                let raw = self
+                    .offloader
+                    .await_block(i)
+                    .map_err(|e| Error::InvalidInput(format!("await block {i}: {e}")))?;
+                if i + 1 < total {
+                    self.offloader
+                        .prefetch_block(i + 1)
+                        .map_err(|e| Error::InvalidInput(format!("prefetch block {}: {e}", i + 1)))?;
+                }
+                let lw = Self::untranspose_block_weights(&raw)?;
+                let (past_k, past_v) = &cache.layers[i];
+                let (new_h, k_full, v_full) = Self::und_layer_step(
+                    cfg, i, &lw, &hidden, &cos_t, &sin_t, past_k, past_v,
+                )?;
+                cache.layers[i] = (k_full, v_full);
+                hidden = new_h;
+            }
+
+            // 3) Final norm → ready for next iteration's lm_head.
+            next_normed = Self::rms_norm_apply(&hidden, &final_norm_w, cfg.rms_norm_eps)?;
+
+            cache.prefix_len += 1;
+            cache.next_t_index += 1;
+        }
+        Ok(out)
+    }
+
+    /// Force-extend `cache` with the literal sequence of `token_ids`. Used by
+    /// think mode after `</think>` to push `\n\n<img>` into the cache without
+    /// sampling, mirroring `_append_text_tokens_to_cache`. Returns the
+    /// FINAL-NORMED last hidden after the appended sequence — useful when the
+    /// caller wants to chain into another decode pass or into `forward_gen`.
+    pub fn extend_cache_with_text_tokens(
+        &mut self,
+        cache: &mut KvCache,
+        token_ids: &[i32],
+    ) -> Result<Tensor> {
+        if token_ids.is_empty() {
+            return Err(Error::InvalidInput(
+                "extend_cache_with_text_tokens: empty token_ids".into(),
+            ));
+        }
+        if cache.layers.len() != self.config.num_layers {
+            return Err(Error::InvalidInput(format!(
+                "extend_cache_with_text_tokens: cache has {} layers, expected {}",
+                cache.layers.len(),
+                self.config.num_layers
+            )));
+        }
+        let cfg_clone = self.config.clone();
+        let cfg = &cfg_clone;
+        let total = cfg.num_layers;
+        let (dim_t, _dim_h, _dim_w) = cfg.rope_dims();
+        let final_norm_w = self
+            .shared
+            .get("language_model.model.norm.weight")
+            .ok_or_else(|| {
+                Error::InvalidInput(
+                    "extend_cache_with_text_tokens: missing language_model.model.norm.weight".into(),
+                )
+            })?
+            .clone();
+
+        // Embed the run as a single [1, N, hidden] block (cheaper than N
+        // separate single-token forwards). t-axis indexes are
+        // arange(next_t_index, next_t_index + N).
+        let n = token_ids.len();
+        let embed_w = self.shared_get("language_model.model.embed_tokens.weight")?;
+        let ids = Tensor::from_vec(
+            token_ids.iter().map(|&id| id as f32).collect(),
+            Shape::from_dims(&[n]),
+            self.device.clone(),
+        )?
+        .to_dtype(DType::I32)?;
+        let mut hidden = embed_w.index_select0(&ids)?.unsqueeze(0)?; // [1, N, h]
+
+        let positions: Vec<i32> = (0..n)
+            .map(|i| (cache.next_t_index + i) as i32)
+            .collect();
+        let (cos_t, sin_t) = build_rope_for_positions(
+            &positions,
+            dim_t,
+            cfg.rope_theta,
+            &self.device,
+        )?;
+
+        // Block-causal mask for the appended chunk attending to itself + the
+        // entire past. The Python reference (`_append_text_tokens_to_cache`)
+        // builds `[1, 1, n, past_len + n]` with the right half being a strict
+        // lower-triangular causal block and the left half all-attend. Our SDPA
+        // takes the [1, 1, q_len, kv_len] mask as 0/1 keep-mask BF16.
+        let past_len = cache.prefix_len;
+        let total_kv = past_len + n;
+        let mut mask_host: Vec<f32> = vec![1.0; n * total_kv];
+        for q in 0..n {
+            for k in past_len..total_kv {
+                let kpos = k - past_len; // 0..n
+                if kpos > q {
+                    mask_host[q * total_kv + k] = 0.0;
+                }
+            }
+        }
+        let attn_mask = Tensor::from_vec(
+            mask_host,
+            Shape::from_dims(&[1, 1, n, total_kv]),
+            self.device.clone(),
+        )?
+        .to_dtype(DType::BF16)?;
+
+        self.offloader
+            .prefetch_block(0)
+            .map_err(|e| Error::InvalidInput(format!("prefetch block 0: {e}")))?;
+        for i in 0..total {
+            let raw = self
+                .offloader
+                .await_block(i)
+                .map_err(|e| Error::InvalidInput(format!("await block {i}: {e}")))?;
+            if i + 1 < total {
+                self.offloader
+                    .prefetch_block(i + 1)
+                    .map_err(|e| Error::InvalidInput(format!("prefetch block {}: {e}", i + 1)))?;
+            }
+            let lw = Self::untranspose_block_weights(&raw)?;
+            let (past_k, past_v) = &cache.layers[i];
+            let (new_h, k_full, v_full) = Self::und_layer_step_chunk(
+                cfg, i, &lw, &hidden, &cos_t, &sin_t, past_k, past_v, &attn_mask,
+            )?;
+            cache.layers[i] = (k_full, v_full);
+            hidden = new_h;
+        }
+
+        let normed = Self::rms_norm_apply(&hidden, &final_norm_w, cfg.rms_norm_eps)?;
+
+        cache.prefix_len += n;
+        cache.next_t_index += n;
+        Ok(normed)
+    }
+
+    /// Multi-token base-mode forward step with past-K/V concat. Same
+    /// semantics as `und_layer_step` but accepts `n > 1` and a custom
+    /// attention mask sized `[1, 1, n, past_len + n]`.
+    #[allow(clippy::too_many_arguments)]
+    fn und_layer_step_chunk(
+        cfg: &SenseNovaU1Config,
+        i: usize,
+        lw: &HashMap<String, Tensor>,
+        hidden: &Tensor,
+        cos_t: &Tensor,
+        sin_t: &Tensor,
+        past_k: &Tensor,
+        past_v: &Tensor,
+        attn_mask: &Tensor,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        let h_total = cfg.num_heads;
+        let h_kv = cfg.num_kv_heads;
+        let d = cfg.head_dim;
+        let n_rep = h_total / h_kv;
+        let dims = hidden.shape().dims().to_vec();
+        let b = dims[0];
+        let n = dims[1];
+
+        let lget = |k: &str| -> Result<&Tensor> {
+            lw.get(k).ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "SenseNovaU1: missing layer-{i} weight {k}"
+                ))
+            })
+        };
+
+        let normed = Self::rms_norm_apply(
+            hidden,
+            lget(&format!("language_model.model.layers.{i}.input_layernorm.weight"))?,
+            cfg.rms_norm_eps,
+        )?;
+        let q = Self::linear_no_bias(
+            &normed,
+            lget(&format!("language_model.model.layers.{i}.self_attn.q_proj.weight"))?,
+        )?;
+        let k = Self::linear_no_bias(
+            &normed,
+            lget(&format!("language_model.model.layers.{i}.self_attn.k_proj.weight"))?,
+        )?;
+        let v = Self::linear_no_bias(
+            &normed,
+            lget(&format!("language_model.model.layers.{i}.self_attn.v_proj.weight"))?,
+        )?;
+        let q = q.reshape(&[b, n, h_total, d])?.permute(&[0, 2, 1, 3])?;
+        let k = k.reshape(&[b, n, h_kv, d])?.permute(&[0, 2, 1, 3])?;
+        let v = v.reshape(&[b, n, h_kv, d])?.permute(&[0, 2, 1, 3])?;
+
+        let q_norm = lget(&format!("language_model.model.layers.{i}.self_attn.q_norm.weight"))?;
+        let q_norm_hw = lget(&format!("language_model.model.layers.{i}.self_attn.q_norm_hw.weight"))?;
+        let k_norm = lget(&format!("language_model.model.layers.{i}.self_attn.k_norm.weight"))?;
+        let k_norm_hw = lget(&format!("language_model.model.layers.{i}.self_attn.k_norm_hw.weight"))?;
+
+        let (q_t, q_hw) = Self::chunk_last_half(&q)?;
+        let q_t = Self::head_rms_norm(&q_t, q_norm, cfg.rms_norm_eps)?;
+        let q_hw = Self::head_rms_norm(&q_hw, q_norm_hw, cfg.rms_norm_eps)?;
+        let q_t = flame_core::bf16_ops::rope_halfsplit_bf16(&q_t, cos_t, sin_t)?;
+        let q = Tensor::cat(&[&q_t, &q_hw], 3)?;
+        let (k_t, k_hw) = Self::chunk_last_half(&k)?;
+        let k_t = Self::head_rms_norm(&k_t, k_norm, cfg.rms_norm_eps)?;
+        let k_hw = Self::head_rms_norm(&k_hw, k_norm_hw, cfg.rms_norm_eps)?;
+        let k_t = flame_core::bf16_ops::rope_halfsplit_bf16(&k_t, cos_t, sin_t)?;
+        let k = Tensor::cat(&[&k_t, &k_hw], 3)?;
+
+        let k_full = Tensor::cat(&[past_k, &k], 2)?;
+        let v_full = Tensor::cat(&[past_v, &v], 2)?;
+        let k_g = Self::repeat_kv(&k_full, n_rep)?;
+        let v_g = Self::repeat_kv(&v_full, n_rep)?;
+        let attn = flame_core::attention::sdpa(&q, &k_g, &v_g, Some(attn_mask))?;
+        let attn = attn.permute(&[0, 2, 1, 3])?.reshape(&[b, n, h_total * d])?;
+        let attn = Self::linear_no_bias(
+            &attn,
+            lget(&format!("language_model.model.layers.{i}.self_attn.o_proj.weight"))?,
+        )?;
+        let hidden = hidden.add(&attn)?;
+
+        let post_norm_w = lget(&format!(
+            "language_model.model.layers.{i}.post_attention_layernorm.weight"
+        ))?;
+        let n2 = Self::rms_norm_apply(&hidden, post_norm_w, cfg.rms_norm_eps)?;
+        let gate_w = lget(&format!("language_model.model.layers.{i}.mlp.gate_proj.weight"))?;
+        let up_w = lget(&format!("language_model.model.layers.{i}.mlp.up_proj.weight"))?;
+        let down_w = lget(&format!("language_model.model.layers.{i}.mlp.down_proj.weight"))?;
+        let gate = Self::linear_no_bias(&n2, gate_w)?;
+        let up = Self::linear_no_bias(&n2, up_w)?;
+        let mlp = gate.silu()?.mul(&up)?;
+        let mlp = Self::linear_no_bias(&mlp, down_w)?;
+        let hidden = hidden.add(&mlp)?;
+
+        Ok((hidden, k_full, v_full))
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 6 (cap. 1/2/4): base-mode 3D-RoPE prefix forward.
+    // -----------------------------------------------------------------------
+    //
+    // Reference: `Qwen3Model.forward` (modeling_qwen3.py:1027) — when
+    // `image_gen_indicators is None` it sets `exist_image_gen_tokens = False`
+    // and dispatches every layer to `forward_und`, i.e. pure base weights.
+    // The 3D RoPE in `Qwen3Attention.forward_und` (line 422) is per-token,
+    // so image-context tokens with non-zero h/w indexes pick up the right
+    // spatial rotations even though projections stay on base weights.
+    //
+    // The earlier `forward_mixed_prefix` routed image-context positions to
+    // `_mot_gen` weights and produced gibberish on the VQA smoke. We now
+    // mirror the python and keep the call signature the same (still accepts
+    // `image_mask` for forward-compat with future autonomous-mixed paths).
+
+    /// Run a 3D-RoPE base-mode prefix forward over already-spliced
+    /// embeddings.
+    ///
+    /// `hidden_in`: `[1, N, 4096]` BF16 — text tokens embedded via
+    /// `embed_tokens`, image tokens (originally `<IMG_CONTEXT>`) replaced by
+    /// features from `extract_feature_und`. `_image_mask` is currently unused
+    /// (always-base routing) but kept on the signature so callers don't need
+    /// to drop it. `t_indexes / h_indexes / w_indexes` come from
+    /// `build_thw_indexes`. Returns `(KvCache, last_hidden)` with
+    /// `last_hidden` FINAL-NORMED — same contract as `forward_und`.
+    pub fn forward_mixed_prefix(
+        &mut self,
+        hidden_in: &Tensor,
+        _image_mask: &[bool],
+        t_indexes: &[i32],
+        h_indexes: &[i32],
+        w_indexes: &[i32],
+    ) -> Result<(KvCache, Tensor)> {
+        let dims = hidden_in.shape().dims().to_vec();
+        if dims.len() != 3 || dims[0] != 1 {
+            return Err(Error::InvalidInput(format!(
+                "forward_mixed_prefix: hidden must be [1, N, hidden], got {dims:?}"
+            )));
+        }
+        let n = dims[1];
+        if t_indexes.len() != n || h_indexes.len() != n || w_indexes.len() != n {
+            return Err(Error::InvalidInput(format!(
+                "forward_mixed_prefix: index arrays must all be length N={n}, got t={} h={} w={}",
+                t_indexes.len(), h_indexes.len(), w_indexes.len()
+            )));
+        }
+
+        let Self { config, shared, device, offloader } = self;
+        let cfg = &*config;
+        let total = cfg.num_layers;
+        let (dim_t, dim_h, dim_w) = cfg.rope_dims();
+
+        // Per-token 3D RoPE tables.
+        let (cos_t, sin_t) = build_rope_for_positions(t_indexes, dim_t, cfg.rope_theta, device)?;
+        let (cos_h, sin_h) = build_rope_for_positions(h_indexes, dim_h, cfg.rope_theta_hw, device)?;
+        let (cos_w, sin_w) = build_rope_for_positions(w_indexes, dim_w, cfg.rope_theta_hw, device)?;
+
+        // Block-causal attention mask from t-indexes (matches python
+        // `create_block_causal_mask(indexes[0])`).
+        let attn_mask = build_block_causal_mask(t_indexes, device)?;
+
+        offloader
+            .prefetch_block(0)
+            .map_err(|e| Error::InvalidInput(format!("prefetch block 0: {e}")))?;
+        let mut hidden = hidden_in.clone();
+        let mut cache_layers: Vec<(Tensor, Tensor)> = Vec::with_capacity(total);
+        for i in 0..total {
+            let raw = offloader
+                .await_block(i)
+                .map_err(|e| Error::InvalidInput(format!("await block {i}: {e}")))?;
+            if i + 1 < total {
+                offloader
+                    .prefetch_block(i + 1)
+                    .map_err(|e| Error::InvalidInput(format!("prefetch block {}: {e}", i + 1)))?;
+            }
+            let lw = Self::untranspose_block_weights(&raw)?;
+            let (new_h, k_cache, v_cache) = Self::und_layer_3d(
+                cfg, i, &lw, &hidden,
+                &cos_t, &sin_t, &cos_h, &sin_h, &cos_w, &sin_w, &attn_mask,
+            )?;
+            cache_layers.push((k_cache, v_cache));
+            hidden = new_h;
+        }
+
+        // Final norm — base path only (matches python Qwen3Model.forward
+        // line 1140, `not exist_image_gen_tokens` branch).
+        let final_norm = shared
+            .get("language_model.model.norm.weight")
+            .ok_or_else(|| {
+                Error::InvalidInput("forward_mixed_prefix: missing model.norm.weight".into())
+            })?;
+        let hidden = Self::rms_norm_apply(&hidden, final_norm, cfg.rms_norm_eps)?;
+
+        let max_t = t_indexes.iter().copied().max().unwrap_or(0);
+        let next_t_index = (max_t as usize) + 1;
+
+        Ok((
+            KvCache {
+                layers: cache_layers,
+                prefix_len: n,
+                next_t_index,
+            },
+            hidden,
+        ))
+    }
+
+    /// Per-layer base-mode body with full 3D RoPE. Same routing as
+    /// `und_layer` (text prefix) but takes per-token h/w RoPE tables instead
+    /// of skipping them. Used by `forward_mixed_prefix` for VQA / it2i
+    /// prefixes where IMG_CONTEXT positions carry non-zero h/w indexes.
+    #[allow(clippy::too_many_arguments)]
+    fn und_layer_3d(
+        cfg: &SenseNovaU1Config,
+        i: usize,
+        lw: &HashMap<String, Tensor>,
+        hidden: &Tensor,
+        cos_t: &Tensor,
+        sin_t: &Tensor,
+        cos_h: &Tensor,
+        sin_h: &Tensor,
+        cos_w: &Tensor,
+        sin_w: &Tensor,
+        attn_mask: &Tensor,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        let h_total = cfg.num_heads;
+        let h_kv = cfg.num_kv_heads;
+        let d = cfg.head_dim;
+        let n_rep = h_total / h_kv;
+        let dims = hidden.shape().dims().to_vec();
+        let b = dims[0];
+        let n = dims[1];
+
+        let lget = |k: &str| -> Result<&Tensor> {
+            lw.get(k).ok_or_else(|| {
+                Error::InvalidInput(format!("SenseNovaU1: missing layer-{i} weight {k}"))
+            })
+        };
+
+        let normed = Self::rms_norm_apply(
+            hidden,
+            lget(&format!("language_model.model.layers.{i}.input_layernorm.weight"))?,
+            cfg.rms_norm_eps,
+        )?;
+        let q = Self::linear_no_bias(
+            &normed,
+            lget(&format!("language_model.model.layers.{i}.self_attn.q_proj.weight"))?,
+        )?;
+        let k = Self::linear_no_bias(
+            &normed,
+            lget(&format!("language_model.model.layers.{i}.self_attn.k_proj.weight"))?,
+        )?;
+        let v = Self::linear_no_bias(
+            &normed,
+            lget(&format!("language_model.model.layers.{i}.self_attn.v_proj.weight"))?,
+        )?;
+
+        let q = q.reshape(&[b, n, h_total, d])?.permute(&[0, 2, 1, 3])?;
+        let k = k.reshape(&[b, n, h_kv, d])?.permute(&[0, 2, 1, 3])?;
+        let v = v.reshape(&[b, n, h_kv, d])?.permute(&[0, 2, 1, 3])?;
+
+        let q_norm = lget(&format!("language_model.model.layers.{i}.self_attn.q_norm.weight"))?;
+        let q_norm_hw = lget(&format!("language_model.model.layers.{i}.self_attn.q_norm_hw.weight"))?;
+        let k_norm = lget(&format!("language_model.model.layers.{i}.self_attn.k_norm.weight"))?;
+        let k_norm_hw = lget(&format!("language_model.model.layers.{i}.self_attn.k_norm_hw.weight"))?;
+
+        let q = Self::apply_3d_rope(
+            &q, q_norm, q_norm_hw, cfg.rms_norm_eps,
+            cos_t, sin_t, cos_h, sin_h, cos_w, sin_w,
+        )?;
+        let k = Self::apply_3d_rope(
+            &k, k_norm, k_norm_hw, cfg.rms_norm_eps,
+            cos_t, sin_t, cos_h, sin_h, cos_w, sin_w,
+        )?;
+
+        let k_cache = k.clone();
+        let v_cache = v.clone();
+
+        let k_g = Self::repeat_kv(&k, n_rep)?;
+        let v_g = Self::repeat_kv(&v, n_rep)?;
+        let attn = flame_core::attention::sdpa(&q, &k_g, &v_g, Some(attn_mask))?;
+        let attn = attn.permute(&[0, 2, 1, 3])?.reshape(&[b, n, h_total * d])?;
+        let attn = Self::linear_no_bias(
+            &attn,
+            lget(&format!("language_model.model.layers.{i}.self_attn.o_proj.weight"))?,
+        )?;
+        let hidden = hidden.add(&attn)?;
+
+        let post_norm_w = lget(&format!(
+            "language_model.model.layers.{i}.post_attention_layernorm.weight"
+        ))?;
+        let n2 = Self::rms_norm_apply(&hidden, post_norm_w, cfg.rms_norm_eps)?;
+        let gate_w = lget(&format!("language_model.model.layers.{i}.mlp.gate_proj.weight"))?;
+        let up_w = lget(&format!("language_model.model.layers.{i}.mlp.up_proj.weight"))?;
+        let down_w = lget(&format!("language_model.model.layers.{i}.mlp.down_proj.weight"))?;
+        let gate = Self::linear_no_bias(&n2, gate_w)?;
+        let up = Self::linear_no_bias(&n2, up_w)?;
+        let mlp = gate.silu()?.mul(&up)?;
+        let mlp = Self::linear_no_bias(&mlp, down_w)?;
+        let hidden = hidden.add(&mlp)?;
+
+        Ok((hidden, k_cache, v_cache))
+    }
+
+    // -----------------------------------------------------------------------
+    // Index/embedding helpers used by VQA + it2i + interleaved bins.
+    // -----------------------------------------------------------------------
+
+    /// Build the per-token `(t_indexes, h_indexes, w_indexes)` arrays for a
+    /// tokenized prefix, mirroring `get_thw_indexes` (modeling_neo_chat.py:1847).
+    /// `img_context_token_id` and `img_start_token_id` mark the
+    /// `<IMG_CONTEXT>` / `<img>` positions in `input_ids`. `image_grid` is a
+    /// list of `(token_h, token_w)` post-merge grids in the same order they
+    /// appear in `input_ids`. `image_mask` returns booleans `true` exactly at
+    /// the `<IMG_CONTEXT>` slots.
+    pub fn build_thw_indexes(
+        &self,
+        input_ids: &[i32],
+        img_context_token_id: i32,
+        img_start_token_id: i32,
+        image_grid: &[(usize, usize)],
+    ) -> Result<(Vec<i32>, Vec<i32>, Vec<i32>, Vec<bool>)> {
+        let n = input_ids.len();
+        let img_start_shift: Vec<i32> = std::iter::once(0)
+            .chain(input_ids.iter().take(n - 1).map(|&id| {
+                if id == img_start_token_id { 1 } else { 0 }
+            }))
+            .collect();
+        let not_img: Vec<i32> = input_ids
+            .iter()
+            .map(|&id| if id != img_context_token_id { 1 } else { 0 })
+            .collect();
+        let mut t_indexes: Vec<i32> = Vec::with_capacity(n);
+        let mut acc: i32 = 0;
+        for k in 0..n {
+            acc += img_start_shift[k] + not_img[k];
+            t_indexes.push(acc - 1);
+        }
+        let mut h_indexes: Vec<i32> = vec![0; n];
+        let mut w_indexes: Vec<i32> = vec![0; n];
+        let image_mask: Vec<bool> = input_ids.iter().map(|&id| id == img_context_token_id).collect();
+
+        // Walk runs of `<IMG_CONTEXT>` and assign h/w from the next image grid.
+        let mut img_idx = 0usize;
+        let mut k = 0usize;
+        while k < n {
+            if image_mask[k] {
+                let (token_h, token_w) = *image_grid.get(img_idx).ok_or_else(|| {
+                    Error::InvalidInput(format!(
+                        "build_thw_indexes: input_ids has more <IMG_CONTEXT> runs than image_grid entries ({})",
+                        image_grid.len()
+                    ))
+                })?;
+                let l = token_h * token_w;
+                if k + l > n || !image_mask[k..k + l].iter().all(|&b| b) {
+                    return Err(Error::InvalidInput(format!(
+                        "build_thw_indexes: <IMG_CONTEXT> run at {k} length {l} doesn't match grid {token_h}x{token_w}"
+                    )));
+                }
+                for j in 0..l {
+                    h_indexes[k + j] = (j / token_w) as i32;
+                    w_indexes[k + j] = (j % token_w) as i32;
+                }
+                k += l;
+                img_idx += 1;
+            } else {
+                k += 1;
+            }
+        }
+        if img_idx != image_grid.len() {
+            return Err(Error::InvalidInput(format!(
+                "build_thw_indexes: input_ids consumed {img_idx} images but image_grid had {}",
+                image_grid.len()
+            )));
+        }
+        Ok((t_indexes, h_indexes, w_indexes, image_mask))
+    }
+
+    /// Embed `input_ids` to `[1, N, hidden]` and splice each image's features
+    /// in place of its `<IMG_CONTEXT>` slot run. `image_features` is one
+    /// `[1, L_i, hidden]` tensor per image, in the same order they appear in
+    /// `input_ids`. Mirrors the index-assignment block at
+    /// `modeling_neo_chat.py:1810-1815` (chat) and `:614-622` (it2i).
+    pub fn embed_with_image_splice(
+        &self,
+        input_ids: &[i32],
+        img_context_token_id: i32,
+        image_features: &[Tensor],
+    ) -> Result<Tensor> {
+        let n = input_ids.len();
+        let embed_w = self.shared_get("language_model.model.embed_tokens.weight")?;
+        let ids = Tensor::from_vec(
+            input_ids.iter().map(|&id| id as f32).collect(),
+            Shape::from_dims(&[n]),
+            self.device.clone(),
+        )?
+        .to_dtype(DType::I32)?;
+        let base = embed_w.index_select0(&ids)?; // [N, hidden]
+        let hidden_size = self.config.hidden_size;
+
+        // Walk runs of <IMG_CONTEXT> and stitch a sequence of segments.
+        let mut segs: Vec<Tensor> = Vec::new();
+        let mut img_idx = 0usize;
+        let mut k = 0usize;
+        let is_ctx = |id: i32| id == img_context_token_id;
+        while k < n {
+            if is_ctx(input_ids[k]) {
+                // Find the run length.
+                let mut j = k;
+                while j < n && is_ctx(input_ids[j]) {
+                    j += 1;
+                }
+                let l = j - k;
+                let feat = image_features.get(img_idx).ok_or_else(|| {
+                    Error::InvalidInput(format!(
+                        "embed_with_image_splice: ran out of image_features at run {img_idx}"
+                    ))
+                })?;
+                let fdims = feat.shape().dims();
+                if fdims.len() != 3 || fdims[0] != 1 || fdims[1] != l || fdims[2] != hidden_size {
+                    return Err(Error::InvalidInput(format!(
+                        "embed_with_image_splice: image_features[{img_idx}] expected [1, {l}, {hidden_size}], got {fdims:?}"
+                    )));
+                }
+                segs.push(feat.reshape(&[l, hidden_size])?);
+                img_idx += 1;
+                k = j;
+            } else {
+                let mut j = k;
+                while j < n && !is_ctx(input_ids[j]) {
+                    j += 1;
+                }
+                let l = j - k;
+                segs.push(base.narrow(0, k, l)?);
+                k = j;
+            }
+        }
+        if img_idx != image_features.len() {
+            return Err(Error::InvalidInput(format!(
+                "embed_with_image_splice: input_ids consumed {img_idx} images but image_features had {}",
+                image_features.len()
+            )));
+        }
+        let stitched = if segs.len() == 1 {
+            segs.into_iter().next().unwrap()
+        } else {
+            let refs: Vec<&Tensor> = segs.iter().collect();
+            Tensor::cat(&refs, 0)?
+        };
+        stitched.reshape(&[1, n, hidden_size])
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1543,6 +2477,27 @@ fn build_causal_mask(
     mask_f32.to_dtype(DType::BF16)
 }
 
+/// Block-causal mask from a 1-D `t_indexes` array, mirroring
+/// `create_block_causal_mask` (modeling_qwen3.py:152). Token i may attend to
+/// token j when either `t_index[j] == t_index[i]` (same-t block, bidirectional)
+/// or `j <= i` (sequence-order causal). Returns `[1, 1, L, L]` BF16 0/1.
+fn build_block_causal_mask(
+    t_indexes: &[i32],
+    device: &Arc<CudaDevice>,
+) -> Result<Tensor> {
+    let l = t_indexes.len();
+    let mut data = vec![0.0f32; l * l];
+    for i in 0..l {
+        for j in 0..l {
+            if j <= i || t_indexes[j] == t_indexes[i] {
+                data[i * l + j] = 1.0;
+            }
+        }
+    }
+    let m = Tensor::from_vec(data, Shape::from_dims(&[1, 1, l, l]), device.clone())?;
+    m.to_dtype(DType::BF16)
+}
+
 // ---------------------------------------------------------------------------
 // Weight-key generation (used by the future loader to filter shared vs per-layer)
 // ---------------------------------------------------------------------------
@@ -1608,9 +2563,10 @@ pub fn expected_per_layer_keys(i: usize) -> Vec<String> {
     ]
 }
 
-/// All shared-weight keys required for T2I inference (the
-/// `vision_model.embeddings.*` understanding-only weights are NOT in this
-/// list — they're loaded permissively but their absence isn't fatal).
+/// All shared-weight keys required for SenseNova-U1 inference. Includes both
+/// the gen-side `fm_modules.vision_model_mot_gen.embeddings.*` (T2I/it2i) and
+/// the understanding-side `vision_model.embeddings.*` (VQA/it2i). The full
+/// 8B-MoT checkpoint ships them all; loader fails fast if any is missing.
 pub fn expected_shared_keys() -> &'static [&'static str] {
     &[
         "language_model.model.embed_tokens.weight",
@@ -1635,6 +2591,11 @@ pub fn expected_shared_keys() -> &'static [&'static str] {
         "fm_modules.vision_model_mot_gen.embeddings.patch_embedding.bias",
         "fm_modules.vision_model_mot_gen.embeddings.dense_embedding.weight",
         "fm_modules.vision_model_mot_gen.embeddings.dense_embedding.bias",
+        // Understanding-side patch+merge embedder (VQA + it2i image input)
+        "vision_model.embeddings.patch_embedding.weight",
+        "vision_model.embeddings.patch_embedding.bias",
+        "vision_model.embeddings.dense_embedding.weight",
+        "vision_model.embeddings.dense_embedding.bias",
     ]
 }
 
@@ -1761,16 +2722,11 @@ mod tests {
         let cfg = SenseNovaU1Config::default();
         let expected_per_layer = expected_per_layer_keys(0).len() * cfg.num_layers;
         let expected_shared = expected_shared_keys().len();
-        // The vision_model (understanding) embedder contributes 4 more keys
-        // not in expected_shared_keys() but matching SHARED_PREFIXES — they
-        // load successfully but aren't required for T2I.
-        let vision_understanding = 4;
-        let computed = expected_per_layer + expected_shared + vision_understanding;
+        let computed = expected_per_layer + expected_shared;
         assert_eq!(
             total, computed,
             "index.json has {total} keys; computed expected {computed} \
-             (per_layer={expected_per_layer}, shared={expected_shared}, \
-             vision_understanding={vision_understanding})"
+             (per_layer={expected_per_layer}, shared={expected_shared})"
         );
     }
 }
