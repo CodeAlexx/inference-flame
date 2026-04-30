@@ -367,6 +367,184 @@ fn denoise_one_chunk(
 }
 
 // -----------------------------------------------------------------------------
+// Tiled VAE decode (mirrors diffusers AutoencoderKLWan.tiled_decode)
+// -----------------------------------------------------------------------------
+
+/// Tile defaults from diffusers (matches AutoencoderKLWan defaults).
+const TILE_SAMPLE_MIN: usize = 256; // pixel
+const TILE_SAMPLE_STRIDE: usize = 192; // pixel
+const SPATIAL_RATIO: usize = 8; // VAE_SPATIAL_STRIDE
+
+/// Linear blend in the overlap zone along the H axis.
+/// `a` is the previous tile (above), `b` is the current tile.
+/// Both shape (B, C, T, H, W). Modifies the FIRST `blend_extent` rows of `b`.
+fn blend_v(a: &Tensor, b: &Tensor, blend_extent: usize) -> Result<Tensor> {
+    let a_dims = a.shape().dims().to_vec();
+    let b_dims = b.shape().dims().to_vec();
+    let blend = blend_extent
+        .min(a_dims[3])
+        .min(b_dims[3]);
+    if blend == 0 {
+        return Ok(b.clone());
+    }
+    let a_slice = a.narrow(3, a_dims[3] - blend, blend).map_err(|e| anyhow!("blend_v narrow_a: {e:?}"))?;
+    let b_top = b.narrow(3, 0, blend).map_err(|e| anyhow!("blend_v narrow_b: {e:?}"))?;
+    let b_rest = if b_dims[3] > blend {
+        Some(b.narrow(3, blend, b_dims[3] - blend).map_err(|e| anyhow!("blend_v narrow_rest: {e:?}"))?)
+    } else {
+        None
+    };
+    // Build linear ramp [0..blend] / blend on CPU, upload, broadcast.
+    let device = a.device().clone();
+    let weights: Vec<f32> = (0..blend).map(|y| y as f32 / blend as f32).collect();
+    let weights = Tensor::from_vec(
+        weights,
+        flame_core::Shape::from_dims(&[1, 1, 1, blend, 1]),
+        device,
+    )
+    .map_err(|e| anyhow!("blend_v weights: {e:?}"))?
+    .to_dtype(DType::BF16)
+    .map_err(|e| anyhow!("blend_v cast: {e:?}"))?;
+    let one_minus = weights.mul_scalar(-1.0).map_err(|e| anyhow!("{e:?}"))?
+        .add_scalar(1.0).map_err(|e| anyhow!("{e:?}"))?;
+    let blended = a_slice.mul(&one_minus).map_err(|e| anyhow!("{e:?}"))?
+        .add(&b_top.mul(&weights).map_err(|e| anyhow!("{e:?}"))?).map_err(|e| anyhow!("{e:?}"))?;
+    if let Some(rest) = b_rest {
+        Tensor::cat(&[&blended, &rest], 3).map_err(|e| anyhow!("{e:?}").into())
+    } else {
+        Ok(blended)
+    }
+}
+
+/// Linear blend in the overlap zone along the W axis (mirrors blend_v on dim 4).
+fn blend_h(a: &Tensor, b: &Tensor, blend_extent: usize) -> Result<Tensor> {
+    let a_dims = a.shape().dims().to_vec();
+    let b_dims = b.shape().dims().to_vec();
+    let blend = blend_extent
+        .min(a_dims[4])
+        .min(b_dims[4]);
+    if blend == 0 {
+        return Ok(b.clone());
+    }
+    let a_slice = a.narrow(4, a_dims[4] - blend, blend).map_err(|e| anyhow!("blend_h narrow_a: {e:?}"))?;
+    let b_left = b.narrow(4, 0, blend).map_err(|e| anyhow!("blend_h narrow_b: {e:?}"))?;
+    let b_rest = if b_dims[4] > blend {
+        Some(b.narrow(4, blend, b_dims[4] - blend).map_err(|e| anyhow!("blend_h narrow_rest: {e:?}"))?)
+    } else {
+        None
+    };
+    let device = a.device().clone();
+    let weights: Vec<f32> = (0..blend).map(|x| x as f32 / blend as f32).collect();
+    let weights = Tensor::from_vec(
+        weights,
+        flame_core::Shape::from_dims(&[1, 1, 1, 1, blend]),
+        device,
+    )
+    .map_err(|e| anyhow!("blend_h weights: {e:?}"))?
+    .to_dtype(DType::BF16)
+    .map_err(|e| anyhow!("blend_h cast: {e:?}"))?;
+    let one_minus = weights.mul_scalar(-1.0).map_err(|e| anyhow!("{e:?}"))?
+        .add_scalar(1.0).map_err(|e| anyhow!("{e:?}"))?;
+    let blended = a_slice.mul(&one_minus).map_err(|e| anyhow!("{e:?}"))?
+        .add(&b_left.mul(&weights).map_err(|e| anyhow!("{e:?}"))?).map_err(|e| anyhow!("{e:?}"))?;
+    if let Some(rest) = b_rest {
+        Tensor::cat(&[&blended, &rest], 4).map_err(|e| anyhow!("{e:?}").into())
+    } else {
+        Ok(blended)
+    }
+}
+
+/// Tiled decode: split z spatially into overlapping tiles, decode each,
+/// blend at boundaries. Output spatial = z spatial * 8.
+///
+/// Defaults match diffusers: 256x256 pixel tiles (32x32 latent),
+/// 192-pixel stride (24-latent stride), 64-pixel blend overlap.
+fn decode_tiled(vae: &Wan21VaeDecoder, z: &Tensor) -> Result<Tensor> {
+    let dims = z.shape().dims().to_vec();
+    let (b, c, num_frames, height, width) = (dims[0], dims[1], dims[2], dims[3], dims[4]);
+    let sample_height = height * SPATIAL_RATIO;
+    let sample_width = width * SPATIAL_RATIO;
+
+    let tile_lat_min = TILE_SAMPLE_MIN / SPATIAL_RATIO; // 32
+    let tile_lat_stride = TILE_SAMPLE_STRIDE / SPATIAL_RATIO; // 24
+    let tile_sample_stride = TILE_SAMPLE_STRIDE; // 192
+    let blend_extent = TILE_SAMPLE_MIN - TILE_SAMPLE_STRIDE; // 64
+
+    println!(
+        "    [tiled_decode] latent {}x{} → {}x{} px, tile_lat {}x{} stride {}, blend {}px",
+        height, width, sample_height, sample_width,
+        tile_lat_min, tile_lat_min, tile_lat_stride, blend_extent
+    );
+
+    // Decode tiles row-by-row, col-by-col.
+    let mut rows: Vec<Vec<Tensor>> = Vec::new();
+    let mut i = 0;
+    while i < height {
+        let mut row: Vec<Tensor> = Vec::new();
+        let mut j = 0;
+        while j < width {
+            let h_extent = tile_lat_min.min(height - i);
+            let w_extent = tile_lat_min.min(width - j);
+            let tile = z
+                .narrow(3, i, h_extent).map_err(|e| anyhow!("narrow h: {e:?}"))?
+                .narrow(4, j, w_extent).map_err(|e| anyhow!("narrow w: {e:?}"))?
+                .contiguous().map_err(|e| anyhow!("contiguous: {e:?}"))?;
+            let decoded = vae.decode(&tile).map_err(|e| anyhow!("vae.decode tile: {e}"))?;
+            // Flush the per-tile transient allocations.
+            flame_core::cuda_alloc_pool::clear_pool_cache();
+            row.push(decoded);
+            j += tile_lat_stride;
+        }
+        rows.push(row);
+        i += tile_lat_stride;
+    }
+
+    // Blend tiles + concat. Diffusers blends with the FULL untrimmed tiles
+    // from above/left, then trims to stride. Keep `rows` and `blended_row`
+    // (full-size) for blending; populate `result_row` (trimmed) for concat.
+    let mut result_rows: Vec<Tensor> = Vec::new();
+    for (i, row) in rows.iter().enumerate() {
+        let mut blended_row: Vec<Tensor> = Vec::new();   // full-size, for left-neighbour blending
+        let mut result_row: Vec<Tensor> = Vec::new();    // trimmed, for concat
+        for (j, tile) in row.iter().enumerate() {
+            let mut t = tile.clone();
+            if i > 0 {
+                t = blend_v(&rows[i - 1][j], &t, blend_extent)?;
+            }
+            if j > 0 {
+                t = blend_h(&blended_row[j - 1], &t, blend_extent)?;
+            }
+            // Stash the blended (still full-size) for the next col's left blend.
+            blended_row.push(t.clone());
+            // Trim to stride extent for output concat.
+            let t_dims = t.shape().dims().to_vec();
+            let h_keep = t_dims[3].min(tile_sample_stride);
+            let w_keep = t_dims[4].min(tile_sample_stride);
+            let t = t
+                .narrow(3, 0, h_keep).map_err(|e| anyhow!("trim h: {e:?}"))?
+                .narrow(4, 0, w_keep).map_err(|e| anyhow!("trim w: {e:?}"))?
+                .contiguous().map_err(|e| anyhow!("trim contig: {e:?}"))?;
+            result_row.push(t);
+        }
+        let row_refs: Vec<&Tensor> = result_row.iter().collect();
+        let cat_w = Tensor::cat(&row_refs, 4).map_err(|e| anyhow!("cat row: {e:?}"))?;
+        result_rows.push(cat_w);
+    }
+    let row_refs: Vec<&Tensor> = result_rows.iter().collect();
+    let mut out = Tensor::cat(&row_refs, 3).map_err(|e| anyhow!("cat rows: {e:?}"))?;
+    // Trim to exact target sample size.
+    let out_dims = out.shape().dims().to_vec();
+    if out_dims[3] > sample_height {
+        out = out.narrow(3, 0, sample_height).map_err(|e| anyhow!("final trim h: {e:?}"))?;
+    }
+    if out_dims[4] > sample_width {
+        out = out.narrow(4, 0, sample_width).map_err(|e| anyhow!("final trim w: {e:?}"))?;
+    }
+    let _ = (b, c, num_frames);
+    Ok(out)
+}
+
+// -----------------------------------------------------------------------------
 // Main
 // -----------------------------------------------------------------------------
 
@@ -571,9 +749,17 @@ fn main() -> Result<()> {
         // CRITICAL: Wan21VaeDecoder.decode() does denormalization internally.
         // We pass un-denormalized latents (raw output from the DiT denoise loop).
         let chunk_lat_bf16 = chunk_lat.to_dtype(DType::BF16)?;
-        let chunk_video = vae
-            .decode(&chunk_lat_bf16)
-            .map_err(|e| anyhow!("vae.decode chunk {i}: {e}"))?;
+        // Use tiled decode when latent spatial > tile_min (32). Mirrors
+        // diffusers AutoencoderKLWan.tiled_decode (256x256 tiles, 192px stride
+        // = 64px overlap, blended with linear ramp in the overlap zone).
+        let lat_dims = chunk_lat_bf16.shape().dims().to_vec();
+        let (lh, lw) = (lat_dims[3], lat_dims[4]);
+        let chunk_video = if lh > 32 || lw > 32 {
+            decode_tiled(&vae, &chunk_lat_bf16)?
+        } else {
+            vae.decode(&chunk_lat_bf16)
+                .map_err(|e| anyhow!("vae.decode chunk {i}: {e}"))?
+        };
         let dims = chunk_video.shape().dims().to_vec();
         let (_, _, t, h, w) = (dims[0], dims[1], dims[2], dims[3], dims[4]);
         println!(
