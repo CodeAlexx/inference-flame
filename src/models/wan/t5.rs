@@ -370,22 +370,23 @@ impl Umt5Encoder {
         let v = v.reshape(&[b, n, h, d])?.permute(&[0, 2, 1, 3])?;
 
         // T5: NO 1/sqrt(d) scaling. Bias is additive float (per-layer).
-        // Manual attention computation to ensure parity with the PyTorch
-        // reference. `sdpa_with_bias` was mis-dispatching for this case.
-        //   scores = Q @ K^T       [B, H, L_q, L_k]
-        //   scores += bias
-        //   attn = softmax(scores.float(), dim=-1).to(bf16)
-        //   out = attn @ V         [B, H, L_q, D]
+        // Mirror torch UMT5Attention exactly:
+        //   scores = Q @ K^T       (BF16 inputs, F32 accumulator → BF16 result)
+        //   scores += bias         (BF16)
+        //   attn = softmax(scores.float(), dim=-1).type_as(scores)
+        //   out = attn @ V
+        // CRITICAL: doing Q@K^T in F32 (which appears more "precise") actually
+        // diverges from torch's BF16-quantized scores. The model expects the
+        // BF16 quantization step — without it, attention sharpness differs and
+        // outputs drift catastrophically by layer 18. This was the Helios UMT5
+        // bug.
         let sdpa_raw = {
-            let q_f = q.to_dtype(DType::F32)?;
-            let k_f = k.to_dtype(DType::F32)?;
-            let v_f = v.to_dtype(DType::F32)?;
             let bh = b * h;
-            let q3 = q_f.reshape(&[bh, n, d])?;
-            let k3 = k_f.reshape(&[bh, n, d])?;
-            let v3 = v_f.reshape(&[bh, n, d])?;
-            let k3_t = k3.permute(&[0, 2, 1])?;        // [bh, d, n]
-            let scores3 = q3.bmm(&k3_t)?;              // [bh, n, n]
+            let q3 = q.reshape(&[bh, n, d])?;          // BF16
+            let k3 = k.reshape(&[bh, n, d])?;
+            let v3 = v.reshape(&[bh, n, d])?;
+            let k3_t = k3.permute(&[0, 2, 1])?.contiguous()?;   // [bh, d, n] BF16
+            let scores3 = q3.bmm(&k3_t)?;              // BF16 (F32 accum internally per cuBLAS)
             if layer_idx == 0 && std::env::var("UMT5_DEBUG").is_ok() {
                 let sv = scores3.to_vec1::<f32>()?;
                 // bh=b*h. head 0 = bh index 0. q_row=0, first 5 keys.
@@ -400,9 +401,12 @@ impl Umt5Encoder {
                     sv[h1q0], sv[h1q0 + 1], sv[h1q0 + 2], sv[h1q0 + 3], sv[h1q0 + 4]
                 );
             }
+            // scores BF16, bias BF16 — keep in BF16 to match torch's exact
+            // arithmetic before the F32 softmax cast.
             let scores4 = scores3.reshape(&[b, h, n, n])?;
-            let bias_f = bias.to_dtype(DType::F32)?;
-            let scores4 = scores4.add(&bias_f)?;
+            let scores4 = scores4.add(&bias)?;
+            // Now cast to F32 for the softmax (torch: softmax(scores.float(), dim=-1)).
+            let scores4 = scores4.to_dtype(DType::F32)?;
             if layer_idx == 0 && std::env::var("UMT5_DEBUG").is_ok() {
                 let sv = scores4.to_vec1::<f32>()?;
                 log::info!(
@@ -432,10 +436,11 @@ impl Umt5Encoder {
                 let row_sum: f32 = sv[..n].iter().sum();
                 log::info!("[UMT5 dbg] L0 attn_weights row sum (head 0 q 0): {row_sum:.4}");
             }
-            let attn3 = attn4.reshape(&[bh, n, n])?;
-            let out3 = attn3.bmm(&v3)?;                // [bh, n, d]
-            let out4 = out3.reshape(&[b, h, n, d])?;
-            out4.to_dtype(DType::BF16)?
+            // attn weights BF16 (torch: .type_as(scores) → BF16). Multiply
+            // attn @ V in BF16 with F32 accumulator.
+            let attn3 = attn4.to_dtype(DType::BF16)?.reshape(&[bh, n, n])?;
+            let out3 = attn3.bmm(&v3)?;                // BF16 (V is BF16)
+            out3.reshape(&[b, h, n, d])?
         };
         if layer_idx == 0 && std::env::var("UMT5_DEBUG").is_ok() {
             // sdpa_raw shape: [B, H, L, D]
@@ -538,8 +543,18 @@ impl Umt5Encoder {
         }
 
         // Transformer blocks (each layer recomputes its own rel-pos bias).
+        // When UMT5_DUMP_PER_LAYER is set, save each layer's output for
+        // bisection vs diffusers reference.
+        let mut per_layer_dump: std::collections::HashMap<String, Tensor> = std::collections::HashMap::new();
+        let dump_per_layer = std::env::var("UMT5_DUMP_PER_LAYER").is_ok();
+        if dump_per_layer {
+            per_layer_dump.insert("raw_embed".to_string(), hidden.clone());
+        }
         for i in 0..cfg.num_layers {
             hidden = self.layer_forward(&hidden, i)?;
+            if dump_per_layer {
+                per_layer_dump.insert(format!("layer_{:02}", i), hidden.clone());
+            }
             if std::env::var("UMT5_DEBUG").is_ok() && i < 3 {
                 let v = hidden.to_dtype(DType::F32)?.to_vec1::<f32>()?;
                 log::info!(
@@ -550,6 +565,12 @@ impl Umt5Encoder {
             if (i + 1) % 6 == 0 || i == cfg.num_layers - 1 {
                 log::info!("[UMT5] Layer {}/{} done", i + 1, cfg.num_layers);
             }
+        }
+        if dump_per_layer {
+            let path = std::env::var("UMT5_DUMP_PER_LAYER").unwrap();
+            flame_core::serialization::save_file(&per_layer_dump, &path)
+                .map_err(|e| Error::Io(format!("save_file: {e}")))?;
+            log::info!("[UMT5] saved per-layer outputs to {path}");
         }
 
         // Final norm.
