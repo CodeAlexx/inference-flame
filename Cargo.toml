@@ -55,6 +55,14 @@ name = "chroma_gen"
 path = "src/bin/chroma_gen.rs"
 
 [[bin]]
+name = "nucleus_infer"
+path = "src/bin/nucleus_infer.rs"
+
+[[bin]]
+name = "nucleus_parity"
+path = "src/bin/nucleus_parity.rs"
+
+[[bin]]
 name = "qwenimage_gen"
 path = "src/bin/qwenimage_gen.rs"
 

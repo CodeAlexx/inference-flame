@@ -67,6 +67,42 @@ impl Qwen3Config {
             ..Self::default()
         }
     }
+
+    /// Config for the **text branch** of Qwen3-VL (used by NucleusAI/Nucleus-Image).
+    ///
+    /// Architecturally identical to the Qwen3 text model (same `q_proj`/
+    /// `k_proj`/`v_proj`/`o_proj`/`q_norm`/`k_norm` plus SwiGLU MLP). The
+    /// only differences vs `Qwen3Config::default()`:
+    /// - `hidden_size` 4096 (vs 2560)
+    /// - `intermediate_size` 12288 (vs 6912)
+    /// - `rope_theta` 5_000_000.0 (vs 1_000_000.0)
+    ///
+    /// MRoPE caveat: Qwen3-VL uses MRoPE with `mrope_section=[24,20,20]`
+    /// and `mrope_interleaved=True` for image-aware positions. For
+    /// **text-only** inputs (no image tokens), `position_ids` has shape
+    /// `(B, S)` and is broadcast to all 3 axes equally, so the per-axis
+    /// `freqs[t]==freqs[h]==freqs[w]` and `apply_interleaved_mrope`'s
+    /// stride-3 overwrite is a no-op. The remaining math collapses to
+    /// standard HF half-split 1D RoPE — exactly what `Qwen3Encoder` does.
+    /// So this config is correct for T2I prompt encoding without
+    /// modification; vision-tower path is intentionally out of scope.
+    ///
+    /// `extract_layers` defaults to the final layer (`num_layers - 1`).
+    /// Use `Qwen3Encoder::output_dim()` to read the resulting hidden dim.
+    pub fn qwen3_vl_text() -> Self {
+        Self {
+            vocab_size: 151_936,
+            hidden_size: 4096,
+            num_layers: 36,
+            intermediate_size: 12288,
+            num_heads: 32,
+            num_kv_heads: 8,
+            head_dim: 128,
+            rms_norm_eps: 1e-6,
+            rope_theta: 5_000_000.0,
+            extract_layers: vec![35],
+        }
+    }
 }
 
 /// Qwen3 text encoder — pure flame-core implementation.
@@ -568,6 +604,126 @@ mod tests {
     fn test_output_dim_klein() {
         let cfg = Qwen3Config::default();
         assert_eq!(cfg.extract_layers.len() * cfg.hidden_size, 7680);
+    }
+
+    #[test]
+    fn test_qwen3_vl_text_config() {
+        let cfg = Qwen3Config::qwen3_vl_text();
+        assert_eq!(cfg.hidden_size, 4096);
+        assert_eq!(cfg.intermediate_size, 12288);
+        assert_eq!(cfg.num_layers, 36);
+        assert_eq!(cfg.rope_theta, 5_000_000.0);
+        assert_eq!(cfg.extract_layers, vec![35]);
+    }
+
+    /// Phase 6.7: parity vs `transformers.Qwen3VLTextModel` on a small toy
+    /// config. Confirms the existing `Qwen3Encoder` correctly handles a
+    /// Qwen3-VL text checkpoint — MRoPE collapses to 1D RoPE for text-only
+    /// inputs, and the layer / norm layout matches Qwen3 exactly.
+    ///
+    /// Generate the fixture with:
+    /// ```
+    /// python3 inference-flame/scripts/generate_qwen3vl_text_small.py
+    /// ```
+    #[test]
+    fn qwen3_vl_text_parity_vs_transformers() {
+        let fixture_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/pytorch_fixtures/nucleus/qwen3vl_text_small.safetensors");
+        if !fixture_path.exists() {
+            eprintln!(
+                "fixture missing — generate with `python3 scripts/generate_qwen3vl_text_small.py`"
+            );
+            return;
+        }
+
+        let device = flame_core::CudaDevice::new(0).expect("cuda dev 0");
+        let device: std::sync::Arc<flame_core::CudaDevice> = device;
+
+        let mut map = flame_core::serialization::load_file(&fixture_path, &device)
+            .expect("load fixture");
+
+        // Pull off inputs, expected, and the final norm before we hand the
+        // remaining model weights to the encoder.
+        let input_ids_tensor = map
+            .remove("inputs.input_ids")
+            .expect("fixture missing inputs.input_ids");
+        let expected = map
+            .remove("expected.last_hidden_state")
+            .expect("fixture missing expected.last_hidden_state");
+        let final_norm_w = map
+            .remove("model.norm.weight")
+            .expect("fixture missing model.norm.weight");
+
+        // Convert i32 token IDs to host slice (fixture stored as int32 cast
+        // from torch.long). `Tensor::to_vec_f32` doesn't apply for I32, so we
+        // peek at the underlying f32 representation that load_file produced.
+        // The fixture script saved torch.int32; flame's load_file reads it as
+        // DType::I32 (f32-bytes-relabeled per FLAME_CONVENTIONS). So
+        // to_vec_f32 returns the int values as f32. Cast back to i32.
+        let token_ids_f32 = input_ids_tensor
+            .to_vec_f32()
+            .expect("input_ids to_vec_f32");
+        let token_ids: Vec<i32> = token_ids_f32.into_iter().map(|x| x as i32).collect();
+
+        let cfg = Qwen3Config {
+            vocab_size: 128,
+            hidden_size: 128,
+            num_layers: 4,
+            intermediate_size: 384,
+            num_heads: 4,
+            num_kv_heads: 1,
+            head_dim: 32,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10_000.0,
+            extract_layers: vec![3], // last layer
+        };
+
+        // Drop fixture metadata keys before constructing the encoder.
+        let _ = map
+            .keys()
+            .filter(|k| k.starts_with("meta."))
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|k| map.remove(&k))
+            .count();
+
+        let encoder = Qwen3Encoder::new(map, cfg.clone(), device.clone());
+        let last_layer_pre_norm = encoder.encode(&token_ids).expect("encode");
+
+        // Apply final RMSNorm (model.norm) to match transformers' last_hidden_state.
+        let dims = last_layer_pre_norm.shape().dims().to_vec();
+        let (b, s, h) = (dims[0], dims[1], dims[2]);
+        let flat = last_layer_pre_norm.reshape(&[b * s, h]).expect("flatten");
+        let normed = flame_core::cuda_ops_bf16::rms_norm_bf16(
+            &flat,
+            Some(&final_norm_w),
+            cfg.rms_norm_eps,
+        )
+        .expect("final rms_norm");
+        let normed = normed.reshape(&[b, s, h]).expect("reshape");
+
+        let got = normed.to_vec_f32().expect("got vec");
+        let exp = expected.to_vec_f32().expect("expected vec");
+        assert_eq!(got.len(), exp.len(), "shape mismatch");
+
+        let mut max_abs = 0f32;
+        let mut sum_abs = 0f64;
+        for (a, b) in got.iter().zip(exp.iter()) {
+            let d = (a - b).abs();
+            if d > max_abs {
+                max_abs = d;
+            }
+            sum_abs += d as f64;
+        }
+        let mean_abs = (sum_abs / got.len() as f64) as f32;
+        eprintln!(
+            "qwen3_vl_text_small_parity: max_abs={max_abs:.4e} mean_abs={mean_abs:.4e}"
+        );
+        // BF16 scatter-add accumulation through 4 layers — mostly tight, max
+        // can spike on near-zero outputs.
+        assert!(mean_abs < 1e-3, "mean_abs {mean_abs} exceeds 1e-3");
+        assert!(max_abs < 1e-1, "max_abs {max_abs} exceeds 1e-1");
     }
 
     #[test]
