@@ -10,3 +10,4 @@ pub mod ernie_sampling;
 pub mod acestep_sampling;
 pub mod exponential_multistep;
 pub mod ddpm_wuerstchen;
+pub mod helios_dmd;
