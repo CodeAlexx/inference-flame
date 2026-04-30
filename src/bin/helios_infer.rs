@@ -478,12 +478,17 @@ fn main() -> Result<()> {
         let history_1x = history_window.narrow(2, cursor, HISTORY_SIZES[2])?;
 
         // latents_prefix: zeros(1) for first chunk T2V, else image_latents (1 frame).
+        // Match history_1x's dtype (F32, since history_latents buffer is F32).
         let latents_prefix = if image_latents.is_none() && is_first_chunk {
             let prefix_shape =
                 Shape::from_dims(&[1, Z_DIM, 1, history_1x.shape().dims()[3], history_1x.shape().dims()[4]]);
             Tensor::zeros(prefix_shape, device.clone())?.to_dtype(history_1x.dtype())?
         } else {
-            image_latents.as_ref().unwrap().clone()
+            image_latents
+                .as_ref()
+                .unwrap()
+                .clone()
+                .to_dtype(history_1x.dtype())?
         };
         let history_short = Tensor::cat(&[&latents_prefix, &history_1x], 2)?;
 
@@ -566,9 +571,14 @@ fn main() -> Result<()> {
             w
         );
         let flat = chunk_video.to_vec_f32().map_err(|e| anyhow!("to_vec_f32: {e}"))?;
+        // Drop the BF16 chunk_video + chunk_lat_bf16 before the GPU pool grows.
+        drop(chunk_video);
+        drop(chunk_lat_bf16);
         let chunk_u8 = inference_flame::mux::video_tensor_to_rgb_u8(&flat, t, h, w);
         all_frames_u8.extend_from_slice(&chunk_u8);
         total_pixel_frames += t;
+        // Flush pool between chunks to avoid fragmentation across multi-chunk runs.
+        flame_core::cuda_alloc_pool::clear_pool_cache();
     }
 
     drop(vae);
