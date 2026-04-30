@@ -402,14 +402,28 @@ fn main() -> Result<()> {
     let umt5_path = locate_umt5_weights(&te_dir)?;
     println!("  UMT5 weights: {}", umt5_path.display());
 
-    let mut umt5 = Umt5Encoder::load(&umt5_path, &device)
-        .map_err(|e| anyhow!("Umt5Encoder::load: {e}"))?;
-    let prompt_embeds = umt5.encode(&pos_ids)?;
-    println!(
-        "  prompt_embeds shape: {:?}",
-        prompt_embeds.shape().dims()
-    );
-    drop(umt5);
+    // BISECT MODE: if HELIOS_PROMPT_EMBEDS_PATH is set, skip Wan UMT5 and load
+    // diffusers's pre-computed embeddings directly. Used to isolate UMT5 bugs
+    // from DiT bugs.
+    let prompt_embeds = if let Ok(path) = std::env::var("HELIOS_PROMPT_EMBEDS_PATH") {
+        println!("  BISECT: loading prompt_embeds from {path}");
+        let m = flame_core::serialization::load_file(Path::new(&path), &device)
+            .map_err(|e| anyhow!("load prompt_embeds: {e}"))?;
+        let pe = m
+            .get("prompt_embeds")
+            .ok_or_else(|| anyhow!("missing 'prompt_embeds' key"))?
+            .clone();
+        let _ = pos_ids;
+        println!("  prompt_embeds shape: {:?} dtype: {:?}", pe.shape().dims(), pe.dtype());
+        pe.to_dtype(flame_core::DType::BF16)?
+    } else {
+        let mut umt5 = Umt5Encoder::load(&umt5_path, &device)
+            .map_err(|e| anyhow!("Umt5Encoder::load: {e}"))?;
+        let pe = umt5.encode(&pos_ids)?;
+        println!("  prompt_embeds shape: {:?}", pe.shape().dims());
+        drop(umt5);
+        pe
+    };
     flame_core::cuda_alloc_pool::clear_pool_cache();
     println!("  stage 1: {:.1}s (UMT5 dropped)", t0.elapsed().as_secs_f32());
 

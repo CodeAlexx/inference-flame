@@ -63,6 +63,10 @@ name = "helios_infer"
 path = "src/bin/helios_infer.rs"
 
 [[bin]]
+name = "helios_umt5_parity"
+path = "src/bin/helios_umt5_parity.rs"
+
+[[bin]]
 name = "nucleus_parity"
 path = "src/bin/nucleus_parity.rs"
 
