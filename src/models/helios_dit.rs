@@ -991,14 +991,28 @@ impl HeliosDit {
         // 3-5. Process each history branch in the order: short → mid → long.
         // Each branch CAT-prepends to (x, rotary), so after all three the order is
         // [long, mid, short, current].
+        // History post-patch spatial (h_short_grid, w_short_grid) — set when
+        // short history is processed; used by mid/long RoPE which build at the
+        // post-patch_SHORT spatial (matching diffusers's H1, W1) before
+        // avg-pooling. Falls back to the current chunk's post-patch spatial
+        // if no short history is provided.
+        let mut h_hist_grid = h_grid;
+        let mut w_hist_grid = w_grid;
+
         if let (Some(lh), Some(idx)) = (latents_history_short, indices_latents_history_short) {
             let pw_w = self
                 .patch_short_w
                 .as_ref()
                 .ok_or_else(|| Error::InvalidOperation("patch_short weight missing".into()))?;
             let pw_b = self.patch_short_b.as_ref().unwrap();
-            let (h_short, _) = self.patchify_with_kernel(lh, (pt, ph, pw), pw_w, pw_b)?;
-            let r_short = self.build_rope_indexed(idx, h_grid, w_grid, device.clone())?;
+            let (h_short, (_f_short_post, h_short_post, w_short_post)) =
+                self.patchify_with_kernel(lh, (pt, ph, pw), pw_w, pw_b)?;
+            // Cache short history's post-patch spatial — mid/long RoPE uses
+            // these as the base resolution before avg_pool.
+            h_hist_grid = h_short_post;
+            w_hist_grid = w_short_post;
+            let r_short =
+                self.build_rope_indexed(idx, h_short_post, w_short_post, device.clone())?;
             x = Tensor::cat(&[&h_short, &x], 1)?;
             rotary = Tensor::cat(&[&r_short, &rotary], 1)?;
         }
@@ -1012,7 +1026,15 @@ impl HeliosDit {
             let kernel = (2 * pt, 2 * ph, 2 * pw);
             let lh_padded = pad_3d_replicate(lh, kernel)?;
             let (h_mid, _) = self.patchify_with_kernel(&lh_padded, kernel, pw_w, pw_b)?;
-            let r_mid = self.build_rope_history_pooled(idx, h_grid, w_grid, (2, 2, 2), device.clone())?;
+            // RoPE built at post-patch_SHORT spatial (= h_hist_grid, w_hist_grid)
+            // then avg-pooled (2,2,2) to match patch_mid output spatial.
+            let r_mid = self.build_rope_history_pooled(
+                idx,
+                h_hist_grid,
+                w_hist_grid,
+                (2, 2, 2),
+                device.clone(),
+            )?;
             x = Tensor::cat(&[&h_mid, &x], 1)?;
             rotary = Tensor::cat(&[&r_mid, &rotary], 1)?;
         }
@@ -1026,7 +1048,14 @@ impl HeliosDit {
             let kernel = (4 * pt, 4 * ph, 4 * pw);
             let lh_padded = pad_3d_replicate(lh, kernel)?;
             let (h_long, _) = self.patchify_with_kernel(&lh_padded, kernel, pw_w, pw_b)?;
-            let r_long = self.build_rope_history_pooled(idx, h_grid, w_grid, (4, 4, 4), device.clone())?;
+            // RoPE built at post-patch_SHORT spatial then avg-pooled (4,4,4).
+            let r_long = self.build_rope_history_pooled(
+                idx,
+                h_hist_grid,
+                w_hist_grid,
+                (4, 4, 4),
+                device.clone(),
+            )?;
             x = Tensor::cat(&[&h_long, &x], 1)?;
             rotary = Tensor::cat(&[&r_long, &rotary], 1)?;
         }
@@ -1319,17 +1348,25 @@ impl HeliosInferDit {
             .build_rope_indexed(&frame_indices_main, h_grid, w_grid, device.clone())?;
         let original_context_length = s_main;
 
+        // History post-patch spatial (set when short history is processed;
+        // mid/long RoPE uses these values as the base resolution before
+        // avg_pool, matching diffusers's H1, W1 from patch_short output).
+        let mut h_hist_grid = h_grid;
+        let mut w_hist_grid = w_grid;
+
         // 2. Process MTM history branches (short → mid → long).
         if let (Some(lh), Some(idx)) =
             (latents_history_short, indices_latents_history_short)
         {
             let pw_w = self.top.patch_short_w.as_ref().expect("patch_short loaded");
             let pw_b = self.top.patch_short_b.as_ref().unwrap();
-            let (h_short, _) =
+            let (h_short, (_f_short_post, h_short_post, w_short_post)) =
                 self.top.patchify_with_kernel(lh, (pt, ph, pw), pw_w, pw_b)?;
+            h_hist_grid = h_short_post;
+            w_hist_grid = w_short_post;
             let r_short = self
                 .top
-                .build_rope_indexed(idx, h_grid, w_grid, device.clone())?;
+                .build_rope_indexed(idx, h_short_post, w_short_post, device.clone())?;
             x = Tensor::cat(&[&h_short, &x], 1)?;
             rotary = Tensor::cat(&[&r_short, &rotary], 1)?;
         }
@@ -1342,8 +1379,8 @@ impl HeliosInferDit {
                 self.top.patchify_with_kernel(&lh_padded, kernel, pw_w, pw_b)?;
             let r_mid = self.top.build_rope_history_pooled(
                 idx,
-                h_grid,
-                w_grid,
+                h_hist_grid,
+                w_hist_grid,
                 (2, 2, 2),
                 device.clone(),
             )?;
@@ -1361,8 +1398,8 @@ impl HeliosInferDit {
                 self.top.patchify_with_kernel(&lh_padded, kernel, pw_w, pw_b)?;
             let r_long = self.top.build_rope_history_pooled(
                 idx,
-                h_grid,
-                w_grid,
+                h_hist_grid,
+                w_hist_grid,
                 (4, 4, 4),
                 device.clone(),
             )?;

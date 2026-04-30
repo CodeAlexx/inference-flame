@@ -140,18 +140,15 @@ fn parse_args() -> Result<Args> {
                 .map(|e| e.path())
                 .expect("Helios snapshot not found; set HELIOS_SNAPSHOT")
         });
+    // Wan 2.1 VAE — must be in the ORIGINAL Wan format (top-level conv1/conv2,
+    // decoder.middle.0/1/2, decoder.upsamples.{N}, decoder.head.{0,2}).
+    // Wan21VaeDecoder::load expects this format. The diffusers-style
+    // ai-toolkit/wan2.1-vae file uses different key names (decoder.conv_in,
+    // decoder.up_blocks.{i}.resnets.{j}, ...) and would need
+    // QwenImageVaeDecoder's remap_qwenimage_to_wan21.
     let vae_path = std::env::var("HELIOS_VAE_PATH")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let pat = "/home/alex/.cache/huggingface/hub/models--ai-toolkit--wan2.1-vae/snapshots";
-            let snap = std::fs::read_dir(pat)
-                .ok()
-                .and_then(|mut it| it.next())
-                .and_then(|r| r.ok())
-                .map(|e| e.path())
-                .expect("Wan 2.1 VAE snapshot not found; set HELIOS_VAE_PATH");
-            snap.join("diffusion_pytorch_model.safetensors")
-        });
+        .unwrap_or_else(|_| PathBuf::from("/home/alex/.serenity/models/vaes/wan_2.1_vae.safetensors"));
 
     let output = output
         .unwrap_or_else(|| PathBuf::from("/home/alex/EriDiffusion/inference-flame/output/helios_out.mp4"));
@@ -270,6 +267,7 @@ fn denoise_one_chunk(
     start_point_list.push(latents.clone());
 
     for (stage_idx, &num_steps) in PYRAMID_NUM_INFERENCE_STEPS.iter().enumerate() {
+        let t_stage = Instant::now();
         // Compute mu from current pyramid sequence length.
         let dims = latents.shape().dims().to_vec();
         let (_b, _c, f, h, w) = (dims[0], dims[1], dims[2], dims[3], dims[4]);
@@ -279,6 +277,10 @@ fn denoise_one_chunk(
         let image_seq_len = (f * h * w) / (pt * ph * pw);
         let mu = calculate_shift(image_seq_len, 256, 4096, 0.5, 1.15);
         scheduler.set_timesteps(num_steps, stage_idx, Some(mu), false);
+        eprintln!(
+            "      stage {}: lat_F={} H={} W={} S_post_patch={} mu={:.4} steps={}",
+            stage_idx, f, h, w, image_seq_len, mu, num_steps
+        );
 
         // For stage > 0: nearest upsample + renoise correction.
         if stage_idx > 0 {
@@ -358,6 +360,7 @@ fn denoise_one_chunk(
                 i,
             )?;
         }
+        eprintln!("      stage {} done in {:.1}s", stage_idx, t_stage.elapsed().as_secs_f32());
     }
 
     Ok(latents)
@@ -427,8 +430,7 @@ fn main() -> Result<()> {
     let h_lat = args.height / VAE_SPATIAL_STRIDE;
     let w_lat = args.width / VAE_SPATIAL_STRIDE;
     let window_num_frames = (NUM_LATENT_FRAMES_PER_CHUNK - 1) * VAE_TEMPORAL_STRIDE + 1; // 33
-    let num_latent_chunks =
-        (args.num_frames + window_num_frames - 1).div_ceil(window_num_frames);
+    let num_latent_chunks = args.num_frames.div_ceil(window_num_frames);
     let num_history_latent_frames: usize = HISTORY_SIZES.iter().sum();
     println!(
         "  latent geom: {}x{} (px), {}x{} (latent), {} chunks of {} frames",
