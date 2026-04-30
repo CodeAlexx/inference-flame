@@ -34,3 +34,4 @@ pub mod wuerstchen_unet;
 pub mod paella_vq;
 pub mod sensenova_u1;
 pub mod nucleus_dit;
+pub mod helios_dit;
