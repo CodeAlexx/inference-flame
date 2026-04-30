@@ -294,14 +294,19 @@ impl HeliosBlock {
         let h = cfg.num_heads;
         let hd = cfg.head_dim;
 
-        // ---- Modulation: scale_shift_table (1,6,D) + temb -> 6 channels
-        // 3-D temb path (B,6,D): chunk to 6 tensors of (B, 1, D), broadcast over S.
-        // 4-D temb path (B,S,6,D): scale_shift_table.unsqueeze(0) → (1,1,6,D)
-        //   added → (B,S,6,D), chunk(6, dim=2) → 6 of (B,S,1,D), squeeze(2) → (B,S,D).
+        // ---- Modulation: scale_shift_table (1,6,D) + temb -> 6 channels.
+        //
+        // CRITICAL: diffusers does this in F32 (`temb.float()` before add).
+        // Mirroring exactly — BF16 modulation accumulates rounding error
+        // across 40 layers × 6 denoise steps that pushes the latent
+        // trajectory off the prompt-conditioned mode (visible as content
+        // drift in the rendered video).
         let temb_ndim = temb.shape().dims().len();
+        let temb_f32 = temb.to_dtype(DType::F32)?;
+        let sst_f32 = self.scale_shift_table.to_dtype(DType::F32)?;
         let (shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa) = if temb_ndim == 4 {
-            let sst_4d = self.scale_shift_table.unsqueeze(0)?; // (1,1,6,D)
-            let sum = sst_4d.add(temb)?; // (B,S,6,D)
+            let sst_4d = sst_f32.unsqueeze(0)?; // (1,1,6,D) F32
+            let sum = sst_4d.add(&temb_f32)?;    // (B,S,6,D) F32
             let cs = sum.chunk(6, 2)?;
             (
                 cs[0].squeeze(Some(2))?,
@@ -312,7 +317,7 @@ impl HeliosBlock {
                 cs[5].squeeze(Some(2))?,
             )
         } else {
-            let sum = self.scale_shift_table.add(temb)?; // (B,6,D)
+            let sum = sst_f32.add(&temb_f32)?;   // (B,6,D) F32
             let cs = sum.chunk(6, 1)?;
             (
                 cs[0].clone(),
@@ -331,10 +336,14 @@ impl HeliosBlock {
         let c_gate_msa = &c_gate_msa;
 
         // ---- 1. Self-attention -----------------------------------------
-        // norm1: FP32 LayerNorm, no affine, eps=1e-6
-        let normed = layer_norm(hidden, &[d], None, None, cfg.eps)?;
+        // norm1: layer_norm computes F32 internally on BF16 input; we cast
+        // its BF16 output to F32 for the post-norm modulation, then back
+        // to BF16 for the attention call.
+        let normed_bf16 = layer_norm(hidden, &[d], None, None, cfg.eps)?;
+        let normed_f32 = normed_bf16.to_dtype(DType::F32)?;
         let scale1 = scale_msa.add_scalar(1.0)?;
-        let normed = normed.mul(&scale1)?.add(shift_msa)?;
+        let normed_f32 = normed_f32.mul(&scale1)?.add(shift_msa)?;
+        let normed = normed_f32.to_dtype(DType::BF16)?;
 
         let attn1_out = self.attention(
             &normed,
@@ -353,9 +362,12 @@ impl HeliosBlock {
             cfg,
         )?;
 
-        // residual: x + gate_msa * attn (NO `tanh` like Nucleus — direct multiply)
-        let gated = gate_msa.mul(&attn1_out)?;
-        let x = hidden.add(&gated)?;
+        // residual: `(hidden.float() + attn * gate).type_as(hidden)` — F32.
+        let hidden_f32 = hidden.to_dtype(DType::F32)?;
+        let attn1_f32 = attn1_out.to_dtype(DType::F32)?;
+        let gated_f32 = gate_msa.mul(&attn1_f32)?;
+        let x_f32 = hidden_f32.add(&gated_f32)?;
+        let x = x_f32.to_dtype(DType::BF16)?;
 
         // ---- 2. Cross-attention ---------------------------------------
         // norm2: FP32 LayerNorm, AFFINE (cross_attn_norm=True)
@@ -415,10 +427,14 @@ impl HeliosBlock {
         };
 
         // ---- 3. Feed-forward (GELU-approximate) -----------------------
-        // norm3: FP32 LayerNorm, no affine
-        let normed3 = layer_norm(&x, &[d], None, None, cfg.eps)?;
+        // norm3: layer_norm on BF16 → F32 cast → modulation in F32 → BF16
+        // for FFN. Final residual in F32.
+        let normed3_bf16 = layer_norm(&x, &[d], None, None, cfg.eps)?;
+        let normed3_f32 = normed3_bf16.to_dtype(DType::F32)?;
         let scale2 = c_scale_msa.add_scalar(1.0)?;
-        let normed3 = normed3.mul(&scale2)?.add(c_shift_msa)?;
+        let normed3_f32 = normed3_f32.mul(&scale2)?.add(c_shift_msa)?;
+        let normed3 = normed3_f32.to_dtype(DType::BF16)?;
+        let x_f32 = x.to_dtype(DType::F32)?;
 
         // Up projection
         let h1 = fused_linear3d_native(&normed3, &self.ffn_up_w, Some(&self.ffn_up_b))?;
@@ -427,10 +443,12 @@ impl HeliosBlock {
         // Down projection
         let ff_out = fused_linear3d_native(&h1, &self.ffn_down_w, Some(&self.ffn_down_b))?;
 
-        // residual: x + c_gate_msa * ff_out
-        let gated = c_gate_msa.mul(&ff_out)?;
-        let _ = (b, s, h, hd); // silence unused if all paths used parameters
-        x.add(&gated)
+        // residual: `(hidden.float() + ff_out.float() * c_gate).type_as(hidden)`.
+        let ff_out_f32 = ff_out.to_dtype(DType::F32)?;
+        let gated_f32 = c_gate_msa.mul(&ff_out_f32)?;
+        let out_f32 = x_f32.add(&gated_f32)?;
+        let _ = (b, s, h, hd);
+        out_f32.to_dtype(DType::BF16)
     }
 
     /// Generic multi-head attention that handles both self- and cross-attn.
