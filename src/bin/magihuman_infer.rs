@@ -997,6 +997,29 @@ fn main() -> Result<()> {
         None
     };
 
+    // MAGI_LOAD_BASE_LATENT=path overrides initial video_lat/audio_lat from a
+    // saved fixture and sets effective_steps = 0 to skip the base sampling loop.
+    // Used to iterate on the SR phase without re-running the 22-min base loop.
+    // (Base DiT still loads, so peak RAM is unchanged. ~30s wasted per run.)
+    let skip_base = std::env::var("MAGI_LOAD_BASE_LATENT").ok();
+    if let Some(load_path) = skip_base.as_ref() {
+        eprintln!("[base ] MAGI_LOAD_BASE_LATENT={load_path} — overriding init latents, skipping sampling loop");
+        let tensors = flame_core::serialization::load_file(load_path, &device)?;
+        video_lat = tensors
+            .get("video_lat")
+            .ok_or_else(|| anyhow!("MAGI_LOAD_BASE_LATENT: missing video_lat key"))?
+            .to_dtype(DType::F32)?;
+        audio_lat = tensors
+            .get("audio_lat")
+            .ok_or_else(|| anyhow!("MAGI_LOAD_BASE_LATENT: missing audio_lat key"))?
+            .to_dtype(DType::F32)?;
+        eprintln!(
+            "[base ] loaded video_lat={:?} audio_lat={:?}",
+            video_lat.shape().dims(),
+            audio_lat.shape().dims()
+        );
+    }
+
     // --- Load full MagiHuman DiT (adapter + final heads on GPU, 40 transformer
     //     layers streamed via BlockOffloader). Internally opens the safetensors
     //     twice: once filtered for adapter/final_*, once for per-layer streaming.
@@ -1013,13 +1036,19 @@ fn main() -> Result<()> {
     // --- CFG: when active, base sampler switches from step_ddim to UniPC
     //     (matches Python video_scheduler.step path used when cfg_number=2).
     //     Audio gets its own UniPC instance only if audio_cfg_scale > 1.0.
-    let mut base_video_unipc: Option<UniPCSampler> = if cfg_active {
+    // MAGI_FORCE_DDIM=1 disables UniPC and uses step_ddim even with CFG. Used
+    // to bisect whether visible artifacts at 32-step CFG come from UniPC drift.
+    let force_ddim = std::env::var("MAGI_FORCE_DDIM").is_ok();
+    if force_ddim {
+        eprintln!("[sched] MAGI_FORCE_DDIM=1 — using step_ddim instead of UniPC");
+    }
+    let mut base_video_unipc: Option<UniPCSampler> = if cfg_active && !force_ddim {
         let sigmas_f64: Vec<f64> = sigmas.iter().map(|&s| s as f64).collect();
         Some(UniPCSampler::new(sigmas_f64, 2))
     } else {
         None
     };
-    let mut base_audio_unipc: Option<UniPCSampler> = if cli.audio_cfg_scale > 1.0 {
+    let mut base_audio_unipc: Option<UniPCSampler> = if cli.audio_cfg_scale > 1.0 && !force_ddim {
         let sigmas_f64: Vec<f64> = sigmas.iter().map(|&s| s as f64).collect();
         Some(UniPCSampler::new(sigmas_f64, 2))
     } else {
@@ -1027,7 +1056,8 @@ fn main() -> Result<()> {
     };
 
     // --- Sampling loop ---
-    for step in 0..cli.steps {
+    let effective_steps = if skip_base.is_some() { 0 } else { cli.steps };
+    for step in 0..effective_steps {
         let sigma_curr = sigmas[step];
         let sigma_next = sigmas[step + 1];
         let t_step = std::time::Instant::now();
@@ -1430,7 +1460,23 @@ fn main() -> Result<()> {
             };
 
             // UniPC step: corrector + predictor.
-            sr_video_lat = unipc.step(&v_velocity, &sr_video_lat)?;
+            // MAGI_FORCE_DDIM=1 also disables SR UniPC and uses step_ddim, for
+            // bisecting whether SR UniPC trajectory is what introduces the
+            // chromatic-streak artifact. step_ddim needs noise; seed mirrors
+            // the base-step seeding scheme using a unique role (7).
+            sr_video_lat = if force_ddim {
+                let noise = Tensor::randn_seeded(
+                    sr_video_lat.shape().clone(),
+                    0.0,
+                    1.0,
+                    seed_for(cli.seed, 7, step as u64),
+                    device.clone(),
+                )?
+                .to_dtype(DType::F32)?;
+                step_ddim(&v_velocity, &sr_video_lat, sigma_curr, sigma_next, &noise)?
+            } else {
+                unipc.step(&v_velocity, &sr_video_lat)?
+            };
             // audio_lat NOT updated in SR phase (matches update_audio=False)
 
             let v_max = sr_video_lat.to_vec_f32()?.iter().fold(0.0f32, |m, x| m.max(x.abs()));
