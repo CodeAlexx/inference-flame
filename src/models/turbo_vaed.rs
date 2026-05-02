@@ -869,19 +869,27 @@ impl TurboVAED {
 
         if num_frames == first_chunk {
             // Single chunk: decode directly with first-chunk semantics.
-            eprintln!("[turbovaed] single-chunk path: in_t={}", first_chunk);
             let out = self.decoder.forward(&z_padded, true)?;
             out_chunks.push(out);
         } else {
-            eprintln!(
-                "[turbovaed] multi-chunk path: total_in_t={num_frames} first_chunk={first_chunk} step={step} overlap_pixel={overlap_pixel}"
-            );
             // First chunk: input frames [0..first_chunk + 1) (= first_chunk+1
             // latent frames), then trim right `overlap_pixel` pixel frames.
+            //
+            // KNOWN ISSUE (2026-05-01): on long latents (≥ 26 latent frames,
+            // e.g. `--seconds 4`), chunk 2 — input shape `[1, 48, 9, 34, 60]`
+            // with `is_first_chunk=false`, yielding `[1, 256, 36, 136, 240]`
+            // at up_block[1] — fails with "CUDA driver error" inside
+            // up_block[2]'s spatial-2× upsample + conv. Likely a cuDNN /
+            // cuBLAS workspace limit at the post-upsample shape
+            // `[1, 256, 36, 272, 480]` (1.2 GB activation, ~5 GB workspace
+            // when the kernel double-buffers). Single-chunk path (≤ 7 latent
+            // frames) is unaffected. Workaround: decode short slices at a
+            // time, e.g. `latent[0..7]` and `latent[19..26]` separately.
+            // Permanent fix: investigate cuDNN selectAlgorithm / fall back to
+            // a smaller-tile conv3d when the expected workspace exceeds
+            // available GPU memory.
             let first_in = z_padded.narrow(2, 0, first_chunk + 1)?;
-            eprintln!("[turbovaed] first chunk in shape: {:?}", first_in.shape().dims());
             let first_out = self.decoder.forward(&first_in, true)?;
-            eprintln!("[turbovaed] first chunk out shape: {:?}", first_out.shape().dims());
             let first_t = first_out.shape().dims()[2];
             if first_t <= overlap_pixel {
                 return Err(Error::InvalidOperation(format!(
@@ -900,12 +908,7 @@ impl TurboVAED {
                 let in_len = right - left;
 
                 let chunk_in = z_padded.narrow(2, left, in_len)?;
-                eprintln!(
-                    "[turbovaed] chunk i={i} (last={is_last_chunk}) in shape={:?}",
-                    chunk_in.shape().dims()
-                );
                 let chunk_out = self.decoder.forward(&chunk_in, false)?;
-                eprintln!("[turbovaed] chunk i={i} out shape={:?}", chunk_out.shape().dims());
                 let chunk_t = chunk_out.shape().dims()[2];
                 let trimmed = if is_last_chunk {
                     chunk_out.narrow(2, overlap_pixel, chunk_t - overlap_pixel)?
