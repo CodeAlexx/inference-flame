@@ -12,3 +12,4 @@ pub mod exponential_multistep;
 pub mod ddpm_wuerstchen;
 pub mod helios_dmd;
 pub mod helios_pyramid;
+pub mod magihuman_unipc;

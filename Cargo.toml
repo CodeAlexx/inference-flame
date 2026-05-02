@@ -67,6 +67,66 @@ name = "helios_umt5_parity"
 path = "src/bin/helios_umt5_parity.rs"
 
 [[bin]]
+name = "turbo_vaed_parity"
+path = "src/bin/turbo_vaed_parity.rs"
+
+[[bin]]
+name = "oobleck_parity"
+path = "src/bin/oobleck_parity.rs"
+
+[[bin]]
+name = "magihuman_layer4_parity"
+path = "src/bin/magihuman_layer4_parity.rs"
+
+[[bin]]
+name = "deinterleave_smoke"
+path = "src/bin/deinterleave_smoke.rs"
+
+[[bin]]
+name = "magihuman_layer0_parity"
+path = "src/bin/magihuman_layer0_parity.rs"
+
+[[bin]]
+name = "magihuman_adapter_parity"
+path = "src/bin/magihuman_adapter_parity.rs"
+
+[[bin]]
+name = "magihuman_full_dit_parity"
+path = "src/bin/magihuman_full_dit_parity.rs"
+
+[[bin]]
+name = "magihuman_unipc_parity"
+path = "src/bin/magihuman_unipc_parity.rs"
+
+[[bin]]
+name = "magihuman_layer0_offloader_parity"
+path = "src/bin/magihuman_layer0_offloader_parity.rs"
+
+[[bin]]
+name = "magihuman_first_n_layers_parity"
+path = "src/bin/magihuman_first_n_layers_parity.rs"
+
+[[bin]]
+name = "magihuman_adapter_40tok_parity"
+path = "src/bin/magihuman_adapter_40tok_parity.rs"
+
+[[bin]]
+name = "magihuman_chain_bisect"
+path = "src/bin/magihuman_chain_bisect.rs"
+
+[[bin]]
+name = "magihuman_layer0_bisect"
+path = "src/bin/magihuman_layer0_bisect.rs"
+
+[[bin]]
+name = "magihuman_infer"
+path = "src/bin/magihuman_infer.rs"
+
+[[bin]]
+name = "magihuman_decode"
+path = "src/bin/magihuman_decode.rs"
+
+[[bin]]
 name = "nucleus_parity"
 path = "src/bin/nucleus_parity.rs"
 
