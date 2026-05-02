@@ -96,10 +96,14 @@ impl Cli {
         let mut sr_audio_noise_scale = 0.7f64;
         let mut cfg_scale = 1.0f64;
         let mut audio_cfg_scale = 1.0f64;
-        // SR CFG defaults match creator's SR2_1080 config: sr_video_txt_guidance_scale=3.5
-        // with cfg_trick value=2.0 for first 13 latent frames. Pass --sr-cfg-scale 1.0
-        // to disable SR CFG entirely (cfg_number=1 path).
-        let mut sr_cfg_scale = 3.5f64;
+        // SR CFG defaults match creator's official `example/sr_1080p/config.json`:
+        // `sr_cfg_number=1` (no SR CFG, just cond pass). With sr_cfg_scale=1.0 the
+        // sr_cfg_active branch is skipped and only the cond forward runs.
+        // To enable CFG manually (creator's variant with `sr_cfg_number=2`), set
+        // `--sr-cfg-scale 3.5` (creator's `sr_video_txt_guidance_scale`); the
+        // cfg_trick logic below will then use --sr-cfg-trick-value (default 2.0)
+        // for the first --sr-cfg-trick-frame latent frames (default 13).
+        let mut sr_cfg_scale = 1.0f64;
         let mut sr_cfg_trick_frame = 13usize;
         let mut sr_cfg_trick_value = 2.0f64;
         let mut it = std::env::args().skip(1);
