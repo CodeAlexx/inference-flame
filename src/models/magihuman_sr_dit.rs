@@ -494,11 +494,23 @@ impl MagiHumanSrDiTSwapped {
         let audio_mask: Vec<bool> = (0..l).map(|i| i >= v_count && i < v_count + a_count).collect();
         let text_mask: Vec<bool> = (0..l).map(|i| i >= v_count + a_count).collect();
 
+        // Optional per-layer intermediate dump for parity bisection.
+        // MAGI_DUMP_SR_INTERMEDIATES=path → save adapter output + outputs after
+        // layers 0/9/19/29/39 + final-norm output to a single safetensors file.
+        // Companion: scripts/sr_dit_layer_parity.py (compares against creator code).
+        let dump_path = std::env::var("MAGI_DUMP_SR_INTERMEDIATES").ok();
+        let mut intermediates: HashMap<String, Tensor> = HashMap::new();
+
         // Adapter
         let mut h = self.adapter.embed(x, &video_mask, &audio_mask, &text_mask)?;
         let rope = self.adapter.rope_from_coords(coords)?;
         let rope_b = rope.unsqueeze(0)?;
         h = h.to_dtype(DType::BF16)?;
+
+        if dump_path.is_some() {
+            intermediates.insert("after_adapter".to_string(), h.to_dtype(DType::F32)?);
+            intermediates.insert("rope".to_string(), rope.to_dtype(DType::F32)?);
+        }
 
         let group_sizes_vec = group_sizes.to_vec();
         self.offloader.prefetch_block(0)
@@ -554,6 +566,14 @@ impl MagiHumanSrDiTSwapped {
             } else {
                 eprintln!("[sr layer {i}] {elapsed} ms  is_mm={is_mm}");
             }
+
+            if dump_path.is_some() && [0_usize, 1, 2, 3, 4, 5, 6, 7, 8, 9, 19, 29, 39].contains(&i) {
+                intermediates.insert(format!("after_layer_{i}"), h.to_dtype(DType::F32)?);
+            }
+        }
+
+        if dump_path.is_some() {
+            intermediates.insert("after_block".to_string(), h.to_dtype(DType::F32)?);
         }
 
         // Final heads — identical to base.
@@ -582,6 +602,30 @@ impl MagiHumanSrDiTSwapped {
             out = base::splice_rows(&out, &proj_a_padded, v_count)?;
         }
         let _ = t_count;
+
+        if let Some(path) = dump_path {
+            intermediates.insert("dit_out".to_string(), out.clone());
+            intermediates.insert("x_input".to_string(), x.to_dtype(DType::F32)?);
+            intermediates.insert("coords_input".to_string(), coords.to_dtype(DType::F32)?);
+            intermediates.insert(
+                "group_sizes".to_string(),
+                Tensor::from_vec(
+                    group_sizes.iter().map(|&s| s as f32).collect(),
+                    Shape::from_dims(&[3]),
+                    device.clone(),
+                )?,
+            );
+            flame_core::serialization::save_file(&intermediates, &path)?;
+            eprintln!(
+                "[sr parity] dumped {} intermediates → {}",
+                intermediates.len(),
+                path
+            );
+            for k in intermediates.keys() {
+                eprintln!("[sr parity]   key: {k}");
+            }
+        }
+
         Ok(out)
     }
 }

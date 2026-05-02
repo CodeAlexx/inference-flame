@@ -60,6 +60,16 @@ struct Cli {
     cfg_scale: f64,
     audio_cfg_scale: f64,
     sr_cfg_scale: f64,
+    // SR `cfg_trick`: creator's pipeline (see video_generate.py:415..418)
+    // applies a lower CFG for the first `sr_cfg_trick_frame` LATENT frames,
+    // then jumps to `sr_cfg_scale` for the rest. Creator defaults are
+    // sr_cfg_scale=3.5 and cfg_trick_value=2.0 with start_frame=13.
+    // For 1-sec / 7-frame outputs, all latent frames are < 13 so cfg_trick
+    // value (2.0) applies throughout. For 5-sec / 32-frame outputs, frames
+    // 0..12 use 2.0 and 13..31 use 3.5.
+    // Pass `--sr-cfg-trick-frame 0` to disable.
+    sr_cfg_trick_frame: usize,
+    sr_cfg_trick_value: f64,
 }
 
 impl Cli {
@@ -86,7 +96,12 @@ impl Cli {
         let mut sr_audio_noise_scale = 0.7f64;
         let mut cfg_scale = 1.0f64;
         let mut audio_cfg_scale = 1.0f64;
-        let mut sr_cfg_scale = 1.0f64;
+        // SR CFG defaults match creator's SR2_1080 config: sr_video_txt_guidance_scale=3.5
+        // with cfg_trick value=2.0 for first 13 latent frames. Pass --sr-cfg-scale 1.0
+        // to disable SR CFG entirely (cfg_number=1 path).
+        let mut sr_cfg_scale = 3.5f64;
+        let mut sr_cfg_trick_frame = 13usize;
+        let mut sr_cfg_trick_value = 2.0f64;
         let mut it = std::env::args().skip(1);
         while let Some(arg) = it.next() {
             match arg.as_str() {
@@ -113,6 +128,8 @@ impl Cli {
                 "--cfg-scale" => cfg_scale = it.next().unwrap().parse()?,
                 "--audio-cfg-scale" => audio_cfg_scale = it.next().unwrap().parse()?,
                 "--sr-cfg-scale" => sr_cfg_scale = it.next().unwrap().parse()?,
+                "--sr-cfg-trick-frame" => sr_cfg_trick_frame = it.next().unwrap().parse()?,
+                "--sr-cfg-trick-value" => sr_cfg_trick_value = it.next().unwrap().parse()?,
                 other => anyhow::bail!("unknown arg: {other}"),
             }
         }
@@ -125,6 +142,7 @@ impl Cli {
             sr_weights, sr_width, sr_height, sr_steps,
             sr_noise_value, sr_audio_noise_scale,
             cfg_scale, audio_cfg_scale, sr_cfg_scale,
+            sr_cfg_trick_frame, sr_cfg_trick_value,
         })
     }
 }
@@ -148,8 +166,13 @@ impl Cli {
 // magnitudes" symptom from the prior debugging session matches this exact
 // failure mode.
 
-/// Load `path` as RGB image, Lanczos-resize to `target_h × target_w`, return
-/// `[1, 3, 1, H, W]` BF16 tensor in `[-1, 1]` for the Wan2.2 VAE encoder.
+/// Load `path` as RGB image, center-crop to target aspect ratio, Lanczos-
+/// resize to `target_h × target_w`, return `[1, 3, 1, H, W]` BF16 tensor in
+/// `[-1, 1]` for the Wan2.2 VAE encoder.
+///
+/// Mirrors creator's `resizecrop` (video_process.py:111..125): crop to target
+/// aspect first to preserve subject proportions, THEN resize. Without the
+/// crop, a square reference squishes vertically when the SR target is 16:9.
 fn load_reference_image(
     path: &Path,
     target_h: usize,
@@ -159,8 +182,31 @@ fn load_reference_image(
     let img = image::open(path)
         .map_err(|e| anyhow!("failed to open image {}: {e}", path.display()))?
         .to_rgb8();
+    // Center-crop to target aspect ratio at native res.
+    let (w, h) = (img.width() as usize, img.height() as usize);
+    let aspect_target = target_h as f64 / target_w as f64;
+    let aspect_image = h as f64 / w as f64;
+    let cropped = if (w == target_w && h == target_h) || (aspect_image - aspect_target).abs() < 1e-6 {
+        img
+    } else {
+        let (new_w, new_h) = if aspect_image > aspect_target {
+            // Image is taller than target → crop top/bottom.
+            let new_w = w;
+            let new_h = ((new_w as f64) * (target_h as f64) / (target_w as f64)).round() as usize;
+            (new_w, new_h)
+        } else {
+            // Image is wider than target → crop left/right.
+            let new_h = h;
+            let new_w = ((new_h as f64) * (target_w as f64) / (target_h as f64)).round() as usize;
+            (new_w, new_h)
+        };
+        let left = (w.saturating_sub(new_w)) / 2;
+        let top = (h.saturating_sub(new_h)) / 2;
+        image::imageops::crop_imm(&img, left as u32, top as u32, new_w as u32, new_h as u32)
+            .to_image()
+    };
     let resized = image::imageops::resize(
-        &img,
+        &cropped,
         target_w as u32,
         target_h as u32,
         image::imageops::FilterType::Lanczos3,
@@ -1440,8 +1486,11 @@ fn main() -> Result<()> {
             drop(dit_out_cond);
 
             // === Unconditional SR pass (CFG only) ===
-            // SR uses sr_cfg_scale uniformly (no time switch). Audio NOT mixed —
-            // SR phase doesn't denoise audio (update_audio=False per Wan2GP line 763).
+            // SR uses per-latent-frame CFG with `cfg_trick`: first
+            // `sr_cfg_trick_frame` frames use `sr_cfg_trick_value`, rest use
+            // `sr_cfg_scale`. Mirrors creator video_generate.py:411..418.
+            // Audio NOT mixed — SR phase doesn't denoise audio
+            // (update_audio=False per video_generate.py:763).
             let v_velocity = if sr_cfg_active {
                 let neg = neg_embeds.as_ref().expect("sr_cfg_active implies neg_embeds loaded");
                 let packed_uncond = pack_inputs_v1(&sr_video_lat, &sr_audio_lat, neg, &device)?;
@@ -1451,13 +1500,39 @@ fn main() -> Result<()> {
                 let (v_vel_uncond, _) =
                     extract_velocities(&dit_out_uncond, v_count, a_count, lt2, lh2, lw2)?;
                 drop(dit_out_uncond);
-                let scale = cli.sr_cfg_scale as f32;
-                eprintln!("[sr step {step}] cfg video={scale:.2}");
                 let v_diff = v_vel_cond.sub(&v_vel_uncond)?;
-                v_vel_uncond.add(&v_diff.mul_scalar(scale)?)?
+                let trick_t = std::cmp::min(cli.sr_cfg_trick_frame, lt2);
+                let scale_main = cli.sr_cfg_scale as f32;
+                let scale_trick = cli.sr_cfg_trick_value as f32;
+                let scaled_diff = if trick_t == 0 || trick_t >= lt2 {
+                    // No split: all frames use the same scale.
+                    let s = if trick_t >= lt2 { scale_trick } else { scale_main };
+                    eprintln!("[sr step {step}] cfg video={s:.2} (uniform, frames=0..{lt2})");
+                    v_diff.mul_scalar(s)?
+                } else {
+                    // Split: frames [0..trick_t] use scale_trick, [trick_t..lt2] use scale_main.
+                    eprintln!(
+                        "[sr step {step}] cfg video={scale_trick:.2} for frames 0..{trick_t}, {scale_main:.2} for {trick_t}..{lt2}",
+                    );
+                    let early = v_diff
+                        .narrow(2, 0, trick_t)?
+                        .contiguous()?
+                        .mul_scalar(scale_trick)?;
+                    let late = v_diff
+                        .narrow(2, trick_t, lt2 - trick_t)?
+                        .contiguous()?
+                        .mul_scalar(scale_main)?;
+                    Tensor::cat(&[&early, &late], 2)?
+                };
+                v_vel_uncond.add(&scaled_diff)?
             } else {
                 v_vel_cond
             };
+
+            // Optional per-step UniPC dump for parity bisection.
+            // MAGI_DUMP_SR_UNIPC=path → save sample_in, velocity, sample_out per step.
+            let unipc_dump_path = std::env::var("MAGI_DUMP_SR_UNIPC").ok();
+            let sr_lat_in = sr_video_lat.clone();
 
             // UniPC step: corrector + predictor.
             // MAGI_FORCE_DDIM=1 also disables SR UniPC and uses step_ddim, for
@@ -1477,6 +1552,43 @@ fn main() -> Result<()> {
             } else {
                 unipc.step(&v_velocity, &sr_video_lat)?
             };
+
+            if let Some(ref path) = unipc_dump_path {
+                let mut tensors: HashMap<String, Tensor> = HashMap::new();
+                tensors.insert(format!("step_{step}_sample_in"),  sr_lat_in.to_dtype(DType::F32)?);
+                tensors.insert(format!("step_{step}_velocity"),   v_velocity.to_dtype(DType::F32)?);
+                tensors.insert(format!("step_{step}_sample_out"), sr_video_lat.to_dtype(DType::F32)?);
+                tensors.insert(
+                    format!("step_{step}_sigmas"),
+                    Tensor::from_vec(
+                        vec![sigma_curr, sigma_next],
+                        Shape::from_dims(&[2]),
+                        device.clone(),
+                    )?,
+                );
+                if step == 0 {
+                    // Dump full sigma schedule once
+                    let all_sigmas: Vec<f32> = unipc.sigmas.iter().map(|x| *x as f32).collect();
+                    let n = all_sigmas.len();
+                    tensors.insert(
+                        "all_sigmas".to_string(),
+                        Tensor::from_vec(all_sigmas, Shape::from_dims(&[n]), device.clone())?,
+                    );
+                }
+                // Append-or-create: load existing dump if present, merge, save.
+                if std::path::Path::new(path).exists() {
+                    if let Ok(existing) = flame_core::serialization::load_file(
+                        std::path::Path::new(path),
+                        &device,
+                    ) {
+                        for (k, v) in existing {
+                            tensors.entry(k).or_insert(v);
+                        }
+                    }
+                }
+                flame_core::serialization::save_file(&tensors, path)?;
+                eprintln!("[sr unipc dump] step {step} → {}", path);
+            }
             // audio_lat NOT updated in SR phase (matches update_audio=False)
 
             let v_max = sr_video_lat.to_vec_f32()?.iter().fold(0.0f32, |m, x| m.max(x.abs()));
