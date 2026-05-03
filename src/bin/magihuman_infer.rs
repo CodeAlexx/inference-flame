@@ -65,6 +65,17 @@ SR PHASE 2 (1080p / 540p refinement) — only runs if --sr-weights given
   --sr-cfg-trick-frame <int>      Latent frames < this use --sr-cfg-trick-value (default 13).
   --sr-cfg-trick-value <f64>      CFG scale for early frames (default 2.0). Only matters when sr_cfg_scale > 1.0.
 
+DECODE
+  --chunk-latent-frames <int>     If > 0, decode the post-SR video latent in
+                                  chunks of N latent frames, concatenating
+                                  pixel outputs. Workaround for the intermittent
+                                  CUDA_ERROR_OUT_OF_MEMORY in TurboVAED's
+                                  multi-chunk path on 24 GB GPUs (see
+                                  turbo_vaed.rs:878). Use 7 for safe single-chunk
+                                  semantics per piece. Loses cross-chunk overlap
+                                  blending — may show small seam at boundaries.
+                                  0 = disabled (full single-shot decode, default).
+
 VAE WEIGHTS (defaults usually OK)
   --turbo-vaed-weights <FILE>     TurboVAED decoder.
   --wan-vae-weights    <FILE>     Wan2.2 VAE encoder for reference image.
@@ -132,6 +143,15 @@ struct Cli {
     // Pass `--sr-cfg-trick-frame 0` to disable.
     sr_cfg_trick_frame: usize,
     sr_cfg_trick_value: f64,
+    /// If > 0, decode the (post-SR) video latent in chunks of this many latent
+    /// frames, concatenating pixel outputs along the temporal axis.
+    /// Workaround for the intermittent CUDA_ERROR_OUT_OF_MEMORY in TurboVAED's
+    /// multi-chunk sliding-window path on 24 GB GPUs (see turbo_vaed.rs:878
+    /// known-issue comment). With chunk size ≤ 7 each chunk hits the safe
+    /// single-chunk path. 0 = disabled (full single-shot decode, current
+    /// default for short outputs that fit). Loses cross-chunk temporal overlap
+    /// blending — small visible seam possible at chunk boundaries.
+    chunk_latent_frames: usize,
 }
 
 impl Cli {
@@ -169,6 +189,7 @@ impl Cli {
         let mut sr_cfg_trick_frame = 13usize;
         let mut sr_cfg_trick_value = 2.0f64;
         let mut audio_path: Option<PathBuf> = None;
+        let mut chunk_latent_frames = 0usize;
         let mut it = std::env::args().skip(1);
         while let Some(arg) = it.next() {
             match arg.as_str() {
@@ -202,6 +223,7 @@ impl Cli {
                 "--sr-cfg-trick-frame" => sr_cfg_trick_frame = it.next().unwrap().parse()?,
                 "--sr-cfg-trick-value" => sr_cfg_trick_value = it.next().unwrap().parse()?,
                 "--audio-path" => audio_path = it.next().map(PathBuf::from),
+                "--chunk-latent-frames" => chunk_latent_frames = it.next().unwrap().parse()?,
                 other => anyhow::bail!("unknown arg: {other}"),
             }
         }
@@ -216,6 +238,7 @@ impl Cli {
             cfg_scale, audio_cfg_scale, sr_cfg_scale,
             audio_path,
             sr_cfg_trick_frame, sr_cfg_trick_value,
+            chunk_latent_frames,
         })
     }
 }
@@ -1101,6 +1124,14 @@ fn main() -> Result<()> {
         device.clone(),
     )?
     .to_dtype(DType::F32)?;
+    // is_a2v ("audio-to-video") = true when the user provided real audio.
+    // Mirrors creator's video_generate.py:271..281: when audio_path is set,
+    // latent_audio is the encoder output and used as IMMUTABLE conditioning
+    // (never denoised). When no audio_path, latent_audio starts as randn and
+    // is denoised through the loop (audio is GENERATED). Treating provided
+    // audio as a noise sample to denoise destroys the phoneme-class signal
+    // (std blows up ~7×, decoder produces unintelligible output).
+    let is_a2v = cli.audio_path.is_some();
     let mut audio_lat = if let Some(audio_path) = cli.audio_path.as_ref() {
         // Pure-Rust path: WAV → 51,200 Hz resample → SA Open VAE encode →
         // bottleneck-mean → [1, num_frames, 64].
@@ -1132,6 +1163,8 @@ fn main() -> Result<()> {
         )?
         .to_dtype(DType::F32)?
     };
+    eprintln!("[mode ] is_a2v={is_a2v} (audio_lat is {})",
+        if is_a2v { "IMMUTABLE conditioning" } else { "denoised across base loop" });
 
     // --- i2v reference: encode image → first-frame conditioning latent.
     //     Done BEFORE the DiT load so the VAE encoder's weights are freed
@@ -1396,18 +1429,26 @@ fn main() -> Result<()> {
             .to_dtype(DType::F32)?;
             video_lat = step_ddim(&v_velocity, &video_lat, sigma_curr, sigma_next, &noise_v)?;
         }
-        if let Some(unipc) = base_audio_unipc.as_mut() {
-            audio_lat = unipc.step(&a_velocity, &audio_lat)?;
+        // Audio update: only when GENERATING audio (is_a2v=false). When the
+        // user provided real audio, audio_lat is immutable conditioning —
+        // matches creator video_generate.py:82 `if not is_a2v and not use_sr_model:`.
+        if !is_a2v {
+            if let Some(unipc) = base_audio_unipc.as_mut() {
+                audio_lat = unipc.step(&a_velocity, &audio_lat)?;
+            } else {
+                let noise_a = Tensor::randn_seeded(
+                    audio_lat.shape().clone(),
+                    0.0,
+                    1.0,
+                    seed_for(cli.seed, 4, step as u64),
+                    device.clone(),
+                )?
+                .to_dtype(DType::F32)?;
+                audio_lat = step_ddim(&a_velocity, &audio_lat, sigma_curr, sigma_next, &noise_a)?;
+            }
         } else {
-            let noise_a = Tensor::randn_seeded(
-                audio_lat.shape().clone(),
-                0.0,
-                1.0,
-                seed_for(cli.seed, 4, step as u64),
-                device.clone(),
-            )?
-            .to_dtype(DType::F32)?;
-            audio_lat = step_ddim(&a_velocity, &audio_lat, sigma_curr, sigma_next, &noise_a)?;
+            // Suppress "unused" by referencing in a_velocity-shape check (no-op).
+            let _ = a_velocity.shape();
         }
 
         // Sanity stats. v_max_abs of state should shrink as denoising. vel_max
@@ -1510,8 +1551,16 @@ fn main() -> Result<()> {
             sr_video_lat
         };
 
-        // Audio noise blend (Wan2GP line 741):
+        // Audio init for SR DiT input — ALWAYS noise-blend, regardless of is_a2v.
+        // Creator video_generate.py:333..336 always blends:
         //   sr_audio = randn * sr_audio_noise_scale + audio * (1 - sr_audio_noise_scale)
+        // The is_a2v=true branch's clean audio_lat is preserved separately at
+        // line 333 (`latent_audio = br_latent_audio.clone()`) for the FINAL
+        // DECODE only — this noised version goes into SR DiT, which was trained
+        // with audio conditioning at this noise level. Earlier code skipped the
+        // blend for is_a2v=true, feeding clean (out-of-distribution) audio to
+        // SR DiT; the resulting cross-attn magnitude mismatch caused frame
+        // jitter / earthquake on dialogue prompts. Fix per audit 2026-05-03.
         let sr_audio_noise_scale_f = cli.sr_audio_noise_scale as f32;
         let n_a = Tensor::randn_seeded(
             audio_lat.shape().clone(),
@@ -1730,7 +1779,11 @@ fn main() -> Result<()> {
         drop(sr_model);
         clear_pool_cache();
 
-        (sr_video_lat, sr_audio_lat)
+        // Creator decodes the post-base audio (saved BEFORE SR noise-blend),
+        // not the noised sr_audio_lat — see video_generate.py:333+357. Even
+        // though we just spent SR steps with sr_audio_lat as input to the SR
+        // DiT, that copy is discarded for decode. Use post-base audio_lat.
+        (sr_video_lat, audio_lat)
     } else {
         (video_lat, audio_lat)
     };
@@ -1760,9 +1813,46 @@ fn main() -> Result<()> {
     )
     .map_err(|e| anyhow!("TurboVAED load: {e}"))?;
     let t_dec = std::time::Instant::now();
-    let video = turbo_vae
-        .decode(&video_lat.to_dtype(DType::BF16)?)
-        .map_err(|e| anyhow!("TurboVAED decode: {e}"))?;
+    let video_bf16 = video_lat.to_dtype(DType::BF16)?;
+    let total_lat_t = video_bf16.shape().dims()[2];
+    let video = if cli.chunk_latent_frames > 0 {
+        // Chunked decode: workaround for the intermittent
+        // CUDA_ERROR_OUT_OF_MEMORY in TurboVAED's multi-chunk sliding-window
+        // path on 24 GB GPUs (turbo_vaed.rs:878). Split the latent into
+        // pieces of `chunk_lt` frames and decode each independently as a
+        // first-chunk decode, then concatenate pixel outputs along axis 2.
+        // Loses cross-chunk overlap blending — small visible seam possible
+        // at boundaries. Logic mirrors `magihuman_decode --chunk-latent-frames`.
+        let chunk_lt = cli.chunk_latent_frames;
+        eprintln!("[decode] chunked path: {total_lat_t} latent frames → chunks of {chunk_lt}");
+        let mut pixel_chunks: Vec<Tensor> = Vec::new();
+        let mut start = 0usize;
+        let mut chunk_idx = 0usize;
+        while start < total_lat_t {
+            let take = (total_lat_t - start).min(chunk_lt);
+            let z_chunk = video_bf16.narrow(2, start, take)?;
+            let t_chunk = std::time::Instant::now();
+            let pix_chunk = turbo_vae
+                .decode(&z_chunk)
+                .map_err(|e| anyhow!("TurboVAED decode chunk {chunk_idx} (lt {start}..{}): {e}", start + take))?;
+            eprintln!(
+                "[decode] chunk {chunk_idx} lt {start}..{} → pix {:?} in {} ms",
+                start + take,
+                pix_chunk.shape().dims(),
+                t_chunk.elapsed().as_millis()
+            );
+            pixel_chunks.push(pix_chunk);
+            start += take;
+            chunk_idx += 1;
+            clear_pool_cache();
+        }
+        let chunk_refs: Vec<&Tensor> = pixel_chunks.iter().collect();
+        Tensor::cat(&chunk_refs, 2)?
+    } else {
+        turbo_vae
+            .decode(&video_bf16)
+            .map_err(|e| anyhow!("TurboVAED decode: {e}"))?
+    };
     eprintln!("[decode] video {} ms shape={:?}", t_dec.elapsed().as_millis(), video.shape().dims());
     drop(turbo_vae);
     clear_pool_cache();

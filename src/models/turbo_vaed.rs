@@ -358,12 +358,23 @@ impl WanResample {
         // Spatial upsample (nearest-exact ≡ nearest at integer factor=2):
         //   permute [B, C, T_out, H, W] → [B, T_out, C, H, W] → [B*T_out, C, H, W]
         //   upsample 2× → conv → permute back
+        let trace = std::env::var("MAGI_TRACE_UPSAMPLE").is_ok();
+        if trace {
+            eprintln!("[wan-up2d] in    [{b},{c},{t_out},{h},{w}]  ({} GB BF16)",
+                (b * c * t_out * h * w * 2) as f64 / 1e9);
+        }
         let x_4d = x_t
             .permute(&[0, 2, 1, 3, 4])?
             .reshape(&[b * t_out, c, h, w])?;
         let x_f32 = x_4d.to_dtype(DType::F32)?;
+        if trace { eprintln!("[wan-up2d] x_4d/x_f32 [{},{},{},{}]", b * t_out, c, h, w); }
         let x_up = GpuOps::upsample2d_nearest(&x_f32, (h * 2, w * 2))?;
         let x_up = x_up.to_dtype(DType::BF16)?;
+        if trace {
+            eprintln!("[wan-up2d] x_up   [{},{},{},{}]  ({} GB BF16)",
+                b * t_out, c, h * 2, w * 2,
+                (b * t_out * c * h * 2 * w * 2 * 2) as f64 / 1e9);
+        }
         let conv_ref = match self {
             WanResample::Upsample2d { conv, .. } => conv,
             WanResample::Upsample3d { conv, .. } => conv,
@@ -372,7 +383,17 @@ impl WanResample {
             WanResample::Upsample2d { out_dim, .. } => *out_dim,
             WanResample::Upsample3d { out_dim, .. } => *out_dim,
         };
-        let x_conv = conv_ref.forward(&x_up)?;
+        let x_conv = conv_ref.forward(&x_up).map_err(|e| {
+            eprintln!(
+                "[wan-up2d] conv2d FAILED: in=[{},{},{},{}] out_dim={out_dim} kind={}",
+                b * t_out, c, h * 2, w * 2,
+                match self { WanResample::Upsample2d { .. } => "2d", WanResample::Upsample3d { .. } => "3d" }
+            );
+            e
+        })?;
+        if trace {
+            eprintln!("[wan-up2d] out    [{},{},{},{}]", b * t_out, out_dim, h * 2, w * 2);
+        }
         x_conv
             .reshape(&[b, t_out, out_dim, h * 2, w * 2])?
             .permute(&[0, 2, 1, 3, 4])
