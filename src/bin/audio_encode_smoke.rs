@@ -31,9 +31,23 @@ fn write_sine_wav(path: &Path, rate: u32, channels: u16, bits: u16, dur_sec: f32
     for i in 0..n_frames {
         let t = i as f32 / rate as f32;
         let v = (t * freq * std::f32::consts::TAU).sin() * 0.5;
-        let i16v = (v * (i16::MAX as f32)) as i16;
-        for _ in 0..channels {
-            w.write_sample(i16v)?;
+        // Per-bit-depth integer encoding. hound's i32 path writes the value
+        // as the appropriate width based on `bits`.
+        match bits {
+            8 => {
+                let s = (v * 127.0) as i32; // ±127 fits 8-bit signed
+                for _ in 0..channels { w.write_sample(s)?; }
+            }
+            16 => {
+                let s = (v * (i16::MAX as f32)) as i16;
+                for _ in 0..channels { w.write_sample(s)?; }
+            }
+            24 | 32 => {
+                let max_abs = (1i64 << (bits - 1)) as f32;
+                let s = (v * max_abs) as i32;
+                for _ in 0..channels { w.write_sample(s)?; }
+            }
+            other => anyhow::bail!("smoke: unsupported test bits {other}"),
         }
     }
     w.finalize()?;
@@ -46,11 +60,12 @@ fn run_case(
     channels: u16,
     dur_sec: f32,
     num_frames: usize,
+    bits: u16,
     sa_vae: &Path,
     device: &Arc<cudarc::driver::CudaDevice>,
 ) -> Result<()> {
     let tmp = std::env::temp_dir().join(format!("smoke_{name}.wav"));
-    let n = write_sine_wav(&tmp, rate, channels, 16, dur_sec, 440.0)?;
+    let n = write_sine_wav(&tmp, rate, channels, bits, dur_sec, 440.0)?;
     eprintln!("[smoke:{name}] wrote {} ({} frames, {} ch, {} Hz, {:.2}s)",
               tmp.display(), n, channels, rate, dur_sec);
     let lat = inference_flame::audio::load_and_encode_audio(&tmp, sa_vae, num_frames, device)?;
@@ -77,22 +92,27 @@ fn main() -> Result<()> {
     println!("audio_encode_smoke — covering common WAV variants");
     println!("============================================================");
 
-    // 1-sec mono @ 44.1 kHz → 1 sec target (25 frames)
-    run_case("1s_mono_44k", 44_100, 1, 1.0, 25, &sa_vae, &device)?;
-    // 1-sec stereo @ 44.1 kHz (downmix → encode)
-    run_case("1s_stereo_44k", 44_100, 2, 1.0, 25, &sa_vae, &device)?;
-    // 1-sec mono @ 48 kHz (different resample ratio)
-    run_case("1s_mono_48k", 48_000, 1, 1.0, 25, &sa_vae, &device)?;
-    // 1-sec mono @ 51.2 kHz (no resample needed)
-    run_case("1s_mono_native", 51_200, 1, 1.0, 25, &sa_vae, &device)?;
-    // 1-sec mono @ 22.05 kHz (low-rate input)
-    run_case("1s_mono_22k", 22_050, 1, 1.0, 25, &sa_vae, &device)?;
-    // 0.5-sec mono — zero-pad to 1-sec target
-    run_case("half_pad_to_1s", 44_100, 1, 0.5, 25, &sa_vae, &device)?;
-    // 2-sec mono — trim to 1-sec target
-    run_case("2s_trim_to_1s", 44_100, 1, 2.0, 25, &sa_vae, &device)?;
-    // 5-sec target (32 latent frames)
-    run_case("5s_mono_44k", 44_100, 1, 5.0, 32, &sa_vae, &device)?;
+    // 1-sec mono @ 44.1 kHz, 16-bit (typical export)
+    run_case("1s_mono_44k_16b",  44_100, 1, 1.0, 25, 16, &sa_vae, &device)?;
+    // 1-sec stereo @ 44.1 kHz, 16-bit
+    run_case("1s_stereo_44k",    44_100, 2, 1.0, 25, 16, &sa_vae, &device)?;
+    // 1-sec mono @ 48 kHz (resample down)
+    run_case("1s_mono_48k_16b",  48_000, 1, 1.0, 25, 16, &sa_vae, &device)?;
+    // 1-sec mono @ 51.2 kHz (no resample)
+    run_case("1s_mono_native",   51_200, 1, 1.0, 25, 16, &sa_vae, &device)?;
+    // 1-sec mono @ 22.05 kHz (resample up)
+    run_case("1s_mono_22k_16b",  22_050, 1, 1.0, 25, 16, &sa_vae, &device)?;
+    // 0.5-sec mono — pad to 1-sec
+    run_case("half_pad_to_1s",   44_100, 1, 0.5, 25, 16, &sa_vae, &device)?;
+    // 2-sec mono — trim to 1-sec
+    run_case("2s_trim_to_1s",    44_100, 1, 2.0, 25, 16, &sa_vae, &device)?;
+    // 5-sec target
+    run_case("5s_mono_44k_16b",  44_100, 1, 5.0, 32, 16, &sa_vae, &device)?;
+    // 8-bit unsigned PCM — regression coverage for the 8-bit shift bug
+    // (was double-shifting hound's already-signed values, max went out of [-1,1])
+    run_case("1s_mono_44k_8b",   44_100, 1, 1.0, 25, 8,  &sa_vae, &device)?;
+    // 24-bit PCM
+    run_case("1s_mono_44k_24b",  44_100, 1, 1.0, 25, 24, &sa_vae, &device)?;
 
     println!();
     println!("ALL CASES PASS");
