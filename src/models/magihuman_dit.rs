@@ -95,7 +95,7 @@ pub(crate) fn mm_rms_norm_single_fused(x_bf16: &Tensor, weight_p1_bf16: &Tensor,
 /// 1 cat. Replaces the ~14-op cascade in `mm_rms_norm_multi`. Inputs must be
 /// BF16; per-modality `weight_p1_bf16[i]` is `(per_modality_gain + 1)` BF16,
 /// pre-computed at layer load time.
-pub(crate) fn mm_rms_norm_multi_fused(
+pub fn mm_rms_norm_multi_fused(
     x_bf16: &Tensor,
     weight_p1_per_modality: &[Tensor; 3],
     group_sizes: &[usize],
@@ -132,7 +132,7 @@ pub(crate) fn precompute_w_plus_1_bf16(weight: &Tensor) -> Result<Tensor> {
 /// Pre-compute three per-modality `(weight_chunk + 1)` BF16 tensors from a
 /// fused `[dim * 3]` weight tensor. Each chunk is stored as a separate
 /// contiguous tensor so the fused kernel can read it directly.
-pub(crate) fn precompute_w_plus_1_bf16_per_modality(weight_full: &Tensor, dim: usize) -> Result<[Tensor; 3]> {
+pub fn precompute_w_plus_1_bf16_per_modality(weight_full: &Tensor, dim: usize) -> Result<[Tensor; 3]> {
     let mut chunks: Vec<Tensor> = Vec::with_capacity(3);
     for i in 0..3 {
         let chunk = weight_full.narrow(0, i * dim, dim)?.contiguous()?;
@@ -186,7 +186,7 @@ pub(crate) fn rope_partial_halfsplit(
 // `group_sizes` slice gives the per-modality count. RMS normalize per token,
 // then apply `(weight_chunk_i + 1)` gain to tokens of modality `i`.
 
-fn mm_rms_norm_multi(
+pub fn mm_rms_norm_multi(
     x: &Tensor,
     weight_full: &Tensor,
     group_sizes: &[usize],

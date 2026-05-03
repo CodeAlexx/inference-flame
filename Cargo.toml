@@ -47,6 +47,10 @@ name = "audio_encode_smoke"
 path = "src/bin/audio_encode_smoke.rs"
 
 [[bin]]
+name = "audio_roundtrip"
+path = "src/bin/audio_roundtrip.rs"
+
+[[bin]]
 name = "wav_probe"
 path = "src/bin/wav_probe.rs"
 
@@ -125,6 +129,18 @@ path = "src/bin/magihuman_adapter_40tok_parity.rs"
 [[bin]]
 name = "magihuman_chain_bisect"
 path = "src/bin/magihuman_chain_bisect.rs"
+
+[[bin]]
+name = "magihuman_layer_isolation"
+path = "src/bin/magihuman_layer_isolation.rs"
+
+[[bin]]
+name = "magihuman_dump_chain_l2"
+path = "src/bin/magihuman_dump_chain_l2.rs"
+
+[[bin]]
+name = "magihuman_rms_compare"
+path = "src/bin/magihuman_rms_compare.rs"
 
 [[bin]]
 name = "magihuman_layer0_bisect"
