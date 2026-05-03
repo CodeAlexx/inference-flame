@@ -28,6 +28,62 @@ use inference_flame::mux::{audio_tensor_to_pcm_i16, video_tensor_to_rgb_u8, writ
 // Minimal args (no clap dep — keep skeleton self-contained)
 // ===========================================================================
 
+fn print_help() {
+    println!(
+        "magihuman_infer — pure-Rust inference for daVinci-MagiHuman talking-head video.
+
+REQUIRED
+  --prompt-embeds-path <FILE>     T5-Gemma-encoded prompt embeds (use scripts/dump_magihuman_t5gemma_embeds.py).
+  --dit-weights        <FILE>     Base DiT (32-step denoising) safetensors.
+
+VIDEO + I2V
+  --image-path         <FILE>     Reference image (PNG/JPG). Center-cropped to target aspect, then resized.
+  --width / --height   <px>       Base video size (default 320x192). Multiple of 32 recommended.
+  --seconds            <int>      Output duration (default 2).
+  --fps                <int>      Output frame rate (default 25).
+  --steps              <int>      Base denoising steps (default 8).
+  --shift              <f64>      Sigma schedule shift (default 5.0).
+  --seed               <u64>      RNG seed (default 42).
+
+CFG (base)
+  --cfg-scale          <f64>      Video CFG (default 1.0 = off; creator base default 5.0).
+  --audio-cfg-scale    <f64>      Audio CFG (default 1.0 = off).
+
+AUDIO
+  --audio-path         <FILE>     WAV file driving talking-head motion. Without this, audio is randn noise
+                                  → animation has no real audio conditioning. Sample rate / mono-stereo handled.
+  --sa-vae-weights     <FILE>     Stable Audio Open 1.0 VAE (Oobleck) safetensors. Used to encode the WAV.
+
+SR PHASE 2 (1080p / 540p refinement) — only runs if --sr-weights given
+  --sr-weights         <FILE>     SR DiT (transformer2) safetensors. Optional.
+  --sr-width / --sr-height <px>   SR pixel size (default 1920x1088).
+  --sr-steps           <int>      SR UniPC steps (default 5; pass 1 for clean short HD without magnitude artifacts).
+  --sr-noise-value     <int>      Index into ZeroSNR sigma table for init noise (default 220, sigma≈0.839).
+  --sr-audio-noise-scale <f64>    Audio noise blend at SR start (default 0.7).
+  --sr-cfg-scale       <f64>      SR CFG. Default 1.0 = matches creator's official sr_1080p config (no CFG).
+                                  Set 3.5 for creator's sr_cfg_number=2 variant; cfg_trick auto-applies.
+  --sr-cfg-trick-frame <int>      Latent frames < this use --sr-cfg-trick-value (default 13).
+  --sr-cfg-trick-value <f64>      CFG scale for early frames (default 2.0). Only matters when sr_cfg_scale > 1.0.
+
+VAE WEIGHTS (defaults usually OK)
+  --turbo-vaed-weights <FILE>     TurboVAED decoder.
+  --wan-vae-weights    <FILE>     Wan2.2 VAE encoder for reference image.
+
+DIAGNOSTICS (env vars, optional)
+  MAGI_LOAD_BASE_LATENT=<file>    Load video_lat + audio_lat from a saved fixture, skip the base loop.
+  MAGI_DUMP_FINAL_LATENT=<file>   Save post-base / pre-SR latent for off-line decoder parity tests.
+  MAGI_DUMP_PRE_DECODE_LATENT=<file>
+  MAGI_DUMP_SR_INTERMEDIATES=<file>  Save SR DiT per-layer hooks for parity bisection.
+  MAGI_DUMP_SR_UNIPC=<file>          Save SR UniPC per-step (sample_in, velocity, sample_out, sigmas).
+  MAGI_FORCE_DDIM=1               Use step_ddim instead of UniPC for SR (debugging only — DDIM is worse).
+
+OUTPUT
+  --out                <FILE>     Output mp4 path (default magihuman_out.mp4).
+
+Pass `--help` or `-h` for this message."
+    );
+}
+
 struct Cli {
     prompt_embeds_path: PathBuf,
     image_path: Option<PathBuf>,
@@ -116,6 +172,10 @@ impl Cli {
         let mut it = std::env::args().skip(1);
         while let Some(arg) = it.next() {
             match arg.as_str() {
+                "--help" | "-h" => {
+                    print_help();
+                    std::process::exit(0);
+                }
                 "--prompt-embeds-path" => prompt_embeds_path = it.next().map(PathBuf::from),
                 "--image-path" => image_path = it.next().map(PathBuf::from),
                 "--width" => width = it.next().unwrap().parse()?,
