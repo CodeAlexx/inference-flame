@@ -28,6 +28,10 @@ env_logger = "0.10"
 rand = "0.8.5"
 log = "0.4"
 image = "0.24"
+# Audio I/O for MagiHuman talking-head conditioning. hound: WAV read/write.
+# rubato: Sinc resampling to model-expected 51200 Hz from arbitrary input rate.
+hound = "3.5"
+rubato = "0.16"
 
 [features]
 default = ["cuda", "bf16_u16"]
@@ -37,6 +41,10 @@ bf16_u16 = []
 # inference. Off by default — enables `src/turbo/`, the
 # `klein9b_infer_turbo` binary, and the `turbo_*` test suite.
 turbo = []
+
+[[bin]]
+name = "audio_encode_smoke"
+path = "src/bin/audio_encode_smoke.rs"
 
 [[bin]]
 name = "bench_flame"

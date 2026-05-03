@@ -60,6 +60,12 @@ struct Cli {
     cfg_scale: f64,
     audio_cfg_scale: f64,
     sr_cfg_scale: f64,
+    // Optional WAV file to drive talking-head motion. Without this audio_lat
+    // is `randn_seeded` random noise → animation has no audio conditioning,
+    // which is why the talking-head identity drifts and mouth motion is
+    // disconnected from anything meaningful. With audio, the model's
+    // audio cross-attention can drive lip-sync + expression.
+    audio_path: Option<PathBuf>,
     // SR `cfg_trick`: creator's pipeline (see video_generate.py:415..418)
     // applies a lower CFG for the first `sr_cfg_trick_frame` LATENT frames,
     // then jumps to `sr_cfg_scale` for the rest. Creator defaults are
@@ -106,6 +112,7 @@ impl Cli {
         let mut sr_cfg_scale = 1.0f64;
         let mut sr_cfg_trick_frame = 13usize;
         let mut sr_cfg_trick_value = 2.0f64;
+        let mut audio_path: Option<PathBuf> = None;
         let mut it = std::env::args().skip(1);
         while let Some(arg) = it.next() {
             match arg.as_str() {
@@ -134,6 +141,7 @@ impl Cli {
                 "--sr-cfg-scale" => sr_cfg_scale = it.next().unwrap().parse()?,
                 "--sr-cfg-trick-frame" => sr_cfg_trick_frame = it.next().unwrap().parse()?,
                 "--sr-cfg-trick-value" => sr_cfg_trick_value = it.next().unwrap().parse()?,
+                "--audio-path" => audio_path = it.next().map(PathBuf::from),
                 other => anyhow::bail!("unknown arg: {other}"),
             }
         }
@@ -146,6 +154,7 @@ impl Cli {
             sr_weights, sr_width, sr_height, sr_steps,
             sr_noise_value, sr_audio_noise_scale,
             cfg_scale, audio_cfg_scale, sr_cfg_scale,
+            audio_path,
             sr_cfg_trick_frame, sr_cfg_trick_value,
         })
     }
@@ -1013,14 +1022,37 @@ fn main() -> Result<()> {
         device.clone(),
     )?
     .to_dtype(DType::F32)?;
-    let mut audio_lat = Tensor::randn_seeded(
-        Shape::from_dims(&[1, num_frames, AUDIO_IN_CHANNELS]),
-        0.0,
-        1.0,
-        seed_for(cli.seed, 2, 0),
-        device.clone(),
-    )?
-    .to_dtype(DType::F32)?;
+    let mut audio_lat = if let Some(audio_path) = cli.audio_path.as_ref() {
+        // Pure-Rust path: WAV → 51,200 Hz resample → SA Open VAE encode →
+        // bottleneck-mean → [1, num_frames, 64].
+        let lat = inference_flame::audio::load_and_encode_audio(
+            audio_path,
+            &cli.sa_vae_weights,
+            num_frames,
+            &device,
+        )?;
+        // Verify shape — load_and_encode_audio already does this but
+        // belt-and-suspenders for the pack_inputs assertion.
+        let d = lat.shape().dims();
+        if d != [1, num_frames, AUDIO_IN_CHANNELS] {
+            anyhow::bail!(
+                "audio_lat shape {:?}, expected [1, {}, {}]",
+                d,
+                num_frames,
+                AUDIO_IN_CHANNELS
+            );
+        }
+        lat
+    } else {
+        Tensor::randn_seeded(
+            Shape::from_dims(&[1, num_frames, AUDIO_IN_CHANNELS]),
+            0.0,
+            1.0,
+            seed_for(cli.seed, 2, 0),
+            device.clone(),
+        )?
+        .to_dtype(DType::F32)?
+    };
 
     // --- i2v reference: encode image → first-frame conditioning latent.
     //     Done BEFORE the DiT load so the VAE encoder's weights are freed

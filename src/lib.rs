@@ -1,3 +1,4 @@
+pub mod audio;
 pub mod vae;
 pub mod models;
 pub mod sampling;
