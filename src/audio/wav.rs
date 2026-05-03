@@ -56,10 +56,13 @@ pub fn load_wav_f32(path: &Path) -> Result<(Vec<f32>, u32, u16)> {
                 .map_err(|e| anyhow!("read i32 samples: {e}"))?
         }
         (SampleFormat::Int, 8) => {
+            // hound's `samples::<i32>` for 8-bit WAV reads each byte and
+            // applies `signed_from_u8` internally — values are already in
+            // [-128, 127]. Scale by 1/127.
             let scale = 1.0f32 / (i8::MAX as f32);
             reader
                 .samples::<i32>()
-                .map(|s| s.map(|v| ((v - 128) as f32) * scale))
+                .map(|s| s.map(|v| (v as f32) * scale))
                 .collect::<std::result::Result<Vec<f32>, _>>()
                 .map_err(|e| anyhow!("read 8-bit samples: {e}"))?
         }

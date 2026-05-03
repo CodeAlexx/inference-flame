@@ -47,6 +47,10 @@ name = "audio_encode_smoke"
 path = "src/bin/audio_encode_smoke.rs"
 
 [[bin]]
+name = "wav_probe"
+path = "src/bin/wav_probe.rs"
+
+[[bin]]
 name = "bench_flame"
 path = "bench/bench_flame.rs"
 
