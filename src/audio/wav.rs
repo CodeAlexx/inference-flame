@@ -9,6 +9,18 @@ use anyhow::{anyhow, Result};
 use hound::{SampleFormat, WavReader};
 use std::path::Path;
 
+/// Probe a WAV header and return `(duration_seconds, sample_rate, channels)`
+/// without decoding any samples. Useful when you need to derive video length
+/// from audio length BEFORE running the full load+encode pipeline.
+pub fn probe_duration(path: &Path) -> Result<(f64, u32, u16)> {
+    let reader = WavReader::open(path)
+        .map_err(|e| anyhow!("hound::WavReader::open({}): {e}", path.display()))?;
+    let spec = reader.spec();
+    let frames_per_channel = reader.duration() as f64; // hound returns frames (per channel)
+    let dur_sec = frames_per_channel / spec.sample_rate as f64;
+    Ok((dur_sec, spec.sample_rate, spec.channels))
+}
+
 /// Returns `(samples, sample_rate, channels)`.
 /// `samples` is interleaved across channels (frame-major: `[ch0_t0, ch1_t0, ch0_t1, ch1_t1, ...]`).
 pub fn load_wav_f32(path: &Path) -> Result<(Vec<f32>, u32, u16)> {

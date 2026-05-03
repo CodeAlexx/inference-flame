@@ -993,7 +993,26 @@ fn main() -> Result<()> {
     let device = global_cuda_device();
 
     // --- Resolve shapes ---
-    let num_frames = cli.seconds * cli.fps + 1; // matches video_generate.py
+    // When --audio-path is given, derive num_frames from the audio duration to
+    // match creator behavior (video_generate.py:271..278: num_frames =
+    // latent_audio.shape[1] when audio is provided). Otherwise use --seconds.
+    let num_frames = if let Some(audio_path) = cli.audio_path.as_ref() {
+        let (dur_sec, native_rate, native_ch) = inference_flame::audio::wav::probe_duration(audio_path)?;
+        // After resample to 51_200 Hz and 2048× downsample: T_lat = round(dur * 51200 / 2048) = round(dur * 25).
+        let derived = (dur_sec * 25.0).round() as usize;
+        let from_seconds = cli.seconds * cli.fps + 1;
+        if derived != from_seconds {
+            eprintln!(
+                "[audio] WAV {} ({:.3}s, {} ch, {} Hz) → num_frames={} \
+                 (overrides --seconds {} which would give {})",
+                audio_path.display(), dur_sec, native_ch, native_rate,
+                derived, cli.seconds, from_seconds,
+            );
+        }
+        derived.max(1)
+    } else {
+        cli.seconds * cli.fps + 1
+    };
     let latent_t = (num_frames - 1) / VAE_STRIDE_T + 1;
     let latent_h = (cli.height / VAE_STRIDE_HW / HW_PATCH) * HW_PATCH;
     let latent_w = (cli.width / VAE_STRIDE_HW / HW_PATCH) * HW_PATCH;
