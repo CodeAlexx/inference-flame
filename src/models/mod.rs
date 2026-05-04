@@ -19,6 +19,7 @@ pub mod flux1_dit;
 pub mod chroma_dit;
 pub mod qwenimage_dit;
 pub mod ltx2_upsampler;
+pub mod ltx2_temporal_upsampler;
 pub mod turbo_vaed;
 pub mod sa_audio_vae;
 pub mod magihuman_dit;
