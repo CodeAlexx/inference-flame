@@ -411,6 +411,10 @@ name = "ltx2_generate_ms"
 path = "src/bin/ltx2_generate_ms.rs"
 
 [[bin]]
+name = "ltx2_validate"
+path = "src/bin/ltx2_validate.rs"
+
+[[bin]]
 name = "klein9b_infer_turbo"
 path = "src/bin/klein9b_infer_turbo.rs"
 required-features = ["turbo"]

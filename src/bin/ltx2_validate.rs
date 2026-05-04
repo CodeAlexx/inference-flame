@@ -198,15 +198,35 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             println!("    Rel err: max={:.4} p99={:.4} p95={:.4} median={:.4}",
                 rel_errs[0], rel_errs[n/100], rel_errs[n/20], rel_errs[n/2]);
         }
-        // BF16 cross-impl tolerance: max err grows with block depth
-        // due to accumulated rounding. p95 should stay under ~1.0.
-        // BF16 cross-impl tolerance. Different GEMM backends (cublasLt strided
-        // batched vs cuBLAS regular) produce slightly different rounding.
-        // Max outlier can reach ~170 but p95 stays under 1.0.
-        let pass = output_err < 200.0;
+        // Compute p95 alongside max — p95 is the meaningful BF16 cross-impl
+        // tolerance (max can have legitimate outliers from cuBLASLt strided
+        // batched vs cuBLAS regular GEMM rounding, but p95 must stay tight).
+        //
+        // Pass criteria (parity-grade, per audit finding 20):
+        //   p95 < 1.0      — accumulated BF16 rounding ceiling
+        //   max < 50.0     — hard cap on any single outlier; the previous
+        //                    `max < 200.0` was meaningless (the audit notes
+        //                    real outliers reach ~170 only on the deepest
+        //                    blocks, so `< 200` could not detect any
+        //                    plausible bug — including the bugs Phase 0 was
+        //                    supposed to catch).
+        // TODO PARITY: tighten further (max < 5.0, p95 < 0.1) once the
+        // flame-core regression that drives e2e noise output is fixed and
+        // a fresh Python reference dump is generated.
+        let p95_err = {
+            let diff = a_minus_b_abs(&x, &ref_output)?;
+            let mut data = diff;
+            data.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            // p95 = 95th percentile (index = 0.95 * n)
+            let idx = (data.len() as f32 * 0.95) as usize;
+            data.get(idx).copied().unwrap_or(0.0)
+        };
+        let pass = p95_err < 1.0 && output_err < 50.0;
         let status = if pass { "PASS" } else { "FAIL" };
 
-        println!("Block {i:2}: in_err={input_err:.6} out_err={output_err:.6} [{status}]");
+        println!(
+            "Block {i:2}: in_err={input_err:.6} out_max={output_err:.6} out_p95={p95_err:.6} [{status}]"
+        );
 
         if !pass { all_pass = false; }
         if output_err > max_err { max_err = output_err; }
@@ -248,4 +268,13 @@ fn max_abs_diff(a: &Tensor, b: &Tensor) -> std::result::Result<f32, Box<dyn std:
     let data = abs_diff.to_vec()?;
     let max_val = data.iter().cloned().fold(0.0f32, f32::max);
     Ok(max_val)
+}
+
+/// Returns the per-element |a - b| as a host Vec (used for percentile stats).
+fn a_minus_b_abs(a: &Tensor, b: &Tensor) -> std::result::Result<Vec<f32>, Box<dyn std::error::Error>> {
+    let a_f32 = a.to_dtype(DType::F32)?;
+    let b_f32 = b.to_dtype(DType::F32)?;
+    let diff = a_f32.sub(&b_f32)?;
+    let abs_diff = diff.abs()?;
+    Ok(abs_diff.to_vec()?)
 }
