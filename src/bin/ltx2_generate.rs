@@ -30,7 +30,7 @@ use inference_flame::models::gemma3_encoder::Gemma3Encoder;
 use inference_flame::models::feature_extractor;
 use inference_flame::models::lora_loader::LoraWeights;
 use inference_flame::models::ltx2_model::{LTX2Config, LTX2StreamingModel};
-use inference_flame::sampling::ltx2_sampling::{build_dev_sigma_schedule, LTX2_DISTILLED_SIGMAS};
+use inference_flame::sampling::ltx2_sampling::{linear_quadratic_schedule, LTX2_DISTILLED_SIGMAS};
 use flame_core::{global_cuda_device, Shape, Tensor};
 use std::time::Instant;
 
@@ -403,7 +403,19 @@ fn main() -> anyhow::Result<()> {
         // Distilled: use fixed sigma schedule
         LTX2_DISTILLED_SIGMAS.to_vec()
     } else {
-        build_dev_sigma_schedule(NUM_STEPS, num_tokens, 0.5, 1.15, 0.0)
+        // CFG / dev path: Lightricks canonical `linear_quadratic_schedule`
+        // (parity-verified by `bin/ltx2_sigma_parity`). Previously this was
+        // `build_dev_sigma_schedule(NUM_STEPS, num_tokens, 0.5, 1.15, 0.0)`,
+        // a Flux-style exponential — wrong curve; dev checkpoint was trained
+        // against linear-quadratic. `num_tokens` was only used by the old
+        // function and is now unused on this path.
+        // TODO PARITY: when the LTX-2 (LTX2Scheduler / token-shift) path
+        // is wired into ltx2_generate, switch to that for LTX-2 dev. For
+        // 0.9.8-dev / LTX-Video this `linear_quadratic_schedule(N, 0.025)`
+        // is the canonical schedule and parity-verified.
+        let mut s = linear_quadratic_schedule(NUM_STEPS, 0.025);
+        s.push(0.0); // Euler step needs a trailing 0 terminator
+        s
     };
     println!("  Noise: {:?}", noise.dims());
     println!("  Sigmas: {:?}", sigmas);
