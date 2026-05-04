@@ -475,7 +475,21 @@ impl ClipEncoder {
             .iter()
             .position(|&id| id == cfg.eos_token_id)
             .unwrap_or(seq_len - 1);
-        let pooled = normed.narrow(1, eos_pos, 1)?.squeeze(Some(1))?;
+        let pooled_pre_proj = normed.narrow(1, eos_pos, 1)?.squeeze(Some(1))?;
+
+        // SD3 / SDXL: CLIP-G applies `text_projection` to pooler_output to
+        // produce `text_embeds`. CLIP-L doesn't ship a text_projection in
+        // the SD3 CLIP-L safetensors, so we fall back to raw pooler_output.
+        // Without this, CLIP-G pooled has wrong scale → y_emb has outliers
+        // (e.g. max_abs ~32) → adaLN modulation explodes → SD3.5 Large hidden
+        // state blows up in block 0 → uniform-color output.
+        let pooled = if let Ok(proj_w) = self.w("text_projection.weight") {
+            let x3 = pooled_pre_proj.unsqueeze(1)?; // [1, 1, C]
+            let y = Self::linear(&x3, proj_w, None)?; // [1, 1, C_out]
+            y.squeeze(Some(1))? // [1, C_out]
+        } else {
+            pooled_pre_proj
+        };
 
         Ok((penultimate_hidden.unwrap(), pooled))
     }

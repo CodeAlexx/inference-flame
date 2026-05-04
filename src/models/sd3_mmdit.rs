@@ -34,6 +34,7 @@
 use flame_core::attention::sdpa;
 use flame_core::conv::Conv2d;
 use flame_core::layer_norm::layer_norm;
+use flame_core::norm::rms_norm;
 use flame_core::serialization::load_file_filtered;
 use flame_core::{DType, Error, Result, Shape, Tensor};
 use std::collections::HashMap;
@@ -241,8 +242,15 @@ impl SD3MMDiT {
         let out_features = weight.shape().dims()[0];
 
         let x_2d = x.reshape(&[batch, in_features])?;
-        let wt = transpose_2d(weight)?;
-        let out_2d = x_2d.matmul(&wt)?;
+        // Compute x @ weight.T via cuBLASLt with TRANSB=T directly.
+        // The previous `permute([1,0]).contiguous().matmul(...)` path produced
+        // numerically wrong output for SD3.5 Large's [14592, 2432] adaLN
+        // weight, causing block-0 hidden state to explode ~5000× → uniform
+        // color final image. matmul_bf16_trans avoids the permute+materialize.
+        let out_2d = flame_core::ops::gemm_bf16::matmul_bf16_trans(
+            &x_2d, weight, false, true,
+        )?;
+
         let out_2d = match self.lora {
             Some(ref lora) => lora.apply(weight_key, &x_2d, out_2d)?,
             None => out_2d,
@@ -460,9 +468,9 @@ impl SD3MMDiT {
         let flat = x.reshape(&[b * h * n, d])?;
         let weight = self.w(&format!("{prefix}.weight"))?;
         let dim = weight.shape().dims()[0];
-        // SD3.5 Medium QK norm has no bias; Large has bias.
-        let bias = self.w(&format!("{prefix}.bias")).ok();
-        let normed = layer_norm(&flat, &[dim], Some(weight), bias, 1e-6)?;
+        // SD3.5 (medium + large) uses RMSNorm for ln_q/ln_k per ComfyUI MMDiT
+        // (qk_norm="rms"). The previous LayerNorm path was incorrect.
+        let normed = rms_norm(&flat, &[dim], Some(weight), 1e-6)?;
         normed.reshape(&[b, h, n, d])
     }
 

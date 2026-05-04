@@ -156,9 +156,6 @@ fn parse_args() -> anyhow::Result<Args> {
         }
         i += 1;
     }
-    if a.lora.as_os_str().is_empty() {
-        anyhow::bail!("--lora is required");
-    }
     if a.prompt.is_empty() {
         anyhow::bail!("--prompt is required");
     }
@@ -360,16 +357,20 @@ fn main() -> anyhow::Result<()> {
     // ------------------------------------------------------------------
     // Stage C: LoRA stack → set_lora.
     // ------------------------------------------------------------------
-    println!("\n--- Stage C: Loading LoRA ---");
-    let t0 = Instant::now();
-    let lora_path_str = args.lora.to_str().ok_or_else(|| anyhow::anyhow!("lora path utf8"))?;
-    let stack = LoraStack::load(lora_path_str, &base_keys, args.multiplier, &device)?;
-    println!(
-        "  loaded {} target weight(s) in {:.1}s",
-        stack.target_count(),
-        t0.elapsed().as_secs_f32()
-    );
-    model.set_lora(Arc::new(stack));
+    if !args.lora.as_os_str().is_empty() {
+        println!("\n--- Stage C: Loading LoRA ---");
+        let t0 = Instant::now();
+        let lora_path_str = args.lora.to_str().ok_or_else(|| anyhow::anyhow!("lora path utf8"))?;
+        let stack = LoraStack::load(lora_path_str, &base_keys, args.multiplier, &device)?;
+        println!(
+            "  loaded {} target weight(s) in {:.1}s",
+            stack.target_count(),
+            t0.elapsed().as_secs_f32()
+        );
+        model.set_lora(Arc::new(stack));
+    } else {
+        println!("\n--- Stage C: No LoRA — base inference ---");
+    }
 
     // ------------------------------------------------------------------
     // Stage D: Build noise + denoise (rectified flow, linear sigmas).
