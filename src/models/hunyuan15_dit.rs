@@ -236,51 +236,60 @@ impl Hunyuan15Dit {
         Ok((cos_t, sin_t))
     }
 
-    /// Apply rotary embedding (use_real=True mode).
-    /// x: [B, S, H, D], freqs_cos/sin: [S_img, D/2]
-    /// Only applied to image tokens (first img_len tokens), text tokens unchanged.
+    /// Apply rotary embedding (HunyuanVideo half-split / `rotate_half` convention).
+    ///
+    /// x: `[B, S, H, D]` BF16 — caller passes the full image stream pre-permute.
+    ///   S must equal `img_len` (text tokens are handled outside, with no RoPE).
+    /// freqs_cos / freqs_sin: `[S_img, D/2]` BF16.
+    ///
+    /// Internally permutes to `[B, H, N, D]`, calls the GPU
+    /// `rope_halfsplit_bf16` kernel, and permutes back to `[B, S, H, D]`.
+    /// Eliminates the host-CPU F32 round-trip that previously dominated cost
+    /// per double-stream block.
     fn apply_rope(
         x: &Tensor,
         freqs_cos: &Tensor,
         freqs_sin: &Tensor,
         img_len: usize,
-        device: &Arc<CudaDevice>,
+        _device: &Arc<CudaDevice>,
     ) -> Result<Tensor> {
         let dims = x.shape().dims().to_vec();
         let (b, s, h, d) = (dims[0], dims[1], dims[2], dims[3]);
+        debug_assert_eq!(s, img_len, "apply_rope: S must equal img_len (text gets no RoPE)");
         let half = d / 2;
 
-        let x_f32 = x.to_dtype(DType::F32)?;
-        let x_data = x_f32.to_vec1::<f32>()?;
-        let cos_data = freqs_cos.to_vec1::<f32>()?;
-        let sin_data = freqs_sin.to_vec1::<f32>()?;
-        let cos_half = freqs_cos.shape().dims()[1]; // D/2
+        // Reshape cos/sin to [1, 1, N, half] as the kernel expects (cos_bh=1).
+        let cos = freqs_cos.reshape(&[1, 1, s, half])?;
+        let sin = freqs_sin.reshape(&[1, 1, s, half])?;
 
-        let mut out = x_data.clone();
+        // [B, S, H, D] → [B, H, S, D] (kernel layout).
+        // Use .contiguous() to force a fresh dense tensor — the rope kernel
+        // expects flat row-major and the BF16 reshape inside it would error
+        // on a permuted view.
+        let x_bhnd = x.permute(&[0, 2, 1, 3])?.contiguous()?;
 
-        for bi in 0..b {
-            for si in 0..img_len.min(s) {
-                for hi in 0..h {
-                    let base = bi * s * h * d + si * h * d + hi * d;
-                    // use_real=True: x_rotated = x[..., :half]*cos - x[..., half:]*sin,
-                    //                             x[..., :half]*sin + x[..., half:]*cos
-                    // Then interleave: out[..., 0::2] = rotated_first, out[..., 1::2] = rotated_second
-                    // Actually HunyuanVideo uses: x1, x2 = x.chunk(2, dim=-1)
-                    //   out = cat(x1*cos - x2*sin, x1*sin + x2*cos, dim=-1)
-                    for i in 0..half.min(cos_half) {
-                        let x1 = out[base + i];
-                        let x2 = out[base + half + i];
-                        let c = cos_data[si * cos_half + i];
-                        let s_val = sin_data[si * cos_half + i];
-                        out[base + i] = x1 * c - x2 * s_val;
-                        out[base + half + i] = x1 * s_val + x2 * c;
-                    }
-                }
-            }
-        }
+        // Fused half-split RoPE on GPU.
+        let out_bhnd = flame_core::bf16_ops::rope_halfsplit_bf16(&x_bhnd, &cos, &sin)?;
 
-        Tensor::from_vec(out, Shape::from_dims(&dims), device.clone())?
-            .to_dtype(DType::BF16)
+        // [B, H, S, D] → [B, S, H, D]
+        out_bhnd.permute(&[0, 2, 1, 3])?.contiguous()
+    }
+
+    /// gelu_tanh: `0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))`.
+    /// Matches PyTorch `F.gelu(approximate='tanh')` and HunyuanVideo's MLP
+    /// activation. Uses existing flame-core BF16 elementwise ops; no new kernel.
+    fn gelu_tanh(x: &Tensor) -> Result<Tensor> {
+        // c = sqrt(2 / pi) ≈ 0.7978845608028654
+        const C: f32 = 0.7978845608028654;
+        const K: f32 = 0.044715;
+        let x_sq = x.mul(x)?;
+        let x_cu = x_sq.mul(x)?;
+        // inner = c * (x + k * x^3)
+        let inner = x.add(&x_cu.mul_scalar(K)?)?.mul_scalar(C)?;
+        let t = inner.tanh()?;
+        // 0.5 * x * (1 + tanh(...))
+        let gate = t.add_scalar(1.0)?.mul_scalar(0.5)?;
+        x.mul(&gate)
     }
 
     // -----------------------------------------------------------------------
@@ -520,7 +529,7 @@ impl Hunyuan15Dit {
         let img_mlp_in = img_normed2.mul(&img_sc2.add_scalar(1.0)?.unsqueeze(1)?)?
             .add(&img_s2.unsqueeze(1)?)?;
         let img_mlp = Self::linear_bias(&img_mlp_in, w("img_mlp.fc1.weight")?, w("img_mlp.fc1.bias")?)?;
-        let img_mlp = img_mlp.gelu()?;
+        let img_mlp = Self::gelu_tanh(&img_mlp)?;
         let img_mlp = Self::linear_bias(&img_mlp, w("img_mlp.fc2.weight")?, w("img_mlp.fc2.bias")?)?;
         let img = img.add(&img_mlp.mul(&img_g2.unsqueeze(1)?)?)?;
 
@@ -532,7 +541,7 @@ impl Hunyuan15Dit {
         let txt_mlp_in = txt_normed2.mul(&txt_sc2.add_scalar(1.0)?.unsqueeze(1)?)?
             .add(&txt_s2.unsqueeze(1)?)?;
         let txt_mlp = Self::linear_bias(&txt_mlp_in, w("txt_mlp.fc1.weight")?, w("txt_mlp.fc1.bias")?)?;
-        let txt_mlp = txt_mlp.gelu()?;
+        let txt_mlp = Self::gelu_tanh(&txt_mlp)?;
         let txt_mlp = Self::linear_bias(&txt_mlp, w("txt_mlp.fc2.weight")?, w("txt_mlp.fc2.bias")?)?;
         let txt = txt.add(&txt_mlp.mul(&txt_g2.unsqueeze(1)?)?)?;
 
