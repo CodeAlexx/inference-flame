@@ -128,7 +128,11 @@ impl TurboCausalConv3d {
             let last_frame = x.narrow(2, last_idx, 1)?.contiguous()?;
             let pad_left = first_frame.repeat_axis_device(2, self.time_pad)?;
             let pad_right = last_frame.repeat_axis_device(2, self.time_pad)?;
-            Tensor::cat(&[&pad_left, x, &pad_right], 2)?.contiguous()?
+            // flame-core's Tensor::cat contract: output is always row-major
+            // contiguous (release-time assert in flame-core, commit c62a91b).
+            // The previous .contiguous()? after cat was a stopgap from before
+            // the contract was made explicit.
+            Tensor::cat(&[&pad_left, x, &pad_right], 2)?
         } else {
             x.clone()
         };
