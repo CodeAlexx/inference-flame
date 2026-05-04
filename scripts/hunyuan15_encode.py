@@ -43,6 +43,12 @@ def main():
     parser.add_argument("--width", type=int, default=480)
     parser.add_argument("--height", type=int, default=272)
     parser.add_argument("--frames", type=int, default=17)
+    parser.add_argument(
+        "--negative",
+        type=str,
+        default="",
+        help="Negative prompt for CFG. Empty string disables uncond emission.",
+    )
     args = parser.parse_args()
 
     device = "cuda"
@@ -53,7 +59,7 @@ def main():
     print()
 
     # ------------------------------------------------------------------
-    # 1. Encode text with Qwen2.5-VL
+    # 1. Encode text with Qwen2.5-VL (cond + optional uncond for CFG)
     # ------------------------------------------------------------------
     print("--- Loading Qwen2.5-VL tokenizer + encoder ---")
     t0 = time.time()
@@ -66,26 +72,30 @@ def main():
     text_encoder.eval()
     print(f"  Loaded in {time.time() - t0:.1f}s")
 
-    # Format prompt
-    formatted = PROMPT_TEMPLATE.format(args.prompt)
-    tokens = tokenizer(
-        [formatted],
-        max_length=512,
-        padding="max_length",
-        truncation=True,
-        return_tensors="pt",
-    ).to(device)
+    def _encode(prompt_str: str):
+        formatted_ = PROMPT_TEMPLATE.format(prompt_str)
+        tokens_ = tokenizer(
+            [formatted_],
+            max_length=512,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt",
+        ).to(device)
+        with torch.no_grad():
+            out_ = text_encoder(
+                input_ids=tokens_.input_ids,
+                attention_mask=tokens_.attention_mask,
+                output_hidden_states=True,
+            )
+        return out_.hidden_states[-1], tokens_.attention_mask
 
-    with torch.no_grad():
-        out = text_encoder(
-            input_ids=tokens.input_ids,
-            attention_mask=tokens.attention_mask,
-            output_hidden_states=True,
-        )
-    # Use last hidden state
-    text_hidden = out.hidden_states[-1]  # [1, 512, 3584]
-    text_mask = tokens.attention_mask  # [1, 512]
-    print(f"  text_hidden: {tuple(text_hidden.shape)}")
+    text_hidden, text_mask = _encode(args.prompt)
+    print(f"  text_hidden (cond): {tuple(text_hidden.shape)}")
+
+    use_uncond = bool(args.negative is not None)  # always emit uncond (default = "")
+    if use_uncond:
+        uncond_hidden, uncond_mask = _encode(args.negative)
+        print(f"  text_hidden (uncond): {tuple(uncond_hidden.shape)}")
 
     del text_encoder
     torch.cuda.empty_cache()
@@ -144,61 +154,72 @@ def main():
 
     c = timestep_aware + context_aware  # [1, 2048]
 
-    # input_embedder: Linear(3584, 2048)
-    ie_w = txt_in_keys["txt_in.input_embedder.weight"]
-    ie_b = txt_in_keys["txt_in.input_embedder.bias"]
-    x = torch.nn.functional.linear(text_hidden.to(dtype), ie_w, ie_b)  # [1, 512, 2048]
+    def _refine(text_hidden_in, text_mask_in):
+        # c_embedder: TextProjection(3584, 2048)
+        mask_float = text_mask_in.float().unsqueeze(-1)
+        context_mean = (text_hidden_in * mask_float).sum(dim=1) / mask_float.sum(dim=1)
+        context_aware = torch.nn.functional.silu(
+            torch.nn.functional.linear(context_mean.to(dtype), c_w1, c_b1)
+        )
+        context_aware = torch.nn.functional.linear(context_aware, c_w2, c_b2)  # [1, 2048]
+        c_local = timestep_aware + context_aware
 
-    # Individual token refiner: 2 blocks
-    mask_bool = text_mask.bool()
-    mask_bool[:, 0] = True  # prevent NaN
+        # input_embedder
+        ie_w = txt_in_keys["txt_in.input_embedder.weight"]
+        ie_b = txt_in_keys["txt_in.input_embedder.bias"]
+        x_local = torch.nn.functional.linear(text_hidden_in.to(dtype), ie_w, ie_b)
 
-    for block_idx in range(2):
-        bp = f"txt_in.individual_token_refiner.blocks.{block_idx}"
-        # adaLN_modulation(c) → gate_msa, gate_mlp
-        ada_w = txt_in_keys[f"{bp}.adaLN_modulation.1.weight"]
-        ada_b = txt_in_keys[f"{bp}.adaLN_modulation.1.bias"]
-        gates = torch.nn.functional.linear(torch.nn.functional.silu(c), ada_w, ada_b)
-        gate_msa, gate_mlp = gates.chunk(2, dim=1)  # each [1, 2048]
+        for block_idx in range(2):
+            bp = f"txt_in.individual_token_refiner.blocks.{block_idx}"
+            ada_w = txt_in_keys[f"{bp}.adaLN_modulation.1.weight"]
+            ada_b = txt_in_keys[f"{bp}.adaLN_modulation.1.bias"]
+            gates = torch.nn.functional.linear(torch.nn.functional.silu(c_local), ada_w, ada_b)
+            gate_msa, gate_mlp = gates.chunk(2, dim=1)
 
-        # norm1 → self_attn
-        n1_w = txt_in_keys[f"{bp}.norm1.weight"]
-        n1_b = txt_in_keys[f"{bp}.norm1.bias"]
-        norm_x = torch.nn.functional.layer_norm(x.float(), [dim], n1_w.float(), n1_b.float()).to(dtype)
+            n1_w = txt_in_keys[f"{bp}.norm1.weight"]
+            n1_b = txt_in_keys[f"{bp}.norm1.bias"]
+            norm_x = torch.nn.functional.layer_norm(
+                x_local.float(), [dim], n1_w.float(), n1_b.float()
+            ).to(dtype)
 
-        qkv_w = txt_in_keys[f"{bp}.self_attn_qkv.weight"]
-        qkv_b = txt_in_keys[f"{bp}.self_attn_qkv.bias"]
-        qkv = torch.nn.functional.linear(norm_x, qkv_w, qkv_b)
-        q, k, v = qkv.chunk(3, dim=-1)
-        q = q.reshape(1, -1, 16, 128).transpose(1, 2)
-        k = k.reshape(1, -1, 16, 128).transpose(1, 2)
-        v = v.reshape(1, -1, 16, 128).transpose(1, 2)
-        attn = torch.nn.functional.scaled_dot_product_attention(q, k, v)
-        attn = attn.transpose(1, 2).reshape(1, -1, dim)
+            qkv_w = txt_in_keys[f"{bp}.self_attn_qkv.weight"]
+            qkv_b = txt_in_keys[f"{bp}.self_attn_qkv.bias"]
+            qkv = torch.nn.functional.linear(norm_x, qkv_w, qkv_b)
+            q, k, v = qkv.chunk(3, dim=-1)
+            q = q.reshape(1, -1, 16, 128).transpose(1, 2)
+            k = k.reshape(1, -1, 16, 128).transpose(1, 2)
+            v = v.reshape(1, -1, 16, 128).transpose(1, 2)
+            attn = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+            attn = attn.transpose(1, 2).reshape(1, -1, dim)
+            proj_w = txt_in_keys[f"{bp}.self_attn_proj.weight"]
+            proj_b = txt_in_keys[f"{bp}.self_attn_proj.bias"]
+            attn = torch.nn.functional.linear(attn, proj_w, proj_b)
+            x_local = x_local + attn * gate_msa.unsqueeze(1)
 
-        proj_w = txt_in_keys[f"{bp}.self_attn_proj.weight"]
-        proj_b = txt_in_keys[f"{bp}.self_attn_proj.bias"]
-        attn = torch.nn.functional.linear(attn, proj_w, proj_b)
-        x = x + attn * gate_msa.unsqueeze(1)
+            n2_w = txt_in_keys[f"{bp}.norm2.weight"]
+            n2_b = txt_in_keys[f"{bp}.norm2.bias"]
+            norm_x2 = torch.nn.functional.layer_norm(
+                x_local.float(), [dim], n2_w.float(), n2_b.float()
+            ).to(dtype)
+            mlp_w1 = txt_in_keys[f"{bp}.mlp.fc1.weight"]
+            mlp_b1 = txt_in_keys[f"{bp}.mlp.fc1.bias"]
+            mlp_w2 = txt_in_keys[f"{bp}.mlp.fc2.weight"]
+            mlp_b2 = txt_in_keys[f"{bp}.mlp.fc2.bias"]
+            mlp_out = torch.nn.functional.silu(
+                torch.nn.functional.linear(norm_x2, mlp_w1, mlp_b1)
+            )
+            mlp_out = torch.nn.functional.linear(mlp_out, mlp_w2, mlp_b2)
+            x_local = x_local + mlp_out * gate_mlp.unsqueeze(1)
 
-        # norm2 → MLP
-        n2_w = txt_in_keys[f"{bp}.norm2.weight"]
-        n2_b = txt_in_keys[f"{bp}.norm2.bias"]
-        norm_x2 = torch.nn.functional.layer_norm(x.float(), [dim], n2_w.float(), n2_b.float()).to(dtype)
-        mlp_w1 = txt_in_keys[f"{bp}.mlp.fc1.weight"]
-        mlp_b1 = txt_in_keys[f"{bp}.mlp.fc1.bias"]
-        mlp_w2 = txt_in_keys[f"{bp}.mlp.fc2.weight"]
-        mlp_b2 = txt_in_keys[f"{bp}.mlp.fc2.bias"]
-        mlp_out = torch.nn.functional.silu(torch.nn.functional.linear(norm_x2, mlp_w1, mlp_b1))
-        mlp_out = torch.nn.functional.linear(mlp_out, mlp_w2, mlp_b2)
-        x = x + mlp_out * gate_mlp.unsqueeze(1)
+        if cond_type_w is not None:
+            x_local = x_local + cond_type_w[0].unsqueeze(0).unsqueeze(0)
+        return x_local
 
-    # Add cond_type_embedding (type 0 = text)
-    if cond_type_w is not None:
-        x = x + cond_type_w[0].unsqueeze(0).unsqueeze(0)
-
-    refined_txt = x  # [1, 512, 2048]
-    print(f"  Refined text: {tuple(refined_txt.shape)}")
+    refined_txt = _refine(text_hidden, text_mask)
+    print(f"  Refined text (cond): {tuple(refined_txt.shape)}")
+    if use_uncond:
+        refined_uncond = _refine(uncond_hidden, uncond_mask)
+        print(f"  Refined text (uncond): {tuple(refined_uncond.shape)}")
     print(f"  Done in {time.time() - t0:.1f}s")
 
     del dit_state

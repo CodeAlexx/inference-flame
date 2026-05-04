@@ -44,6 +44,13 @@ fn main() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("Missing txt_embeds"))?.clone())?;
     let txt_mask = tensors.get("txt_mask")
         .ok_or_else(|| anyhow::anyhow!("Missing txt_mask"))?.clone();
+    // Optional uncond branch for CFG. The encode script emits these when
+    // `--negative <prompt>` is supplied (default empty string still emits).
+    // If absent, CFG silently degrades to cond-only (cfg_scale ignored).
+    let uncond_embeds = tensors.get("uncond_embeds")
+        .or_else(|| tensors.get("refined_uncond"))
+        .map(|t| ensure_bf16(t.clone())).transpose()?;
+    let uncond_mask = tensors.get("uncond_mask").cloned();
     let target_h = tensors.get("target_h").unwrap()
         .to_dtype(DType::F32)?.to_vec1::<f32>()?[0] as usize;
     let target_w = tensors.get("target_w").unwrap()
@@ -140,9 +147,19 @@ fn main() -> anyhow::Result<()> {
             let model_input = Tensor::cat(&[&latent, &condition, &mask], 1)?; // [1, 65, T, H, W]
 
             let cond_pred = dit.forward(&model_input, ts, &txt_embeds, &txt_mask, 6016.0)?;
-            // For CFG we'd need uncond too — for now just use cond (no CFG)
-            // TODO: add negative prompt support
-            let noise_pred = cond_pred;
+
+            // CFG path (mirrors wan22_t2v_gen.rs structure):
+            //   noise_pred = uncond + cfg_scale * (cond - uncond)
+            // Only runs when uncond embeddings exist AND cfg_scale > 1.0.
+            let noise_pred = match (&uncond_embeds, &uncond_mask) {
+                (Some(ue), Some(um)) if cfg_scale > 1.0 => {
+                    let uncond_pred = dit.forward(&model_input, ts, ue, um, 6016.0)?;
+                    let diff = cond_pred.sub(&uncond_pred)?;
+                    let scaled = diff.mul_scalar(cfg_scale)?;
+                    uncond_pred.add(&scaled)?
+                }
+                _ => cond_pred,
+            };
 
             let step_delta = noise_pred.mul_scalar(dt)?;
             latent.add(&step_delta)?
