@@ -343,6 +343,10 @@ name = "hunyuan15_gen"
 path = "src/bin/hunyuan15_gen.rs"
 
 [[bin]]
+name = "hunyuan15_decode"
+path = "src/bin/hunyuan15_decode.rs"
+
+[[bin]]
 name = "klein9b_edit_infer"
 path = "src/bin/klein9b_edit_infer.rs"
 
@@ -405,6 +409,14 @@ path = "src/bin/ltx2_adain_tone_map_parity.rs"
 [[bin]]
 name = "ltx2_generate_ms"
 path = "src/bin/ltx2_generate_ms.rs"
+
+[[bin]]
+name = "ltx2_full_pipeline"
+path = "src/bin/ltx2_full_pipeline.rs"
+
+[[bin]]
+name = "sd3_medium_infer"
+path = "src/bin/sd3_medium_infer.rs"
 
 [[bin]]
 name = "klein9b_infer_turbo"
