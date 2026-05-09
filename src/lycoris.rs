@@ -596,6 +596,11 @@ fn adapter_diff_weight(adapter: &LycorisAdapter) -> anyhow::Result<Tensor> {
         LycorisAdapter::Full(m) => m
             .delta_weight(1.0)
             .map_err(|e| anyhow::anyhow!("Full delta_weight failed: {e:?}")),
+        // TODO(separate cleanup item): add OFT support. Phase 2b temporary
+        // arm to unblock the workspace build for hidream_o1 compilation.
+        LycorisAdapter::OFT(_) => Err(anyhow::anyhow!(
+            "OFT adapter not yet supported in adapter_diff_weight; tracked separately"
+        )),
     }
 }
 

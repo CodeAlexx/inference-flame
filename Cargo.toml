@@ -75,6 +75,10 @@ name = "nucleus_infer"
 path = "src/bin/nucleus_infer.rs"
 
 [[bin]]
+name = "hidream_o1_infer"
+path = "src/bin/hidream_o1_infer.rs"
+
+[[bin]]
 name = "helios_infer"
 path = "src/bin/helios_infer.rs"
 
