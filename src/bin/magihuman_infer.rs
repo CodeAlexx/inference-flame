@@ -118,7 +118,8 @@ struct Cli {
     sr_steps: usize,
     sr_noise_value: usize,         // 0..1000 index into ZeroSNR sigma table
     sr_audio_noise_scale: f64,
-    // Classifier-free guidance. Mirrors Wan2GP's _run_diffusion_phase:
+    // Classifier-free guidance. Source of truth: GAIR-NLP/daVinci-MagiHuman
+    // inference/pipeline/video_generate.py.
     //   cfg_number = 2 when cfg_scale > 1.0 OR audio_cfg_scale > 1.0
     //   pred = pred_uncond + scale * (pred_cond - pred_uncond)
     // Time-conditional video schedule: scale = cfg_scale when sigma_curr > 0.5
@@ -249,13 +250,11 @@ impl Cli {
 //
 // daVinci-MagiHuman is fundamentally i2v: the model takes a "reference image
 // latent" as one of its inputs (per the model card and architecture diagram).
-// In the Wan2GP / upstream pipeline, this reference latent is fed via the
-// first temporal frame of the noisy video latent — at every step, BEFORE the
-// forward pass:
+// In the upstream pipeline (GAIR-NLP/daVinci-MagiHuman), this reference latent
+// is fed via the first temporal frame of the noisy video latent — at every
+// step, BEFORE the forward pass:
 //
 //     latent_video[:, :, :1] = image_latent[:, :, :1]
-//
-// (See `_run_diffusion_phase` in Wan2GP's magi_human_model.py.)
 //
 // Without this injection, the model has no clean reference to attend to and
 // produces garbage velocity. The "noise output despite plausible velocity
@@ -587,7 +586,7 @@ fn pack_inputs(
 // SR phase 2 (transformer2) helpers — refines base 256p output to 1080p.
 // ===========================================================================
 //
-// Pipeline (matches Wan2GP magi_human_model.py:732..765):
+// Pipeline (matches GAIR-NLP/daVinci-MagiHuman video_generate.py SR branch):
 //   1. Encode reference image at FULL SR resolution (Wan2.2 VAE).
 //   2. Trilinear-upsample base latent_video (lt unchanged) to SR latent dims.
 //      `align_corners=True` per Python; we mirror via a 2D bilinear with
@@ -618,7 +617,7 @@ fn bilinear_upsample_3d_spatial(x: &Tensor, new_h: usize, new_w: usize) -> Resul
     // (B, C, T, H, W) → (B, T, C, H, W) → (B*T, C, H, W)
     let r = x.permute(&[0, 2, 1, 3, 4])?.contiguous()?;
     let r = r.reshape(&[b * t, c, h, w])?;
-    // Wan2GP uses align_corners=True for the trilinear interp (line 737).
+    // align_corners=True matches the upstream creator pipeline.
     let up = GpuOps::upsample2d_bilinear(&r, (new_h, new_w), true)?;
     let r = up.reshape(&[b, t, c, new_h, new_w])?;
     r.permute(&[0, 2, 1, 3, 4])?
@@ -664,7 +663,7 @@ fn zero_snr_sigmas(num_timesteps: usize) -> Vec<f64> {
     sqrt_acp
 }
 
-/// Build production-`v1` coords (used by sr_data_proxy in Wan2GP). Differs
+/// Build production-`v1` coords (used by sr_data_proxy upstream). Differs
 /// from v2:
 ///   - Audio ref_feat_shape = (lt, 1, 1) instead of (magic_audio_ref_t, 1, 1)
 ///   - Text ref_feat_shape = (2, 1, 1) instead of (1, 1, 1)
@@ -1259,8 +1258,8 @@ fn main() -> Result<()> {
 
         // i2v conditioning: replace the first temporal frame with the encoded
         // reference image latent BEFORE every forward pass. Mirrors
-        // `latent_video[:, :, :1] = image_latent[:, :, :1]` in Wan2GP's
-        // _run_diffusion_phase.
+        // `latent_video[:, :, :1] = image_latent[:, :, :1]` in
+        // GAIR-NLP/daVinci-MagiHuman video_generate.py:478.
         if let Some(img_lat) = image_latent.as_ref() {
             video_lat = inject_image_latent(&video_lat, img_lat)?;
         }
@@ -1492,7 +1491,8 @@ fn main() -> Result<()> {
 
     // --- SR phase 2 (transformer2) ---
     // Refine 256p base latent → 1080p via the SR DiT. Only runs if the user
-    // passed --sr-weights. Mirrors Wan2GP's _run_diffusion_phase(use_sr_model=True).
+    // passed --sr-weights. Mirrors the use_sr_model=True branch in
+    // GAIR-NLP/daVinci-MagiHuman video_generate.py:336..354.
     let (final_video_lat, final_audio_lat) = if let Some(sr_path) = cli.sr_weights.as_ref() {
         eprintln!("\n[sr   ] running SR phase 2: {}x{} → {}x{}",
             cli.width, cli.height, cli.sr_width, cli.sr_height);
@@ -1503,8 +1503,9 @@ fn main() -> Result<()> {
         let sr_pixel_w = sr_latent_w * VAE_STRIDE_HW;
         eprintln!("[sr   ] SR latent dims: lt={latent_t} lh={sr_latent_h} lw={sr_latent_w}");
 
-        // Re-encode reference image at full SR resolution. Required by Wan2GP
-        // line 734: sr_image_latent = self._encode_image_latent(image_batch, height, width, ...).
+        // Re-encode reference image at full SR resolution. The SR DiT was
+        // trained on a fresh image latent at SR resolution, not an upsampled
+        // base latent (per GAIR-NLP/daVinci-MagiHuman creator pipeline).
         let sr_image_latent = if let Some(img_path) = cli.image_path.as_ref() {
             let lat = encode_reference_image(
                 img_path,
@@ -1530,7 +1531,6 @@ fn main() -> Result<()> {
         eprintln!("[sr   ] upsampled base latent: {:?}", sr_video_lat.shape().dims());
 
         // Add ZeroSNR-derived noise: lat = lat * sigma + randn * sqrt(1 - sigma²).
-        // Matches Wan2GP line 738..740.
         let noise_sigmas = zero_snr_sigmas(1000);
         let sr_sigma = noise_sigmas[cli.sr_noise_value] as f32;
         eprintln!("[sr   ] sr_noise_value={} → sigma={sr_sigma:.4}", cli.sr_noise_value);

@@ -43,7 +43,7 @@ const VAE_PATH: &str =
 
 const OUTPUT_DIR: &str = "/home/alex/EriDiffusion/inference-flame/output";
 
-const PROMPT: &str = "A close-up frames a woman pressed flat against a cold metal locker in a dark storage bay, her face half-lit by a single flickering overhead light. Condensation drips down riveted steel walls as she holds her breath, eyes wide, listening. She whispers to herself in a trembling, barely audible voice, Think. Think. The airlock is two decks down. She swallows hard, closing her eyes as a slow, wet scraping sound passes on the other side of the wall. Her lips move again, voice cracking, It can hear you. It can hear your heartbeat. Stop shaking.";
+const PROMPT: &str = "A realistic and detailed 24 fps HD video where an android is being worked on. The android blinks as the technician works on her eye soket with his tool she says softly \"what are we doing now?\". The technician off camera says \"were tring to fix up that visual glitch in your visual cortex you had do you remember?\" The android says \"Yes, im sorry i just worry sometimes when you work on me\" The technician off camera says \"why would you worry about that?\" The android then says \"Julia was worked on, where is Julia now?\" as sadness rolls accross the face of the android";
 const NUM_FRAMES: usize = 257;
 const TARGET_WIDTH: usize = 512;
 const TARGET_HEIGHT: usize = 320;
@@ -60,6 +60,20 @@ fn main() -> anyhow::Result<()> {
     let device = global_cuda_device();
 
     let skip_transformer = std::env::var("LTX2_SKIP_TRANSFORMER").is_ok();
+
+    // Stage 1 runs at half-res then the spatial upsampler doubles the latent.
+    // For (s1_latent × 2) to equal s2_latent, both target dims must be
+    // divisible by 64 (not just 32). Otherwise integer truncation in
+    // TARGET/2/32 vs TARGET/32 leaves a 1-row off-by-one and Stage 2 fails
+    // ~15 minutes in with a "Broadcasting incompatible shapes" error.
+    assert!(
+        TARGET_WIDTH % 64 == 0 && TARGET_HEIGHT % 64 == 0,
+        "TARGET_WIDTH and TARGET_HEIGHT must be divisible by 64 (got {TARGET_WIDTH}x{TARGET_HEIGHT})"
+    );
+    assert!(
+        (NUM_FRAMES - 1) % 8 == 0,
+        "NUM_FRAMES must satisfy (n-1) % 8 == 0 (got {NUM_FRAMES})"
+    );
 
     let s1_width = TARGET_WIDTH / 2;
     let s1_height = TARGET_HEIGHT / 2;
