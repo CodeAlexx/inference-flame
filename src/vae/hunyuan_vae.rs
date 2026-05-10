@@ -602,13 +602,17 @@ impl HunyuanUpsampleCausal3D {
         let (s_t, s_h, s_w) = self.upsample_factor;
         let t = dims[2];
 
-        // Split (1, T-1) along temporal axis.
-        let first = x.narrow(2, 0, 1)?;
+        // Split (1, T-1) along temporal axis.  Use `narrow_owning` so the
+        // ~250 MB parent `x` can drop once we've materialized both halves;
+        // the zero-copy `narrow` would pin it for the rest of the function
+        // (and across the upsample/temporal_nearest allocations) which is
+        // the TurboVAED OOM pattern flagged in `project_active_handoff.md`.
+        let first = x.narrow_owning(2, 0, 1)?;
         // first_frame: interpolate spatial only, no temporal scale.
         let first_up = Self::spatial_nearest(&first, s_h, s_w)?;
 
         let h_cat = if t > 1 {
-            let others = x.narrow(2, 1, t - 1)?;
+            let others = x.narrow_owning(2, 1, t - 1)?;
             // others: temporal interp first, then spatial.
             let others_t = Self::temporal_nearest(&others, s_t)?;
             let others_full = Self::spatial_nearest(&others_t, s_h, s_w)?;

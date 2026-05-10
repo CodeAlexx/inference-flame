@@ -583,8 +583,13 @@ pub fn merge_klein_lora(
                     );
                     continue;
                 }
-                let top = base_w.narrow(0, 0, n)?.contiguous()?;
-                let bottom = base_w.narrow(0, n, base_dims[0] - n)?.contiguous()?;
+                // `narrow_owning` instead of `narrow().contiguous()`:
+                // `.contiguous()` short-circuits on already-contiguous
+                // tensors and just clones `Arc<Storage>` — keeping `base_w`
+                // pinned across the rest of the merge loop.  We want the
+                // parent to drop after we've materialized our chunks.
+                let top = base_w.narrow_owning(0, 0, n)?;
+                let bottom = base_w.narrow_owning(0, n, base_dims[0] - n)?;
                 let top_merged = top.add(&delta)?;
                 Tensor::cat(&[&top_merged, &bottom], 0)?
             }
@@ -598,8 +603,8 @@ pub fn merge_klein_lora(
                     );
                     continue;
                 }
-                let left = base_w.narrow(1, 0, n)?.contiguous()?;
-                let right = base_w.narrow(1, n, base_dims[1] - n)?.contiguous()?;
+                let left = base_w.narrow_owning(1, 0, n)?;
+                let right = base_w.narrow_owning(1, n, base_dims[1] - n)?;
                 let left_merged = left.add(&delta)?;
                 Tensor::cat(&[&left_merged, &right], 1)?
             }
@@ -619,13 +624,13 @@ pub fn merge_klein_lora(
                 let tail_len = base_dims[0] - start - len;
                 let mut parts: Vec<Tensor> = Vec::with_capacity(3);
                 if head_len > 0 {
-                    parts.push(base_w.narrow(0, 0, head_len)?.contiguous()?);
+                    parts.push(base_w.narrow_owning(0, 0, head_len)?);
                 }
-                let mid = base_w.narrow(0, start, len)?.contiguous()?;
+                let mid = base_w.narrow_owning(0, start, len)?;
                 let mid_merged = mid.add(&delta)?;
                 parts.push(mid_merged);
                 if tail_len > 0 {
-                    parts.push(base_w.narrow(0, start + len, tail_len)?.contiguous()?);
+                    parts.push(base_w.narrow_owning(0, start + len, tail_len)?);
                 }
                 let part_refs: Vec<&Tensor> = parts.iter().collect();
                 Tensor::cat(&part_refs, 0)?
