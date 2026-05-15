@@ -2,6 +2,10 @@
 
 Pure Rust diffusion model inference using [flame-core](https://github.com/CodeAlexx/Flame). No Python, no diffusers, no ONNX.
 
+![AsymFLUX.2 Klein 9B — pure-Rust pixel-space sample](assets/asymflux2_green_eye.png)
+
+*AsymFLUX.2 Klein 9B — 1024², 38 steps, ~115s on a 24 GB 3090 Ti. Pure-Rust pixel-space inference with Oklab color encoder + AsymFlow velocity wrap.*
+
 | Klein 9B | Z-Image | Anima 2B |
 |---|---|---|
 | ![Klein 9B](docs/klein9b_sample.png) | ![Z-Image](docs/zimage_sample.png) | ![Anima 2B](docs/anima_sample.png) |
