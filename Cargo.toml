@@ -163,6 +163,10 @@ name = "nucleus_parity"
 path = "src/bin/nucleus_parity.rs"
 
 [[bin]]
+name = "qwenimage_encode"
+path = "src/bin/qwenimage_encode.rs"
+
+[[bin]]
 name = "qwenimage_gen"
 path = "src/bin/qwenimage_gen.rs"
 
@@ -203,6 +207,10 @@ name = "sd3_lora_infer"
 path = "src/bin/sd3_lora_infer.rs"
 
 [[bin]]
+name = "ernie_image_infer"
+path = "src/bin/ernie_image_infer.rs"
+
+[[bin]]
 name = "ernie_lora_infer"
 path = "src/bin/ernie_lora_infer.rs"
 
@@ -233,6 +241,10 @@ path = "src/bin/sd15_infer.rs"
 [[bin]]
 name = "klein9b_infer"
 path = "src/bin/klein9b_infer.rs"
+
+[[bin]]
+name = "asymflux2_klein9b_infer"
+path = "src/bin/asymflux2_klein9b_infer.rs"
 
 [[bin]]
 name = "debug_encoder"
@@ -527,3 +539,10 @@ required-features = ["turbo"]
 name = "turbo_qwen_edit_parity"
 path = "tests/turbo_qwen_edit_parity.rs"
 required-features = ["turbo"]
+
+# Mirror flame-core: route cudarc through the vendored cudarc-pinctx so the
+# `install_external_ptr_hook` symbol resolves. Without this patch, building
+# inference-flame pulls upstream cudarc 0.11.9 (which lacks the symbol) and
+# flame-core/src/external_memory.rs fails to compile.
+[patch.crates-io]
+cudarc = { path = "../cudarc-pinctx" }

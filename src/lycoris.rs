@@ -568,7 +568,7 @@ pub fn fuse_split_qkv(
         coll.adapters.insert(
             fused_key,
             LycorisAdapter::Full(FullAdapter {
-                diff: fused,
+                diff: flame_core::Var::new(fused),
                 diff_b: None,
             }),
         );
@@ -600,6 +600,9 @@ fn adapter_diff_weight(adapter: &LycorisAdapter) -> anyhow::Result<Tensor> {
         // arm to unblock the workspace build for hidream_o1 compilation.
         LycorisAdapter::OFT(_) => Err(anyhow::anyhow!(
             "OFT adapter not yet supported in adapter_diff_weight; tracked separately"
+        )),
+        LycorisAdapter::BOFT(_) => Err(anyhow::anyhow!(
+            "BOFT adapter not yet supported in adapter_diff_weight; tracked separately"
         )),
     }
 }
@@ -971,7 +974,10 @@ mod tests {
             .expect("from_vec")
             .to_dtype(flame_core::DType::BF16)
             .expect("to bf16");
-        lycoris_rs::algorithms::full::FullAdapter { diff, diff_b: None }
+        lycoris_rs::algorithms::full::FullAdapter {
+            diff: flame_core::Var::new(diff),
+            diff_b: None,
+        }
     }
 
     #[test]

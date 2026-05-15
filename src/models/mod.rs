@@ -41,3 +41,4 @@ pub mod sensenova_u1;
 pub mod nucleus_dit;
 pub mod helios_dit;
 pub mod hidream_o1;
+pub mod asymflux2;

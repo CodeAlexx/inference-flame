@@ -24,3 +24,5 @@ pub mod qwenimage_decoder;
 pub use qwenimage_decoder::QwenImageVaeDecoder;
 pub mod acestep_vae;
 pub use acestep_vae::OobleckVaeDecoder;
+pub mod oklab;
+pub use oklab::{decode_planar as oklab_decode_planar, encode_planar as oklab_encode_planar};
