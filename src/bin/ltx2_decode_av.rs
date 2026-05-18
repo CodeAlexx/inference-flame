@@ -7,8 +7,8 @@
 //!   2. Video VAE decode → RGB frames
 //!   3. Load audio latents from safetensors
 //!   4. Audio VAE decode → mel spectrogram
-//!   5. BigVGAN vocoder → 16 kHz stereo waveform
-//!   6. ffmpeg mux → MP4 (with aresample 16→48 kHz)
+//!   5. BigVGAN vocoder + BWE → 48 kHz stereo waveform
+//!   6. ffmpeg mux → MP4
 //!
 //! Audio decode failures are non-fatal: if audio VAE or vocoder fails,
 //! the video is still saved as a silent MP4.
@@ -24,14 +24,13 @@
 
 use flame_core::{global_cuda_device, DType};
 use inference_flame::mux;
-use inference_flame::vae::{LTX2AudioVaeDecoder, LTX2VaeDecoder, LTX2Vocoder};
+use inference_flame::vae::{LTX2AudioVaeDecoder, LTX2VaeDecoder, LTX2VocoderWithBWE};
 use std::time::Instant;
 
 const DEFAULT_OUTPUT_DIR: &str = "/home/alex/EriDiffusion/inference-flame/output";
 const DEFAULT_CHECKPOINT: &str =
     "/home/alex/.serenity/models/checkpoints/ltx-2.3-22b-dev.safetensors";
 const DEFAULT_FPS: f32 = 25.0;
-const VOCODER_SAMPLE_RATE: u32 = 16000;
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
@@ -140,11 +139,18 @@ fn main() -> anyhow::Result<()> {
             for tile_idx in 0..n_tiles {
                 let f0 = tile_idx * tile;
                 let f1 = (f0 + tile).min(f_lat);
-                let slice = video_latents.narrow(2, f0, f1 - f0)?;
+                let slice_f0 = if tile_idx == 0 { f0 } else { f0 - 1 };
+                let slice = video_latents.narrow(2, slice_f0, f1 - slice_f0)?;
                 let t_tile = Instant::now();
-                let out = video_vae.decode(&slice)?;
+                let decoded = video_vae.decode(&slice)?;
+                let out = if tile_idx == 0 {
+                    decoded
+                } else {
+                    let out_f = decoded.shape().dims()[2];
+                    decoded.narrow(2, 1, out_f - 1)?
+                };
                 println!(
-                    "    tile {}/{}: latent F=[{f0}..{f1}] → pixel shape {:?} in {:.1}s",
+                    "    tile {}/{}: latent F=[{slice_f0}..{f1}] use=[{f0}..{f1}] → pixel shape {:?} in {:.1}s",
                     tile_idx + 1, n_tiles, out.shape().dims(), t_tile.elapsed().as_secs_f32(),
                 );
                 tile_outputs.push(out);
@@ -230,17 +236,13 @@ fn main() -> anyhow::Result<()> {
             )?;
         }
         None => {
-            // Silent video: generate empty audio
-            let silence: Vec<i16> = vec![0i16; 2]; // minimal stereo silence
-            mux::write_mp4(
+            mux::write_mp4_video_only(
                 std::path::Path::new(&output_path),
                 &rgb_u8,
                 f_out,
                 w_out,
                 h_out,
                 fps,
-                &silence,
-                VOCODER_SAMPLE_RATE,
             )?;
         }
     }
@@ -306,17 +308,19 @@ fn decode_audio(
     );
     drop(audio_vae);
 
-    // Vocoder: mel → 16 kHz stereo waveform
+    // Vocoder: mel → 48 kHz stereo waveform through the checkpoint's BWE path
     println!("  Loading vocoder...");
     let t_voc = Instant::now();
-    let vocoder = LTX2Vocoder::from_file(checkpoint, device, "vocoder")?;
+    let vocoder = LTX2VocoderWithBWE::from_file(checkpoint, device)?;
     println!("  Vocoder loaded in {:.1}s", t_voc.elapsed().as_secs_f32());
 
     let t_fwd = Instant::now();
     let waveform = vocoder.forward(&mel)?;
+    let sample_rate = vocoder.output_sample_rate();
     println!(
-        "  Waveform: {:?} in {:.1}s",
+        "  Waveform: {:?} @ {}Hz in {:.1}s",
         waveform.shape().dims(),
+        sample_rate,
         t_fwd.elapsed().as_secs_f32()
     );
     drop(vocoder);
@@ -331,13 +335,13 @@ fn decode_audio(
     let pcm_i16 = mux::audio_tensor_to_pcm_i16(&waveform_f32, n_channels, n_samples, true);
     drop(waveform_f32);
 
-    let duration = n_samples as f32 / VOCODER_SAMPLE_RATE as f32;
+    let duration = n_samples as f32 / sample_rate as f32;
     println!(
         "  PCM: {} stereo samples ({:.2}s @ {}Hz)",
         pcm_i16.len() / 2,
         duration,
-        VOCODER_SAMPLE_RATE
+        sample_rate
     );
 
-    Ok((pcm_i16, VOCODER_SAMPLE_RATE))
+    Ok((pcm_i16, sample_rate))
 }

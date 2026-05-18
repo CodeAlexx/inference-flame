@@ -22,6 +22,7 @@ use flame_core::nn::Linear;
 use flame_core::{CudaDevice, DType, Result, Shape, Tensor};
 
 use super::HiDreamO1Config;
+use super::lora::{add_lora_residual, LoraRegistry};
 
 /// Two-stage patch embedder: `Linear(P*P*C → bottleneck) → Linear(bottleneck → hidden)`.
 ///
@@ -57,6 +58,20 @@ impl BottleneckPatchEmbed {
     pub fn forward(&self, patches: &Tensor) -> Result<Tensor> {
         let h = self.proj1.forward(patches)?;
         self.proj2.forward(&h)
+    }
+
+    /// LoRA-aware forward for ai-toolkit O1's non-decoder target set.
+    pub fn forward_lora(&self, patches: &Tensor, lora: Option<&LoraRegistry>) -> Result<Tensor> {
+        let h = self.proj1.forward(patches)?;
+        let h = match lora.and_then(|r| r.get_global("x_embedder.proj1")) {
+            Some(adapter) => add_lora_residual(h, patches, adapter)?,
+            None => h,
+        };
+        let out = self.proj2.forward(&h)?;
+        match lora.and_then(|r| r.get_global("x_embedder.proj2")) {
+            Some(adapter) => add_lora_residual(out, &h, adapter),
+            None => Ok(out),
+        }
     }
 
     /// Patchify an image tensor `[B, C, H, W]` into

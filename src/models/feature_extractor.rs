@@ -18,7 +18,7 @@
 //!
 //! ⚠️ This module is STANDALONE — it does NOT connect to any inference pipeline.
 
-use flame_core::{DType, Result, Shape, Tensor};
+use flame_core::{DType, Result, Tensor};
 
 /// Process Gemma-3 hidden states into features ready for the connector.
 ///
@@ -127,45 +127,6 @@ fn norm_and_concat_per_token_rms_fast(
     // For each layer, compute variance = mean(h^2, dim=-1, keepdim=True) → [B, T, 1]
     // Then normalize: h_normed = h * rsqrt(var + eps)
     // Concatenate all normalized hidden states into [B, T, D*L]
-
-    // Allocate output: [B*T, D*L] as BF16
-    let device = hidden_states[0].device().clone();
-    let mut output = Tensor::zeros_dtype(
-        Shape::from_dims(&[b * t, flat_dim]), DType::BF16, device.clone(),
-    )?;
-
-    for (i, h) in hidden_states.iter().enumerate() {
-        // h: [B, T, D] → [B*T, D]
-        let h_2d = h.reshape(&[b * t, d])?;
-
-        // variance = mean(h^2, dim=-1) → [B*T]
-        let sq = h_2d.mul(&h_2d)?;
-        let var = sq.mean_dim(&[1], false)?; // [B*T]
-
-        // inv_std = rsqrt(var + eps) → [B*T]
-        let inv_std = var.add_scalar(1e-6)?.rsqrt()?;
-
-        // normed = h * inv_std → [B*T, D]
-        let inv_std_bc = inv_std.unsqueeze(1)?.expand(&[b * t, d])?;
-        let normed = h_2d.mul(&inv_std_bc)?;
-
-        // Copy into output at offset i*D
-        // output[:, i*D : (i+1)*D] = normed
-        // Use narrow + copy since we can't do scatter
-        // Actually, we need to build the output by parts. Let's collect and cat.
-        // This is still cheaper than stacking all 49 into 4D.
-        if i == 0 {
-            // First: just store the slices for later cat
-        }
-        // Actually the simplest approach: collect normed slices, cat at the end
-        drop(normed); // we'll redo this below
-        drop(inv_std_bc);
-        drop(inv_std);
-        drop(var);
-        drop(sq);
-        drop(h_2d);
-    }
-    drop(output);
 
     // Normalize each layer, then stack → reshape to produce LIGHTRICKS's exact
     // flat layout.

@@ -90,6 +90,10 @@ const IMAGE_MODELS: &[&str] = &[
     // /home/alex/.serenity/models/sensenova_u1; `worker/sensenova.rs` ignores
     // any path override from the ComboBox and uses its hardcoded const dir.
     "sensenova-u1.safetensors",
+    // AsymFlux / AsymFlow (LakonLab research). UI entry only — selecting
+    // this returns "AsymFlux: worker not yet wired" until the inference
+    // path ships. See LakonLab/docs/AsymFlow.md.
+    "asymflux.safetensors",
 ];
 
 const VIDEO_MODELS: &[&str] = &[

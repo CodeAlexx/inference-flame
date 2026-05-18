@@ -195,20 +195,38 @@ fn pre_transpose_weight(w: &Tensor) -> Result<Tensor> {
 
 /// Allocator-side safety valve for the DiT block loop.
 ///
-/// Call after `drop(block)` in each BlockOffloader / FP8-resident block
-/// loop iteration. Returns any cached blocks from flame's BF16 arena AND
-/// asks the CUDA async mempool to release all cached segments it's
-/// hanging onto. Without this, the second-pass forward at high token
-/// counts drifts toward OOM as freed pool blocks fragment the heap —
-/// observed at ~block 14/48 on pass-2 at 768×448, 257 frames.
-///
-/// Each call is ~tens of μs on a 3090 Ti. Disable via
-/// `LTX2_NO_BLOCK_TRIM=1` if it ever shows up in a perf trace.
+/// The old path trimmed the BF16 arena and CUDA async mempool after every
+/// block. That prevents high-resolution second-pass OOMs, but it costs real
+/// time on small/interactive runs. Default behavior is now adaptive: skip the
+/// trim while free VRAM is healthy, trim once free VRAM drops below
+/// `LTX2_BLOCK_TRIM_FREE_GB` (default 4GB), and allow explicit force/disable
+/// via env.
 #[inline]
 fn maybe_trim_pool_between_blocks() {
     static DISABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *DISABLE.get_or_init(|| std::env::var_os("LTX2_NO_BLOCK_TRIM").is_some()) {
         return;
+    }
+    static FORCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let force = *FORCE.get_or_init(|| {
+        std::env::var("LTX2_FORCE_BLOCK_TRIM").as_deref() == Ok("1")
+            || std::env::var("LTX2_BLOCK_TRIM").as_deref() == Ok("1")
+    });
+    if !force {
+        static THRESHOLD_BYTES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let threshold = *THRESHOLD_BYTES.get_or_init(|| {
+            let gb = std::env::var("LTX2_BLOCK_TRIM_FREE_GB")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(4.0)
+                .max(0.0);
+            (gb * 1_000_000_000.0) as u64
+        });
+        match cudarc::driver::result::mem_get_info() {
+            Ok((free, _)) if free as u64 > threshold => return,
+            Err(_) => return,
+            _ => {}
+        }
     }
     flame_core::cuda_alloc_pool::clear_pool_cache();
     flame_core::device::trim_cuda_mempool(0);
@@ -2737,7 +2755,7 @@ pub struct LTX2StreamingModel {
 
     /// Async block offloader (BlockOffloader). When initialized via `init_offloader()`,
     /// replaces block_cache and load_block_from_disk with async pinned transfers.
-    pub offloader: Option<flame_diffusion::BlockOffloader>,
+    pub offloader: Option<flame_core::offload::BlockOffloader>,
     /// Detected key prefix for stripping from BlockOffloader output keys.
     pub key_prefix: String,
     /// Pre-cached F32 tensors per block (scale_shift_table etc.)
@@ -3417,7 +3435,7 @@ impl LTX2StreamingModel {
             prefix: String,
             num_layers: usize,
         }
-        impl flame_diffusion::block_offload::BlockFacilitator for Ltx2Facilitator {
+        impl flame_core::offload::BlockFacilitator for Ltx2Facilitator {
             fn block_count(&self) -> usize { self.num_layers }
             fn classify_key(&self, name: &str) -> Option<usize> {
                 let stripped = name.strip_prefix(&self.prefix).unwrap_or(name);
@@ -3437,11 +3455,12 @@ impl LTX2StreamingModel {
         }
 
         let facilitator = Ltx2Facilitator { prefix: prefix.clone(), num_layers };
-        let offloader = flame_diffusion::BlockOffloader::load(
+        let offloader = flame_core::offload::BlockOffloader::load(
             &[&self.checkpoint_path],
             &facilitator,
             device.clone(),
-        ).map_err(|e| flame_core::Error::Io(format!("BlockOffloader load failed: {e}")))?;
+        ).map_err(|e| flame_core::Error::Io(format!("BlockOffloader load failed: {e}")))?
+            .with_native_layout(true);
 
         log::info!("[LTX2] BlockOffloader ready: {} blocks, ~{:.2}GB pinned, {:.1}s",
             offloader.block_count(), offloader.pinned_bytes() as f64 / 1e9, t0.elapsed().as_secs_f32());
@@ -3465,6 +3484,85 @@ impl LTX2StreamingModel {
         }
         log::info!("[LTX2] F32 cache: {} blocks, {:.1}s total init",
             f32_cache.len(), t0.elapsed().as_secs_f32());
+
+        self.offloader = Some(offloader);
+        self.f32_cache = f32_cache;
+        Ok(())
+    }
+
+    /// Initialize the mmap-backed streaming offloader for BF16 inference.
+    ///
+    /// Unlike `init_offloader`, this does not eagerly copy every block into
+    /// pinned host RAM. It keeps the checkpoint mmap'd and uses two pinned
+    /// staging buffers sized for the largest block, then streams each block on
+    /// demand. This is the low-startup path for short interactive LTX2 runs.
+    pub fn init_offloader_streaming(&mut self) -> Result<()> {
+        let device = flame_core::global_cuda_device();
+        let t0 = std::time::Instant::now();
+        let prefix = self.key_prefix.clone();
+        let num_layers = self.config.num_layers;
+
+        log::info!(
+            "[LTX2] Initializing streaming BlockOffloader for {} blocks (prefix='{}')",
+            num_layers,
+            prefix,
+        );
+
+        struct Ltx2Facilitator {
+            prefix: String,
+            num_layers: usize,
+        }
+        impl flame_core::offload::BlockFacilitator for Ltx2Facilitator {
+            fn block_count(&self) -> usize { self.num_layers }
+            fn classify_key(&self, name: &str) -> Option<usize> {
+                let stripped = name.strip_prefix(&self.prefix).unwrap_or(name);
+                if !stripped.starts_with("transformer_blocks.") { return None; }
+                if stripped.contains("scale_shift_table") { return None; }
+                if stripped.ends_with(".weight_scale") || stripped.ends_with(".input_scale") {
+                    return None;
+                }
+                let rest = stripped.strip_prefix("transformer_blocks.")?;
+                rest.split('.').next()?.parse().ok()
+            }
+        }
+
+        let facilitator = Ltx2Facilitator { prefix: prefix.clone(), num_layers };
+        let checkpoint_path = self.checkpoint_path.as_str();
+        let offloader = flame_core::offload::BlockOffloader::load_streaming(
+            &[checkpoint_path],
+            &facilitator,
+            device.clone(),
+        ).map_err(|e| flame_core::Error::Io(format!("streaming BlockOffloader load failed: {e}")))?
+            .with_native_layout(true);
+
+        log::info!(
+            "[LTX2] Streaming BlockOffloader ready: {} blocks, ~{:.2}GB pinned staging, {:.1}s",
+            offloader.block_count(),
+            offloader.pinned_bytes() as f64 / 1e9,
+            t0.elapsed().as_secs_f32(),
+        );
+
+        log::info!("[LTX2] Caching F32 block tensors...");
+        let mut f32_cache = Vec::with_capacity(num_layers);
+        for i in 0..num_layers {
+            let pfx = format!("{prefix}transformer_blocks.{i}.");
+            let f32_tensors = flame_core::serialization::load_file_filtered(
+                &self.checkpoint_path, &device,
+                |key| key.starts_with(&pfx) && key.contains("scale_shift_table"),
+            )?;
+            let stripped: HashMap<String, Tensor> = f32_tensors.into_iter()
+                .map(|(k, v)| {
+                    let s = k.strip_prefix(&prefix).unwrap_or(&k).to_string();
+                    (s, v)
+                })
+                .collect();
+            f32_cache.push(stripped);
+        }
+        log::info!(
+            "[LTX2] F32 cache: {} blocks, {:.1}s total init",
+            f32_cache.len(),
+            t0.elapsed().as_secs_f32(),
+        );
 
         self.offloader = Some(offloader);
         self.f32_cache = f32_cache;
@@ -3514,7 +3612,7 @@ impl LTX2StreamingModel {
             prefix: String,
             num_layers: usize,
         }
-        impl flame_diffusion::block_offload::BlockFacilitator for Ltx2Facilitator {
+        impl flame_core::offload::BlockFacilitator for Ltx2Facilitator {
             fn block_count(&self) -> usize { self.num_layers }
             fn classify_key(&self, name: &str) -> Option<usize> {
                 let stripped = name.strip_prefix(&self.prefix).unwrap_or(name);
@@ -3529,11 +3627,12 @@ impl LTX2StreamingModel {
         }
         let facilitator = Ltx2Facilitator { prefix: prefix.clone(), num_layers };
 
-        let offloader = flame_diffusion::BlockOffloader::load_fp8_stream(
+        let offloader = flame_core::offload::BlockOffloader::load_fp8_stream(
             &[fp8_checkpoint_path],
             &facilitator,
             device.clone(),
-        ).map_err(|e| flame_core::Error::Io(format!("FP8-stream BlockOffloader load: {e}")))?;
+        ).map_err(|e| flame_core::Error::Io(format!("FP8-stream BlockOffloader load: {e}")))?
+            .with_native_layout(true);
 
         log::info!(
             "[LTX2] FP8-stream BlockOffloader ready: {} blocks, ~{:.2}GB pinned (raw FP8 bytes + BF16 bias/norm), {:.1}s",
@@ -4171,24 +4270,20 @@ impl LTX2StreamingModel {
                 .map_err(|e| flame_core::Error::Io(format!("prefetch: {e}")))?;
             for i in 0..num_layers {
                 let t_block = std::time::Instant::now();
-                let raw_weights = offloader.await_block(i)
+                let raw_weights = offloader.await_block_handle(i)
                     .map_err(|e| flame_core::Error::Io(format!("await_block: {e}")))?;
                 if i + 1 < num_layers {
                     offloader.prefetch_block(i + 1)
                         .map_err(|e| flame_core::Error::Io(format!("prefetch: {e}")))?;
                 }
-                // Strip key prefix + un-transpose 2D .weight tensors
-                // (BlockOffloader::prepare_weights auto-transposes to [Cin,Cout]
-                // but fused_linear3d_native expects [Cout,Cin] — same pattern
-                // Chroma/FLUX1/Qwen fixed).
-                let mut block_weights: HashMap<String, Tensor> = raw_weights.iter()
+                // BlockOffloader is initialized with native layout, so 2D
+                // weights stay in PyTorch [Cout,Cin] form for
+                // fused_linear3d_native. Keep the scoped handle alive until
+                // this block's kernels have been queued.
+                let mut block_weights: HashMap<String, Tensor> = raw_weights.weights().iter()
                     .map(|(k, v)| {
                         let stripped = k.strip_prefix(key_prefix.as_str()).unwrap_or(k).to_string();
-                        let tensor = if stripped.ends_with(".weight") && v.shape().dims().len() == 2 {
-                            v.transpose()?
-                        } else {
-                            v.clone()
-                        };
+                        let tensor = v.clone();
                         Ok::<_, flame_core::Error>((stripped, tensor))
                     })
                     .collect::<Result<HashMap<_, _>>>()?;
@@ -4217,7 +4312,8 @@ impl LTX2StreamingModel {
                     None,
                     prompt_timestep.as_ref(),
                 )?;
-                drop(block); // Free transposed weights immediately
+                drop(block);
+                drop(raw_weights);
                 maybe_trim_pool_between_blocks();
                 let t_total = t_block.elapsed().as_millis();
                 if (i + 1) % 12 == 0 || i + 1 == num_layers || i == 0 {
@@ -4522,16 +4618,22 @@ impl LTX2StreamingModel {
         // 6. AV cross-attention global modulation
         let cross_gate_scale = (self.config.cross_attn_timestep_scale_multiplier
             / self.config.timestep_scale_multiplier) as f32;
+        // AV cross-attention AdaLN is global per sample in the reference
+        // transformer args. It uses the modality sigma, not the per-token
+        // video timestep after I2V/keyframe conditioning masks zero selected
+        // video tokens. Keep this unmasked so conditioned token 0 cannot
+        // collapse the whole AV cross-attention gate to sigma=0.
+        let global_ts_scaled = timestep.mul_scalar(self.config.timestep_scale_multiplier as f32)?;
 
         let v_ca_ss = if let Some(ref adaln) = self.av_cross_attn_video_scale_shift {
-            let (ss, _) = adaln.forward(&ts_flat.narrow(0, 0, batch_size)?)?;
+            let (ss, _) = adaln.forward(&global_ts_scaled)?;
             ss.reshape(&[batch_size, 1, ss.shape().dims()[ss.shape().rank() - 1]])?
         } else {
             Tensor::zeros_dtype(Shape::from_dims(&[batch_size, 1, 4 * inner_dim]), DType::BF16, device.clone())?
         };
 
         let v_ca_gate = if let Some(ref adaln) = self.av_cross_attn_video_a2v_gate {
-            let scaled_ts = ts_flat.narrow(0, 0, batch_size)?.mul_scalar(cross_gate_scale)?;
+            let scaled_ts = global_ts_scaled.mul_scalar(cross_gate_scale)?;
             let (g, _) = adaln.forward(&scaled_ts)?;
             g.reshape(&[batch_size, 1, g.shape().dims()[g.shape().rank() - 1]])?
         } else {
@@ -4539,14 +4641,14 @@ impl LTX2StreamingModel {
         };
 
         let a_ca_ss = if let Some(ref adaln) = self.av_cross_attn_audio_scale_shift {
-            let (ss, _) = adaln.forward(&ats_flat.narrow(0, 0, batch_size)?)?;
+            let (ss, _) = adaln.forward(&global_ts_scaled)?;
             ss.reshape(&[batch_size, 1, ss.shape().dims()[ss.shape().rank() - 1]])?
         } else {
             Tensor::zeros_dtype(Shape::from_dims(&[batch_size, 1, 4 * audio_inner_dim]), DType::BF16, device.clone())?
         };
 
         let a_ca_gate = if let Some(ref adaln) = self.av_cross_attn_audio_v2a_gate {
-            let scaled_ats = ats_flat.narrow(0, 0, batch_size)?.mul_scalar(cross_gate_scale)?;
+            let scaled_ats = global_ts_scaled.mul_scalar(cross_gate_scale)?;
             let (g, _) = adaln.forward(&scaled_ats)?;
             g.reshape(&[batch_size, 1, g.shape().dims()[g.shape().rank() - 1]])?
         } else {
@@ -4643,6 +4745,16 @@ impl LTX2StreamingModel {
         if video_prompt_ts.is_some() && audio_prompt_ts.is_none() {
             log::warn!("[LTX2 AV] video prompt_timestep loaded but audio_prompt_adaln_single missing — audio CA will be unmodulated");
         }
+        let video_block_mask = if self.connector.is_some() {
+            None
+        } else {
+            encoder_attention_mask
+        };
+        let audio_block_mask = if self.audio_connector.is_some() {
+            None
+        } else {
+            audio_encoder_attention_mask
+        };
 
         // 8. Stream blocks (FP8 resident or BlockOffloader)
         let num_layers = self.config.num_layers;
@@ -4711,7 +4823,7 @@ impl LTX2StreamingModel {
                     Some((&a_cos, &a_sin)),
                     Some((&ca_v_cos, &ca_v_sin)),
                     Some((&ca_a_cos, &ca_a_sin)),
-                    None, None,
+                    video_block_mask, audio_block_mask,
                     video_prompt_ts.as_ref(),
                     audio_prompt_ts.as_ref(),
                     skip_scalar,
@@ -4737,7 +4849,7 @@ impl LTX2StreamingModel {
             let prof = std::env::var("LTX2_BLOCK_PROF").is_ok();
             for i in 0..num_layers {
                 let t_block = std::time::Instant::now();
-                let raw_weights = offloader.await_block(i)
+                let raw_weights = offloader.await_block_handle(i)
                     .map_err(|e| flame_core::Error::Io(format!("await_block: {e}")))?;
                 if prof { let _ = device.synchronize(); }
                 let t_after_await = t_block.elapsed().as_millis();
@@ -4746,16 +4858,14 @@ impl LTX2StreamingModel {
                     offloader.prefetch_block(i + 1)
                         .map_err(|e| flame_core::Error::Io(format!("prefetch: {e}")))?;
                 }
-                // Strip key prefix + un-transpose 2D .weight tensors (see
-                // parallel block in forward_video at line 3583 for rationale).
-                let mut block_weights: HashMap<String, Tensor> = raw_weights.iter()
+                // BlockOffloader is initialized with native layout, so 2D
+                // weights stay in PyTorch [Cout,Cin] form for
+                // fused_linear3d_native. Keep the scoped handle alive until
+                // this block's kernels have been queued.
+                let mut block_weights: HashMap<String, Tensor> = raw_weights.weights().iter()
                     .map(|(k, v)| {
                         let stripped = k.strip_prefix(key_prefix.as_str()).unwrap_or(k).to_string();
-                        let tensor = if stripped.ends_with(".weight") && v.shape().dims().len() == 2 {
-                            v.transpose()?
-                        } else {
-                            v.clone()
-                        };
+                        let tensor = v.clone();
                         Ok::<_, flame_core::Error>((stripped, tensor))
                     })
                     .collect::<Result<HashMap<_, _>>>()?;
@@ -4801,6 +4911,12 @@ impl LTX2StreamingModel {
                         if let Some(ref t) = audio_prompt_ts {
                             dump.insert("audio_prompt_ts".into(), t.clone());
                         }
+                        if std::env::var("LTX2_DUMP_BLOCK0_WEIGHTS").is_ok() {
+                            dump.insert("w_audio_attn1_to_q".into(), block.audio_attn1.to_q_weight.clone());
+                            dump.insert("b_audio_attn1_to_q".into(), block.audio_attn1.to_q_bias.clone());
+                            dump.insert("w_video_attn1_to_q".into(), block.attn1.to_q_weight.clone());
+                            dump.insert("b_video_attn1_to_q".into(), block.attn1.to_q_bias.clone());
+                        }
                         flame_core::serialization::save_tensors(
                             &dump,
                             std::path::Path::new("/home/alex/EriDiffusion/inference-flame/output/rust_block0_dump.safetensors"),
@@ -4822,7 +4938,7 @@ impl LTX2StreamingModel {
                     Some((&a_cos, &a_sin)),
                     Some((&ca_v_cos, &ca_v_sin)),
                     Some((&ca_a_cos, &ca_a_sin)),
-                    None, None,
+                    video_block_mask, audio_block_mask,
                     video_prompt_ts.as_ref(),
                     audio_prompt_ts.as_ref(),
                     skip_scalar,
@@ -4880,6 +4996,7 @@ impl LTX2StreamingModel {
                 hs = new_hs;
                 ahs = new_ahs;
                 drop(block);
+                drop(raw_weights);
                 maybe_trim_pool_between_blocks();
                 if prof || (i + 1) % 12 == 0 || i + 1 == num_layers || i == 0 {
                     log::info!("[LTX2] AV Block {}/{}: total={}ms (await={}ms, build={}ms, forward={}ms)",
@@ -5046,27 +5163,28 @@ impl LTX2StreamingModel {
 
         // 5. Cross-attention global modulation
         let cross_gate_scale = (self.config.cross_attn_timestep_scale_multiplier / self.config.timestep_scale_multiplier) as f32;
+        let global_ts_scaled = timestep.mul_scalar(self.config.timestep_scale_multiplier as f32)?;
         let v_ca_ss = if let Some(ref adaln) = self.av_cross_attn_video_scale_shift {
-            let (ss, _) = adaln.forward(&ts_flat.narrow(0, 0, batch_size)?)?;
+            let (ss, _) = adaln.forward(&global_ts_scaled)?;
             ss.reshape(&[batch_size, 1, ss.shape().dims()[ss.shape().rank() - 1]])?
         } else {
             Tensor::zeros_dtype(Shape::from_dims(&[batch_size, 1, 4 * inner_dim]), DType::BF16, device.clone())?
         };
         let v_ca_gate = if let Some(ref adaln) = self.av_cross_attn_video_a2v_gate {
-            let scaled_ts = ts_flat.narrow(0, 0, batch_size)?.mul_scalar(cross_gate_scale)?;
+            let scaled_ts = global_ts_scaled.mul_scalar(cross_gate_scale)?;
             let (g, _) = adaln.forward(&scaled_ts)?;
             g.reshape(&[batch_size, 1, g.shape().dims()[g.shape().rank() - 1]])?
         } else {
             Tensor::zeros_dtype(Shape::from_dims(&[batch_size, 1, inner_dim]), DType::BF16, device.clone())?
         };
         let a_ca_ss = if let Some(ref adaln) = self.av_cross_attn_audio_scale_shift {
-            let (ss, _) = adaln.forward(&ats_flat.narrow(0, 0, batch_size)?)?;
+            let (ss, _) = adaln.forward(&global_ts_scaled)?;
             ss.reshape(&[batch_size, 1, ss.shape().dims()[ss.shape().rank() - 1]])?
         } else {
             Tensor::zeros_dtype(Shape::from_dims(&[batch_size, 1, 4 * audio_inner_dim]), DType::BF16, device.clone())?
         };
         let a_ca_gate = if let Some(ref adaln) = self.av_cross_attn_audio_v2a_gate {
-            let scaled_ats = ats_flat.narrow(0, 0, batch_size)?.mul_scalar(cross_gate_scale)?;
+            let scaled_ats = global_ts_scaled.mul_scalar(cross_gate_scale)?;
             let (g, _) = adaln.forward(&scaled_ats)?;
             g.reshape(&[batch_size, 1, g.shape().dims()[g.shape().rank() - 1]])?
         } else {

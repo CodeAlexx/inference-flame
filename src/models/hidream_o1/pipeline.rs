@@ -36,6 +36,7 @@ use anyhow::{anyhow, Result as AnyResult};
 use flame_core::{CudaDevice, DType, Result, Shape, Tensor};
 
 use super::bottleneck_patch_embed::BottleneckPatchEmbed;
+use super::lora::LoraRegistry;
 use super::model::HiDreamO1Model;
 use super::mrope::{build_mrope_positions, MRopePositions};
 use super::scheduler::{FlashFlowMatchEulerDiscreteScheduler, SchedulerMode};
@@ -49,18 +50,21 @@ pub struct HiDreamO1Pipeline {
     pub config: HiDreamO1Config,
     pub device: Arc<CudaDevice>,
     pub dtype: DType,
-    /// Smoke-test escape hatch: when true, bypass the
-    /// `find_closest_resolution` snap and run at the requested HxW
-    /// directly (must still be patch-divisible). Off-manifold output
-    /// expected — model was only trained at 2048²-area resolutions.
+    /// Backward-compatible debug flag. Current ai-toolkit O1 only rounds to
+    /// the patch multiple, so this flag no longer changes normal generation.
     pub allow_any_resolution: bool,
+    /// Optional LoRA adapters routed through `model.forward_lora`. When
+    /// `None`, generation calls `model.forward` (byte-identical to the
+    /// pre-M4 inference path). Set via [`Self::set_lora`] after
+    /// constructing the pipeline.
+    pub lora: Option<LoraRegistry>,
 }
 
-/// Predefined resolutions list, mirrors `utils.py:6-18`.
+/// Legacy predefined resolutions list.
 ///
-/// `find_closest_resolution` picks the entry whose aspect ratio is closest
-/// to the user's request — area is ignored (edge case D3 in
-/// `/tmp/hidream_scope_bugs.md`).
+/// Older HiDream-O1 scripts snapped requests to these 2048-area presets.
+/// Current ai-toolkit's O1 pipeline only rounds to the patch multiple; keep
+/// the list for tests/docs that still reference the old behavior.
 pub const PREDEFINED_RESOLUTIONS: &[(usize, usize)] = &[
     (2048, 2048),
     (2304, 1728),
@@ -126,13 +130,22 @@ impl HiDreamO1Pipeline {
             device,
             dtype,
             allow_any_resolution: false,
+            lora: None,
         })
     }
 
-    /// Smoke-test escape hatch — bypass the predefined-resolution snap.
-    /// Output is off-manifold; use only for pipeline-correctness testing.
+    /// Backward-compatible no-op for callers that used the old snap bypass.
     pub fn set_allow_any_resolution(&mut self, allow: bool) {
         self.allow_any_resolution = allow;
+    }
+
+    /// Attach a LoRA registry (M4). When set, both the cond and uncond
+    /// forwards in [`Self::generate`] route through `model.forward_lora`
+    /// with `Some(&registry)`; clearing it (via `set_lora(None)`) restores
+    /// the no-LoRA forward path. Loaded checkpoints must be PEFT-format
+    /// (see [`LoraRegistry::from_safetensors`]).
+    pub fn set_lora(&mut self, lora: Option<LoraRegistry>) {
+        self.lora = lora;
     }
 
     fn validate_token_id(
@@ -200,7 +213,13 @@ impl HiDreamO1Pipeline {
     // ─── Token stream + position IDs + masks ───────────────────────────
 
     /// Build the T2I sample for `prompt` at `(height, width)`.
-    /// Returns (input_ids `[B,S_text]` I32, position_ids_thw, vinput_mask `[B,S_total]` BF16).
+    /// Returns (input_ids `[B,S_text]` I32, position_ids_thw,
+    /// vinput_mask `[B,S_total]` BF16, token_types_bin `[B,S_total]` BF16).
+    ///
+    /// `token_types_bin = (token_types > 0)` includes the TMS row at
+    /// `txt_seq_len - 1` (type=3) in addition to the image rows (type=1).
+    /// Required by `model.forward` for the attention mask construction
+    /// (matches `qwen3_vl_transformers.py:1501`).
     ///
     /// **Layout**:
     /// - `input_ids` is the text portion ONLY (chat template + boi + tms).
@@ -218,7 +237,7 @@ impl HiDreamO1Pipeline {
         prompt: &str,
         height: usize,
         width: usize,
-    ) -> AnyResult<(Tensor, MRopePositionsOwned, Tensor)> {
+    ) -> AnyResult<(Tensor, MRopePositionsOwned, Tensor, Tensor)> {
         if height % self.config.patch_size != 0 || width % self.config.patch_size != 0 {
             return Err(anyhow!(
                 "build_t2i_input: H={} W={} must be divisible by patch_size={}",
@@ -295,6 +314,30 @@ impl HiDreamO1Pipeline {
             DType::BF16,
         )?;
 
+        // 5b) token_types_bin = (token_types > 0). For T2I this is True over
+        //     the SAME range as `vinput_mask` PLUS the TMS slot at
+        //     `txt_seq_len - 1` (type=3). Used by `model.forward` for the
+        //     attention mask (Python's `gen_positions = token_types[b].bool()`
+        //     at `qwen3_vl_transformers.py:1501`). The deep-investigation at
+        //     `EriDiffusion-v2/docs/hidream_o1_g0_deep_investigation.md`
+        //     showed that using `vinput_mask` instead breaks parity at token
+        //     22 (the TMS row).
+        let mut token_types_bin_data = vec![0.0_f32; all_seq_len];
+        // Image rows.
+        for i in txt_seq_len..(txt_seq_len + image_len) {
+            token_types_bin_data[i] = 1.0;
+        }
+        // TMS row (last text slot, type=3 in Python, > 0 ⇒ bin = True).
+        if txt_seq_len > 0 {
+            token_types_bin_data[txt_seq_len - 1] = 1.0;
+        }
+        let token_types_bin = Tensor::from_vec_dtype(
+            token_types_bin_data,
+            Shape::from_dims(&[1, all_seq_len]),
+            self.device.clone(),
+            DType::BF16,
+        )?;
+
         // 6) input_ids is the TEXT portion ONLY for `model.forward`
         //    (Phase 2b's contract: text + tms; the L image slots get
         //    replaced by `BottleneckPatchEmbed(noise_patches)` inside the model).
@@ -317,6 +360,7 @@ impl HiDreamO1Pipeline {
                 w: w_pos,
             },
             vinput_mask,
+            token_types_bin,
         ))
     }
 
@@ -348,33 +392,29 @@ impl HiDreamO1Pipeline {
         seed: u64,
         guidance_scale: f32,
     ) -> AnyResult<Tensor> {
-        // 1) Snap to predefined resolution by aspect ratio (unless the
-        //    smoke-test bypass is set, in which case use HxW verbatim;
-        //    patch divisibility is enforced by build_t2i_input).
-        let (height, width) = if self.allow_any_resolution {
-            eprintln!(
-                "[hidream_o1] allow_any_resolution=true — running at {}x{} (off-manifold; smoke test only).",
-                width, height
-            );
-            (height, width)
-        } else {
-            let (h, w) = find_closest_resolution(width, height);
-            if h != height || w != width {
-                eprintln!(
-                    "[hidream_o1] Resolution snapped from {}x{} to {}x{} (aspect-ratio match).",
-                    width, height, w, h
-                );
-            }
-            (h, w)
-        };
-
         let p = self.config.patch_size;
+        // 1) Current ai-toolkit O1 rounds to the patch multiple only.
+        let rounded_width = (width / p) * p;
+        let rounded_height = (height / p) * p;
+        if rounded_width == 0 || rounded_height == 0 {
+            return Err(anyhow!(
+                "HiDream-O1 resolution must be at least {}x{}, got {}x{}",
+                p, p, width, height
+            ));
+        }
+        if rounded_width != width || rounded_height != height {
+            eprintln!(
+                "[hidream_o1] Resolution rounded from {}x{} to {}x{}",
+                width, height, rounded_width, rounded_height
+            );
+        }
+        let (height, width) = (rounded_height, rounded_width);
         let h_patches = height / p;
         let w_patches = width / p;
 
         // 2) Build cond + (optional) uncond samples.
-        let do_cfg = guidance_scale > 1.0 && !negative_prompt.is_empty();
-        let (cond_input_ids, cond_pos, cond_vmask) =
+        let do_cfg = guidance_scale > 1.0;
+        let (cond_input_ids, cond_pos, cond_vmask, cond_token_types_bin) =
             self.build_t2i_input(prompt, height, width)
                 .map_err(|e| anyhow!("build_t2i_input(cond): {}", e))?;
 
@@ -383,10 +423,10 @@ impl HiDreamO1Pipeline {
             // (`pipeline.py:160`); empty string and " " produce different
             // token streams. Match the Python contract.
             let prompt_uncond = if negative_prompt.is_empty() { " " } else { negative_prompt };
-            let (i, p, v) = self
+            let (i, p, v, ttb) = self
                 .build_t2i_input(prompt_uncond, height, width)
                 .map_err(|e| anyhow!("build_t2i_input(uncond): {}", e))?;
-            Some((i, p, v))
+            Some((i, p, v, ttb))
         } else {
             None
         };
@@ -436,6 +476,7 @@ impl HiDreamO1Pipeline {
 
         // 6) Denoise loop. Mirror `pipeline.py:343-388`.
         for step_idx in 0..num_steps {
+            let step_start = std::time::Instant::now();
             let step_t = self.scheduler.timesteps[step_idx];
             let t_pixeldit = 1.0_f32 - step_t / 1000.0_f32;
             let sigma_clamped = (step_t / 1000.0_f32).max(0.001_f32);
@@ -452,13 +493,15 @@ impl HiDreamO1Pipeline {
                 self.device.clone(),
                 DType::BF16,
             )?;
-            let x_pred_full = self.model.forward(
+            let x_pred_full = self.model.forward_lora(
                 &cond_input_ids,
                 &t_tensor,
                 &z,
                 &pos_thw,
                 &cond_vmask,
+                &cond_token_types_bin,
                 None,
+                self.lora.as_ref(),
             )?;
             // Gather rows where vinput_mask == 1 (edge case D1 / pipeline.py:329).
             let x_pred_cond = self.gather_image_rows(&x_pred_full, &cond_vmask)?;
@@ -466,19 +509,21 @@ impl HiDreamO1Pipeline {
             // v_cond = (x_pred - z) / sigma  (FP32 per pipeline.py:349)
             let v_cond = self.compute_velocity(&x_pred_cond, &z, sigma_clamped)?;
 
-            let v_guided = if let Some((u_input_ids, u_pos, u_vmask)) = &uncond {
+            let v_guided = if let Some((u_input_ids, u_pos, u_vmask, u_token_types_bin)) = &uncond {
                 let u_pos_thw = MRopePositions {
                     t: &u_pos.t,
                     h: &u_pos.h,
                     w: &u_pos.w,
                 };
-                let x_pred_full_u = self.model.forward(
+                let x_pred_full_u = self.model.forward_lora(
                     u_input_ids,
                     &t_tensor,
                     &z,
                     &u_pos_thw,
                     u_vmask,
+                    u_token_types_bin,
                     None,
+                    self.lora.as_ref(),
                 )?;
                 let x_pred_uncond = self.gather_image_rows(&x_pred_full_u, u_vmask)?;
                 let v_uncond = self.compute_velocity(&x_pred_uncond, &z, sigma_clamped)?;
@@ -512,6 +557,14 @@ impl HiDreamO1Pipeline {
                 noise_clip_std,
                 &self.device,
             )?;
+            log::info!(
+                "[hidream_o1] denoise step {}/{} t={:.3} sigma={:.6} done in {:.2}s",
+                step_idx + 1,
+                num_steps,
+                step_t,
+                sigma_clamped,
+                step_start.elapsed().as_secs_f64()
+            );
         }
 
         // 7) Unpatchify → [1, 3, H, W] in [-1, 1] range.

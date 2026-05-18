@@ -24,6 +24,8 @@
 //! Output safetensors keys:
 //!   `t5_cond`   — [1, 512, 4096] BF16
 //!   `t5_uncond` — [1, 512, 4096] BF16
+//!   `cond_real_len` / `uncond_real_len` — [1] F32 token counts for
+//!       downstream attention-pad masking
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -78,17 +80,17 @@ fn main() -> anyhow::Result<()> {
 
     println!("--- Encoding cond ---");
     let t0 = Instant::now();
-    let cond_tokens = tokenize_t5(&prompt);
+    let (cond_tokens, cond_real_len) = tokenize_t5_with_len(&prompt);
     let cond_hidden = t5.encode(&cond_tokens)?;
-    println!("  cond hidden: {:?} in {:.1}s",
-        cond_hidden.shape().dims(), t0.elapsed().as_secs_f32());
+    println!("  cond hidden: {:?} (real_len={}) in {:.1}s",
+        cond_hidden.shape().dims(), cond_real_len, t0.elapsed().as_secs_f32());
 
     println!("--- Encoding uncond ---");
     let t0 = Instant::now();
-    let uncond_tokens = tokenize_t5(&negative);
+    let (uncond_tokens, uncond_real_len) = tokenize_t5_with_len(&negative);
     let uncond_hidden = t5.encode(&uncond_tokens)?;
-    println!("  uncond hidden: {:?} in {:.1}s",
-        uncond_hidden.shape().dims(), t0.elapsed().as_secs_f32());
+    println!("  uncond hidden: {:?} (real_len={}) in {:.1}s",
+        uncond_hidden.shape().dims(), uncond_real_len, t0.elapsed().as_secs_f32());
 
     // Drop T5 explicitly so the BlockOffloader-backed weights free before save.
     drop(t5);
@@ -108,6 +110,21 @@ fn main() -> anyhow::Result<()> {
     let mut tensors: HashMap<String, flame_core::Tensor> = HashMap::new();
     tensors.insert("t5_cond".to_string(), cond_hidden);
     tensors.insert("t5_uncond".to_string(), uncond_hidden);
+    // Real token counts (pre-pad) for downstream attention masking.
+    // Saved as 1-elem f32 (Tensor::from_vec only takes Vec<f32>); chroma_gen
+    // reads via to_vec() and casts back to usize.
+    let cond_len_t = flame_core::Tensor::from_vec(
+        vec![cond_real_len as f32],
+        flame_core::Shape::from_dims(&[1]),
+        device.clone(),
+    )?;
+    let uncond_len_t = flame_core::Tensor::from_vec(
+        vec![uncond_real_len as f32],
+        flame_core::Shape::from_dims(&[1]),
+        device.clone(),
+    )?;
+    tensors.insert("cond_real_len".to_string(), cond_len_t);
+    tensors.insert("uncond_real_len".to_string(), uncond_len_t);
 
     flame_core::serialization::save_file(&tensors, &out_path)?;
     println!("  Saved {} tensors in {:.1}s", tensors.len(), t0.elapsed().as_secs_f32());
@@ -124,22 +141,24 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// T5-XXL tokenize, pad to T5_SEQ_LEN with 0 (T5 pad token).
-fn tokenize_t5(prompt: &str) -> Vec<i32> {
+/// T5-XXL tokenize, pad to T5_SEQ_LEN with 0. Returns (tokens, real_len).
+/// `real_len` = post-truncation, pre-pad count. Used downstream for attention masking.
+fn tokenize_t5_with_len(prompt: &str) -> (Vec<i32>, usize) {
     match tokenizers::Tokenizer::from_file(T5_TOKENIZER) {
         Ok(tok) => {
             let enc = tok.encode(prompt, true).expect("t5 tokenize");
             let mut ids: Vec<i32> = enc.get_ids().iter().map(|&i| i as i32).collect();
             ids.truncate(T5_SEQ_LEN);
+            let real_len = ids.len();
             while ids.len() < T5_SEQ_LEN {
                 ids.push(0);
             }
-            ids
+            (ids, real_len)
         }
         Err(e) => {
             eprintln!("[chroma_encode] T5 tokenizer load failed: {}", e);
             eprintln!("                 falling back to all-zero tokens — output will be GARBAGE");
-            vec![0i32; T5_SEQ_LEN]
+            (vec![0i32; T5_SEQ_LEN], 0)
         }
     }
 }

@@ -86,6 +86,17 @@ pub fn write_mp4(
     assert_eq!(frames.len(), frame_count * width * height * 3);
     assert_eq!(audio.len() % 2, 0);
 
+    let min_audio_samples = ((frame_count as f32 / fps) * audio_sample_rate as f32).ceil() as usize;
+    let min_audio_len = min_audio_samples * 2;
+    let mut padded_audio = Vec::new();
+    let audio_write = if audio.len() < min_audio_len {
+        padded_audio.extend_from_slice(audio);
+        padded_audio.resize(min_audio_len, 0);
+        padded_audio.as_slice()
+    } else {
+        audio
+    };
+
     if let Some(parent) = out_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -105,8 +116,8 @@ pub fn write_mp4(
     {
         let mut f = File::create(&audio_path)?;
         // Convert i16 → little-endian bytes.
-        let mut buf = Vec::with_capacity(audio.len() * 2);
-        for s in audio {
+        let mut buf = Vec::with_capacity(audio_write.len() * 2);
+        for s in audio_write {
             buf.extend_from_slice(&s.to_le_bytes());
         }
         f.write_all(&buf)?;
@@ -141,6 +152,58 @@ pub fn write_mp4(
     // Clean up temp files regardless of success.
     let _ = std::fs::remove_file(&frames_path);
     let _ = std::fs::remove_file(&audio_path);
+
+    if !status.success() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("ffmpeg exited with status {status}"),
+        ));
+    }
+    Ok(())
+}
+
+/// Write a video-only MP4 via ffmpeg.
+///
+/// This is used when audio was explicitly skipped or failed to decode. Feeding
+/// ffmpeg a near-empty audio stream with `-shortest` can make the output stop at
+/// t=0 before any rawvideo frames are encoded.
+pub fn write_mp4_video_only(
+    out_path: &Path,
+    frames: &[u8],
+    frame_count: usize,
+    width: usize,
+    height: usize,
+    fps: f32,
+) -> std::io::Result<()> {
+    assert_eq!(frames.len(), frame_count * width * height * 3);
+
+    if let Some(parent) = out_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let tmp_dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let frames_path = tmp_dir.join(format!("ltx2_mux_{pid}_frames.rgb"));
+
+    {
+        let mut f = File::create(&frames_path)?;
+        f.write_all(frames)?;
+    }
+
+    let status = Command::new("ffmpeg")
+        .arg("-y")
+        .arg("-f").arg("rawvideo")
+        .arg("-pix_fmt").arg("rgb24")
+        .arg("-s").arg(format!("{width}x{height}"))
+        .arg("-r").arg(format!("{fps}"))
+        .arg("-i").arg(&frames_path)
+        .arg("-c:v").arg("libx264")
+        .arg("-crf").arg("18")
+        .arg("-pix_fmt").arg("yuv420p")
+        .arg(out_path)
+        .status()?;
+
+    let _ = std::fs::remove_file(&frames_path);
 
     if !status.success() {
         return Err(std::io::Error::new(

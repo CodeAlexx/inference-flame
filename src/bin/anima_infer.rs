@@ -9,7 +9,7 @@ use inference_flame::models::anima::{Anima, load_all_weights};
 use flame_core::{global_cuda_device, DType, Shape, Tensor};
 use std::time::Instant;
 
-const MODEL_PATH: &str = "/home/alex/EriDiffusion/Models/anima/split_files/diffusion_models/anima-preview2.safetensors";
+const MODEL_PATH: &str = "/home/alex/EriDiffusion/Models/anima/split_files/diffusion_models/anima-base-v1.0.safetensors";
 const DEFAULT_EMB_PATH: &str = "/home/alex/EriDiffusion/inference-flame/output/anima_embeddings.safetensors";
 const VAE_PATH: &str = "/home/alex/EriDiffusion/Models/anima/split_files/vae/qwen_image_vae.safetensors";
 const OUTPUT_PATH: &str = "/home/alex/EriDiffusion/inference-flame/output/anima_rust.png";

@@ -51,7 +51,7 @@ use inference_flame::models::qwen3_encoder::Qwen3Encoder;
 use inference_flame::vae::Wan21VaeDecoder;
 
 const DEFAULT_BASE: &str =
-    "/home/alex/EriDiffusion/Models/anima/split_files/diffusion_models/anima-preview2.safetensors";
+    "/home/alex/EriDiffusion/Models/anima/split_files/diffusion_models/anima-base-v1.0.safetensors";
 const DEFAULT_QWEN3: &str =
     "/home/alex/EriDiffusion/Models/anima/split_files/text_encoders/qwen_3_06b_base.safetensors";
 const DEFAULT_VAE: &str =

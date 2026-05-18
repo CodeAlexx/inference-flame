@@ -102,6 +102,12 @@ pub enum ModelKind {
     /// stays ~11 GB. T2I non-think only — chat/think-mode/it2i are out of
     /// scope for this UI worker (use the standalone CLI bins).
     SenseNovaU1,
+    /// AsymFlux / AsymFlow — research model from LakonLab (asymmetric flow
+    /// velocity reconstruction). UI surface added 2026-05-15 ahead of the
+    /// worker implementation; selecting this entry currently returns
+    /// "AsymFlux: worker not yet wired". Update once the inference path
+    /// ships (track in LakonLab/docs/AsymFlow.md).
+    AsymFlux,
 }
 
 impl ModelKind {
@@ -134,6 +140,15 @@ impl ModelKind {
         // (handled inside `worker/sensenova.rs`).
         if lower.contains("sensenova") {
             Self::SenseNovaU1
+        // AsymFlux / AsymFlow — match either spelling. The user-facing typo
+        // "asmyflux" also matches via a Levenshtein-friendly substring check.
+        } else if lower.contains("asymflux")
+            || lower.contains("asym-flux")
+            || lower.contains("asymflow")
+            || lower.contains("asym-flow")
+            || lower.contains("asmyflux")
+        {
+            Self::AsymFlux
         } else if lower.contains("z-image-turbo") || lower.contains("zimage-turbo") {
             Self::ZImageTurbo
         } else if lower.contains("z-image-base") || lower.contains("zimage-base") {

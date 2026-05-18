@@ -100,6 +100,15 @@ fn main() -> anyhow::Result<()> {
     let t5_uncond = embeddings.get("t5_uncond")
         .ok_or_else(|| anyhow::anyhow!("Missing t5_uncond in embeddings file"))?
         .clone();
+    // Optional real token counts (post-tokenize, pre-pad). Present on
+    // embeddings produced by post-2026-05-16 chroma_encode; missing on
+    // older files → falls back to T5_SEQ_LEN (no mask, legacy behavior).
+    let cond_real_len: usize = embeddings.get("cond_real_len")
+        .and_then(|t| t.to_vec().ok().map(|v| v[0] as usize))
+        .unwrap_or(T5_SEQ_LEN);
+    let uncond_real_len: usize = embeddings.get("uncond_real_len")
+        .and_then(|t| t.to_vec().ok().map(|v| v[0] as usize))
+        .unwrap_or(T5_SEQ_LEN);
     drop(embeddings);
     let t5_cond = ensure_bf16(t5_cond)?;
     let t5_uncond = ensure_bf16(t5_uncond)?;
@@ -171,6 +180,47 @@ fn main() -> anyhow::Result<()> {
         device.clone(),
     )?;
 
+    // Attention mask [2, 1, S, S] BF16, K-side only (queries from pad
+    // positions are discarded when extracting img-only output). flame-core
+    // SDPA uses binary keep-mask semantics: 1 = attend, 0 = block.
+    // Row 0 = cond, row 1 = uncond.
+    //   T5 token range [0 .. real_len+1] and all img range → 1 (kept)
+    //   Remaining T5 pad range → 0 (blocked)
+    // The extra unmasked token matches OneTrainer's ChromaModel behavior.
+    let total_seq = T5_SEQ_LEN + n_img;
+    println!("  T5 real_len cond={} uncond={} (pad-masked: {}+{})",
+        cond_real_len, uncond_real_len,
+        T5_SEQ_LEN.saturating_sub(cond_real_len),
+        T5_SEQ_LEN.saturating_sub(uncond_real_len));
+    let attn_mask = {
+        let mut data = vec![1.0f32; 2 * 1 * total_seq * total_seq];
+        let cond_block_start = (cond_real_len + 1).min(T5_SEQ_LEN);
+        let uncond_block_start = (uncond_real_len + 1).min(T5_SEQ_LEN);
+        // batch 0 = cond
+        for q in 0..total_seq {
+            let row = q * total_seq;
+            for k in cond_block_start..T5_SEQ_LEN {
+                data[row + k] = 0.0;
+            }
+        }
+        // batch 1 = uncond
+        let b1 = total_seq * total_seq;
+        for q in 0..total_seq {
+            let row = b1 + q * total_seq;
+            for k in uncond_block_start..T5_SEQ_LEN {
+                data[row + k] = 0.0;
+            }
+        }
+        Tensor::from_f32_to_bf16(
+            data,
+            Shape::from_dims(&[2, 1, total_seq, total_seq]),
+            device.clone(),
+        )?
+    };
+    println!("  Built attn_mask {:?} ({:.1} MB BF16)",
+        attn_mask.shape().dims(),
+        (2 * total_seq * total_seq * 2) as f32 / 1e6);
+
     // FLUX-style flow-match Euler shift schedule. Chroma is NOT distilled,
     // so we run real CFG (2 forwards per step).
     let timesteps = get_schedule(num_steps, n_img, 0.5, 1.15, true);
@@ -204,7 +254,7 @@ fn main() -> anyhow::Result<()> {
             // Stack x twice to match B=2. Same latent feeds both rows; the
             // split happens in the output based on the T5 side.
             let x_batched = Tensor::cat(&[&x, &x], 0)?;
-            let preds = dit.forward_cached(&x_batched, &t5_batched, &pooled_temb, &pe_cos, &pe_sin)?;
+            let preds = dit.forward_cached_masked(&x_batched, &t5_batched, &pooled_temb, &pe_cos, &pe_sin, Some(&attn_mask))?;
             drop(x_batched);
 
             // preds[0] = cond, preds[1] = uncond (matches t5_batched order).

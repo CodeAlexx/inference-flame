@@ -165,5 +165,10 @@ pub fn resolve_image_model_path(filename: &str, kind: ModelKind) -> Option<Strin
         // hardcoded SENSENOVA_WEIGHTS_DIR const. Return None so we don't
         // mislead the worker into treating the placeholder as a real path.
         ModelKind::SenseNovaU1 => None,
+
+        // AsymFlux / AsymFlow: UI surface only; the worker dispatch returns
+        // an explicit "not yet wired" error. No on-disk path resolution to
+        // do until the inference port lands.
+        ModelKind::AsymFlux => None,
     }
 }

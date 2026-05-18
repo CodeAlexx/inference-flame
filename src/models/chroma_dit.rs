@@ -663,6 +663,21 @@ impl ChromaDit {
         pe_cos: &Tensor,
         pe_sin: &Tensor,
     ) -> Result<Tensor> {
+        self.forward_cached_masked(img, txt, pooled_temb, pe_cos, pe_sin, None)
+    }
+
+    /// `forward_cached` with optional additive attention mask shape
+    /// `[B,1,Q,K]` (or broadcastable) BF16, applied inside SDPA to hide
+    /// T5 pad tokens. None → identical to `forward_cached`.
+    pub fn forward_cached_masked(
+        &mut self,
+        img: &Tensor,
+        txt: &Tensor,
+        pooled_temb: &Tensor,
+        pe_cos: &Tensor,
+        pe_sin: &Tensor,
+        attn_mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
         let img_len = img.shape().dims()[1];
 
         // --- Input projections (use &self.shared) ---
@@ -691,6 +706,7 @@ impl ChromaDit {
             pooled_temb, pe_cos, pe_sin,
             offloader,
             /* transpose_2d_weights = */ true,
+            attn_mask,
         )
     }
 
@@ -722,6 +738,7 @@ impl ChromaDit {
         pe_sin: &Tensor,
         loader: &mut L,
         transpose_2d_weights: bool,
+        attn_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
         // --- Block indexing constants (layout from diffusers transformer_chroma.py) ---
         //   single block i:  [3*i : 3*i + 3]                          for i in 0..38
@@ -762,6 +779,7 @@ impl ChromaDit {
             let (new_img, new_txt) = Self::double_block_forward(
                 cfg,
                 &img, &txt, &img_mod, &txt_mod, pe_cos, pe_sin, &raw, i,
+                attn_mask,
             )?;
             img = new_img;
             txt = new_txt;
@@ -793,7 +811,7 @@ impl ChromaDit {
             };
 
             let single_mod = pooled_temb.narrow(1, 3 * i, 3)?; // [B, 3, dim]
-            x = Self::single_block_forward(cfg, &x, &single_mod, pe_cos, pe_sin, &raw, i)?;
+            x = Self::single_block_forward(cfg, &x, &single_mod, pe_cos, pe_sin, &raw, i, attn_mask)?;
 
             if i % 10 == 0 || i == cfg.num_single_blocks - 1 {
                 log::info!("[Chroma] Single block {}/{}", i + 1, cfg.num_single_blocks);
@@ -868,6 +886,7 @@ impl ChromaDit {
             &pooled_temb, &pe_cos, &pe_sin,
             loader,
             /* transpose_2d_weights = */ false,
+            /* attn_mask = */ None,
         )
     }
 
@@ -894,6 +913,7 @@ impl ChromaDit {
         pe_sin: &Tensor,
         weights: &HashMap<String, Tensor>,
         block_idx: usize,
+        attn_mask: Option<&Tensor>,
     ) -> Result<(Tensor, Tensor)> {
         let h = cfg.num_heads;
         let d = cfg.head_dim;
@@ -989,7 +1009,7 @@ impl ChromaDit {
         let (q, k) = Self::apply_rope_complex(&q, &k, pe_cos, pe_sin)?;
 
         // ── 6. SDPA ──
-        let attn_out = flame_core::attention::sdpa(&q, &k, &v, None)?;
+        let attn_out = flame_core::attention::sdpa(&q, &k, &v, attn_mask)?;
 
         // ── 7. Split back, permute, project out ──
         // Fused: one kernel replaces 2 narrow + 2 permute+reshape.
@@ -1034,6 +1054,7 @@ impl ChromaDit {
         pe_sin: &Tensor,
         weights: &HashMap<String, Tensor>,
         block_idx: usize,
+        attn_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
         let h = cfg.num_heads;
         let d = cfg.head_dim;
@@ -1087,7 +1108,7 @@ impl ChromaDit {
         let (q, k) = Self::apply_rope_complex(&q, &k, pe_cos, pe_sin)?;
 
         // ── 6. SDPA ──
-        let attn_out = flame_core::attention::sdpa(&q, &k, &v, None)?;
+        let attn_out = flame_core::attention::sdpa(&q, &k, &v, attn_mask)?;
         let attn_out = attn_out.permute(&[0, 2, 1, 3])?.reshape(&[b, n, h * d])?;
 
         // ── 7. MLP path: proj_mlp → GELU ──

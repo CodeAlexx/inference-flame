@@ -51,8 +51,7 @@ const LTX_CHECKPOINT: &str =
     "/home/alex/.serenity/models/checkpoints/ltx-2.3-22b-dev.safetensors";
 const UPSAMPLER_PATH: &str =
     "/home/alex/.serenity/models/checkpoints/ltx-2.3-spatial-upscaler-x2-1.0.safetensors";
-const VAE_STATS_PATH: &str =
-    "/home/alex/.serenity/models/checkpoints/ltx-2.3-22b-distilled.safetensors";
+const VAE_STATS_PATH: &str = LTX_CHECKPOINT;
 const OUTPUT_DIR: &str =
     "/home/alex/EriDiffusion/inference-flame/output";
 
@@ -60,6 +59,7 @@ const LATENT_CHANNELS: usize = 128;
 const AUDIO_CHANNELS: usize = 8;
 const AUDIO_MEL_BINS: usize = 16;
 const FRAME_RATE: f32 = 25.0;
+const TEXT_MAX_LEN: usize = 1024;
 
 const DEFAULT_PROMPT: &str =
     "A close-up frames a woman pressed flat against a cold metal locker in a dark storage bay, \
@@ -163,7 +163,7 @@ fn main() -> anyhow::Result<()> {
     // a schema version (bumped when the encoder pipeline changes — e.g.
     // the 2026-04-19 feature_extractor layout fix) so older cached
     // embeddings don't silently get loaded.
-    const CACHE_SCHEMA_VERSION: &str = "v2_post_fe_fix";
+    const CACHE_SCHEMA_VERSION: &str = "v3_mask_1024";
     let prompt_hash = {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
@@ -176,7 +176,7 @@ fn main() -> anyhow::Result<()> {
     let video_cache = format!("{cache_dir}/video_context_{prompt_hash}.safetensors");
     let audio_cache = format!("{cache_dir}/audio_context_{prompt_hash}.safetensors");
 
-    let (video_context, audio_context) = if std::path::Path::new(&video_cache).exists()
+    let (video_context, audio_context, text_mask) = if std::path::Path::new(&video_cache).exists()
         && std::path::Path::new(&audio_cache).exists()
         && std::env::var("LTX2_MS_REENCODE").is_err()
     {
@@ -185,8 +185,12 @@ fn main() -> anyhow::Result<()> {
         let ac = flame_core::serialization::load_file(std::path::Path::new(&audio_cache), &device)?;
         let v = vc.get("video_context").unwrap().to_dtype(DType::BF16)?;
         let a = ac.get("audio_context").unwrap().to_dtype(DType::BF16)?;
+        let m = vc.get("encoder_attention_mask")
+            .or_else(|| ac.get("encoder_attention_mask"))
+            .ok_or_else(|| anyhow::anyhow!("cached LTX2 contexts are missing encoder_attention_mask; set LTX2_MS_REENCODE=1"))?
+            .to_dtype(DType::BF16)?;
         println!("  Loaded video_ctx={:?}  audio_ctx={:?}", v.dims(), a.dims());
-        (v, a)
+        (v, a, m)
     } else {
         println!("\n--- Text Encoding (Gemma-3) ---");
         let t0 = Instant::now();
@@ -198,7 +202,7 @@ fn main() -> anyhow::Result<()> {
         }
         let shard_refs: Vec<&str> = shards.iter().map(|s| s.as_str()).collect();
 
-        let (input_ids, attention_mask) = simple_tokenize(&prompt, 256)?;
+        let (input_ids, attention_mask) = simple_tokenize(&prompt, TEXT_MAX_LEN)?;
         let mut encoder = Gemma3Encoder::load(&shard_refs, &device, input_ids.len())?;
         let (all_hidden, mask_out) = encoder.encode(&input_ids, &attention_mask)?;
         println!("  Gemma done: {:.1}s", t0.elapsed().as_secs_f32());
@@ -224,6 +228,7 @@ fn main() -> anyhow::Result<()> {
         let audio_context = feature_extractor::feature_extract_and_project(
             &all_hidden, &mask_out, aagg_w, aagg_b, 2048,
         )?;
+        let text_mask = feature_extractor::convert_to_additive_mask(&mask_out)?;
 
         drop(encoder);
         drop(all_hidden);
@@ -235,18 +240,20 @@ fn main() -> anyhow::Result<()> {
         std::fs::create_dir_all(&cache_dir)?;
         let mut vc = HashMap::new();
         vc.insert("video_context".to_string(), video_context.clone());
+        vc.insert("encoder_attention_mask".to_string(), text_mask.clone());
         flame_core::serialization::save_tensors(
             &vc, std::path::Path::new(&video_cache),
             flame_core::serialization::SerializationFormat::SafeTensors,
         )?;
         let mut ac = HashMap::new();
         ac.insert("audio_context".to_string(), audio_context.clone());
+        ac.insert("encoder_attention_mask".to_string(), text_mask.clone());
         flame_core::serialization::save_tensors(
             &ac, std::path::Path::new(&audio_cache),
             flame_core::serialization::SerializationFormat::SafeTensors,
         )?;
         println!("  Encoded in {:.1}s", t0.elapsed().as_secs_f32());
-        (video_context, audio_context)
+        (video_context, audio_context, text_mask)
     };
 
     // ========================================
@@ -267,8 +274,8 @@ fn main() -> anyhow::Result<()> {
         model.init_offloader_fp8_stream(MODEL_PATH_FP8)?;
         println!("  FP8-stream BlockOffloader ready in {:.1}s", t0.elapsed().as_secs_f32());
     } else {
-        model.init_offloader()?;
-        println!("  BlockOffloader ready in {:.1}s", t0.elapsed().as_secs_f32());
+        model.init_offloader_streaming()?;
+        println!("  Streaming BlockOffloader ready in {:.1}s", t0.elapsed().as_secs_f32());
     }
 
     // ========================================
@@ -338,7 +345,7 @@ fn main() -> anyhow::Result<()> {
             &video_x, &audio_x, &sigma_t,
             &video_context, &audio_context,
             FRAME_RATE,
-            None, None,
+            Some(&text_mask), Some(&text_mask),
         )?;
 
         // F32-accumulated Euler step (same rationale as ltx2_two_stage.rs).
@@ -369,7 +376,7 @@ fn main() -> anyhow::Result<()> {
     println!("\n--- Upsample + AdaIN (video) ---");
     let t0 = Instant::now();
 
-    // VAE per-channel stats (distilled checkpoint).
+    // VAE per-channel stats from the full LTX checkpoint, not diffusers VAE stats.
     let vae_stats = flame_core::serialization::load_file_filtered(
         std::path::Path::new(VAE_STATS_PATH), &device,
         |k| k == "vae.per_channel_statistics.mean-of-means"
@@ -461,7 +468,7 @@ fn main() -> anyhow::Result<()> {
             &video_x, &audio_x, &sigma_t,
             &video_context, &audio_context,
             FRAME_RATE,
-            None, None,
+            Some(&text_mask), Some(&text_mask),
         )?;
 
         let dt = sigma_next - sigma;

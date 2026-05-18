@@ -375,6 +375,22 @@ name = "ltx2_decode_av"
 path = "src/bin/ltx2_decode_av.rs"
 
 [[bin]]
+name = "ltx2_audio_stack_smoke"
+path = "src/bin/ltx2_audio_stack_smoke.rs"
+
+[[bin]]
+name = "ltx2_audio_vae_parity"
+path = "src/bin/ltx2_audio_vae_parity.rs"
+
+[[bin]]
+name = "ltx2_vocoder_parity"
+path = "src/bin/ltx2_vocoder_parity.rs"
+
+[[bin]]
+name = "ltx2_lora_wiring_check"
+path = "src/bin/ltx2_lora_wiring_check.rs"
+
+[[bin]]
 name = "wan_infer"
 path = "src/bin/wan_infer.rs"
 
@@ -425,6 +441,22 @@ path = "src/bin/ltx2_adain_tone_map_parity.rs"
 [[bin]]
 name = "ltx2_generate_ms"
 path = "src/bin/ltx2_generate_ms.rs"
+
+[[bin]]
+name = "ltx2_generate_av"
+path = "src/bin/ltx2_generate_av.rs"
+
+[[bin]]
+name = "ltx2_generate_kf"
+path = "src/bin/ltx2_generate_kf.rs"
+
+[[bin]]
+name = "ltx2_two_stage"
+path = "src/bin/ltx2_two_stage.rs"
+
+[[bin]]
+name = "ltx2_stage2_only"
+path = "src/bin/ltx2_stage2_only.rs"
 
 [[bin]]
 name = "ltx2_full_pipeline"

@@ -27,6 +27,7 @@ use flame_core::nn::Linear;
 use flame_core::{CudaDevice, Result, Tensor};
 
 use super::HiDreamO1Config;
+use super::lora::{add_lora_residual, LoraRegistry};
 
 /// Final projection: `[B, L, hidden_size] → [B, L, P*P*C]`.
 ///
@@ -61,5 +62,18 @@ impl FinalLayer {
     /// actually wires modulation here.
     pub fn forward(&self, hidden_states: &Tensor, _cond: Option<&Tensor>) -> Result<Tensor> {
         self.linear.forward(hidden_states)
+    }
+
+    pub fn forward_lora(
+        &self,
+        hidden_states: &Tensor,
+        _cond: Option<&Tensor>,
+        lora: Option<&LoraRegistry>,
+    ) -> Result<Tensor> {
+        let out = self.linear.forward(hidden_states)?;
+        match lora.and_then(|r| r.get_global("final_layer2.linear")) {
+            Some(adapter) => add_lora_residual(out, hidden_states, adapter),
+            None => Ok(out),
+        }
     }
 }

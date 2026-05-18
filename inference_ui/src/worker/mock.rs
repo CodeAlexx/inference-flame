@@ -326,6 +326,19 @@ pub fn run(ui_rx: Receiver<UiMsg>, ev_tx: Sender<WorkerEvent>, ctx: egui::Contex
                     let state = cascade_state.as_mut().unwrap();
                     cascade::run(&job, state, &ui_rx, &ev_tx, &ctx, &mut pending);
                 }
+                ModelKind::AsymFlux => {
+                    // UI placeholder — surface a clear error until the
+                    // AsymFlow/AsymFlux inference path is ported into
+                    // inference-flame. Tracked in LakonLab/docs/AsymFlow.md.
+                    let _ = ev_tx.send(WorkerEvent::Failed {
+                        id: job.id,
+                        error: "AsymFlux: worker not yet wired (UI surface only — \
+                                track LakonLab/docs/AsymFlow.md for the inference \
+                                port)".to_string(),
+                    });
+                    ctx.request_repaint();
+                    continue;
+                }
                 ModelKind::SenseNovaU1 => {
                     if sensenova_state.is_none() {
                         match sensenova::SenseNovaState::new() {

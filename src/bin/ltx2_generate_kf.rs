@@ -81,6 +81,7 @@ const LATENT_CHANNELS: usize = 128;
 const AUDIO_CHANNELS: usize = 8;
 const AUDIO_MEL_BINS: usize = 16;
 const NUM_STEPS: usize = 8;
+const TEXT_MAX_LEN: usize = 1024;
 const DEFAULT_COND_NOISE_SCALE: f32 = 0.15; // pipeline_ltx_video.py inference.py:365-368
 
 // ===========================================================================
@@ -331,9 +332,13 @@ fn main() -> anyhow::Result<()> {
     let stg_blocks = parse_stg_blocks();
     let cond_noise_scale: f32 =
         get_arg("--cond-noise-scale").unwrap_or(DEFAULT_COND_NOISE_SCALE);
+    let num_steps: usize = get_arg("--steps")
+        .unwrap_or(NUM_STEPS)
+        .clamp(1, LTX2_DISTILLED_SIGMAS.len() - 1);
     let neg_text =
         collect_str_arg("--neg").unwrap_or_else(|| DEFAULT_NEGATIVE.to_string());
     let fp8_stream = has_flag("--fp8-stream");
+    let fp8_resident = has_flag("--fp8-resident");
 
     let do_cfg = cfg_scale > 1.0;
     let do_stg = stg_scale > 0.0 && !stg_blocks.is_empty();
@@ -343,7 +348,7 @@ fn main() -> anyhow::Result<()> {
     println!("============================================================");
     println!(
         "  {}x{}, {} frames @ {}fps, {} steps",
-        width, height, num_frames, FRAME_RATE, NUM_STEPS
+        width, height, num_frames, FRAME_RATE, num_steps
     );
     println!(
         "  cfg={:.2} ({})  stg={:.2} ({})  cfg_star={}",
@@ -448,7 +453,7 @@ fn main() -> anyhow::Result<()> {
     }
     let shard_refs: Vec<&str> = shards.iter().map(|s| s.as_str()).collect();
 
-    let (input_ids, attention_mask) = simple_tokenize(&prompt, 256)?;
+    let (input_ids, attention_mask) = simple_tokenize(&prompt, TEXT_MAX_LEN)?;
     let mut encoder = Gemma3Encoder::load(&shard_refs, &device, input_ids.len())?;
     let (all_hidden, mask_out) = encoder.encode(&input_ids, &attention_mask)?;
 
@@ -484,22 +489,24 @@ fn main() -> anyhow::Result<()> {
         audio_agg_b,
         2048,
     )?;
+    let text_mask = feature_extractor::convert_to_additive_mask(&mask_out)?;
     drop(all_hidden);
     drop(mask_out);
 
     // Negative prompt encoding if CFG enabled.
-    let (neg_video_context, neg_audio_context) = if do_cfg {
-        let (nids, nmask) = simple_tokenize(&neg_text, 256)?;
+    let (neg_video_context, neg_audio_context, neg_text_mask) = if do_cfg {
+        let (nids, nmask) = simple_tokenize(&neg_text, TEXT_MAX_LEN)?;
         let (nh, nm) = encoder.encode(&nids, &nmask)?;
         let nv = feature_extractor::feature_extract_and_project(&nh, &nm, agg_w, agg_b, 4096)?;
         let na = feature_extractor::feature_extract_and_project(
             &nh, &nm, audio_agg_w, audio_agg_b, 2048,
         )?;
+        let ntm = feature_extractor::convert_to_additive_mask(&nm)?;
         drop(nh);
         drop(nm);
-        (Some(nv), Some(na))
+        (Some(nv), Some(na), Some(ntm))
     } else {
-        (None, None)
+        (None, None, None)
     };
 
     drop(encoder);
@@ -549,12 +556,12 @@ fn main() -> anyhow::Result<()> {
             MODEL_PATH_FP8,
         );
     } else if !lora_specs.is_empty() {
-        model.init_offloader()?;
+        model.init_offloader_streaming()?;
         println!(
-            "  BlockOffloader initialized (LoRA path) in {:.1}s",
+            "  Streaming BlockOffloader initialized (LoRA path) in {:.1}s",
             t0.elapsed().as_secs_f32()
         );
-    } else {
+    } else if fp8_resident {
         match model.load_fp8_resident() {
             Ok(()) => println!(
                 "  FP8 resident loaded in {:.1}s",
@@ -562,13 +569,19 @@ fn main() -> anyhow::Result<()> {
             ),
             Err(e) => {
                 println!("  FP8 resident failed ({e}), falling back to BlockOffloader");
-                model.init_offloader()?;
+                model.init_offloader_streaming()?;
                 println!(
-                    "  BlockOffloader initialized in {:.1}s",
+                    "  Streaming BlockOffloader initialized in {:.1}s",
                     t0.elapsed().as_secs_f32()
                 );
             }
         }
+    } else {
+        model.init_offloader_streaming()?;
+        println!(
+            "  Streaming BlockOffloader initialized (--fp8-resident opt-in disabled by default) in {:.1}s",
+            t0.elapsed().as_secs_f32()
+        );
     }
 
     // ========================================================================
@@ -605,7 +618,17 @@ fn main() -> anyhow::Result<()> {
     // (pipeline_ltx_video.py:1151-1159).
     let init_latents_snapshot = merged_latents.clone();
 
-    let sigmas = LTX2_DISTILLED_SIGMAS.to_vec();
+    let sigmas: Vec<f32> = if num_steps == LTX2_DISTILLED_SIGMAS.len() - 1 {
+        LTX2_DISTILLED_SIGMAS.to_vec()
+    } else {
+        let last = LTX2_DISTILLED_SIGMAS.len() - 1;
+        (0..=num_steps)
+            .map(|i| {
+                let idx = ((i * last) + (num_steps / 2)) / num_steps;
+                LTX2_DISTILLED_SIGMAS[idx.min(last)]
+            })
+            .collect()
+    };
     println!("  Merged video latents: {:?}", merged_latents.dims());
     println!("  Audio noise:          {:?}", audio_noise.dims());
     println!(
@@ -626,13 +649,13 @@ fn main() -> anyhow::Result<()> {
     // ========================================================================
     println!(
         "\n--- Stage 4: Denoise ({} steps, AV joint, {} fwd/step) ---",
-        NUM_STEPS, forwards_per_step
+        num_steps, forwards_per_step
     );
     let t0 = Instant::now();
     let mut video_x = merged_latents;
     let mut audio_x = audio_noise;
 
-    for step in 0..NUM_STEPS {
+    for step in 0..num_steps {
         let sigma = sigmas[step];
         let sigma_next = sigmas[step + 1];
         let t_step = Instant::now();
@@ -668,8 +691,8 @@ fn main() -> anyhow::Result<()> {
             &video_context,
             &audio_context,
             FRAME_RATE,
-            None,
-            None,
+            Some(&text_mask),
+            Some(&text_mask),
             None, // no STG on the conditional pass
             cond_mask_packed.as_ref(),
         )?;
@@ -685,8 +708,8 @@ fn main() -> anyhow::Result<()> {
                 nvc,
                 nac,
                 FRAME_RATE,
-                None,
-                None,
+                neg_text_mask.as_ref(),
+                neg_text_mask.as_ref(),
                 None,
                 cond_mask_packed.as_ref(),
             )?;
@@ -712,8 +735,8 @@ fn main() -> anyhow::Result<()> {
                 &video_context,
                 &audio_context,
                 FRAME_RATE,
-                None,
-                None,
+                Some(&text_mask),
+                Some(&text_mask),
                 Some(&stg_blocks),
                 cond_mask_packed.as_ref(),
             )?;
@@ -746,7 +769,7 @@ fn main() -> anyhow::Result<()> {
         println!(
             "  Step {}/{} sigma={:.4} dt={:.1}s",
             step + 1,
-            NUM_STEPS,
+            num_steps,
             sigma,
             dt_step
         );
@@ -756,7 +779,7 @@ fn main() -> anyhow::Result<()> {
     println!(
         "  Denoised in {:.1}s ({:.1}s/step)",
         dt,
-        dt / NUM_STEPS as f32
+        dt / num_steps as f32
     );
 
     // ========================================================================

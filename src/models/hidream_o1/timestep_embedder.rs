@@ -38,9 +38,10 @@
 use std::sync::Arc;
 
 use flame_core::nn::Linear;
-use flame_core::{bf16_ops, CudaDevice, DType, Error, Result, Shape, Tensor};
+use flame_core::{CudaDevice, DType, Error, Result, Shape, Tensor};
 
 use super::HiDreamO1Config;
+use super::lora::{add_lora_residual, LoraRegistry};
 
 /// 2-layer MLP that turns a scalar timestep into a `[B, hidden_size]` vector,
 /// which is then scattered into the sequence at every `<|tms_token|>` slot
@@ -89,6 +90,10 @@ impl TimestepEmbedder {
     ///
     /// Output: `[B, hidden_size]`, dtype matches `mlp_in.weight` (BF16).
     pub fn forward(&self, t: &Tensor) -> Result<Tensor> {
+        self.forward_lora(t, None)
+    }
+
+    pub fn forward_lora(&self, t: &Tensor, lora: Option<&LoraRegistry>) -> Result<Tensor> {
         // Build sinusoidal embedding on CPU (small, batch-1 typical) at FP32,
         // then upload as BF16 — matches the `t_freq.to(self.mlp[0].weight.dtype)`
         // cast in Python.
@@ -100,8 +105,16 @@ impl TimestepEmbedder {
             &self.device,
         )?;
         let h = self.mlp_in.forward(&t_freq)?;
-        let h = bf16_ops::silu_bf16(&h)?;
-        self.mlp_out.forward(&h)
+        let h = match lora.and_then(|r| r.get_global("t_embedder1.mlp.0")) {
+            Some(adapter) => add_lora_residual(h, &t_freq, adapter)?,
+            None => h,
+        };
+        let h = h.silu()?;
+        let out = self.mlp_out.forward(&h)?;
+        match lora.and_then(|r| r.get_global("t_embedder1.mlp.2")) {
+            Some(adapter) => add_lora_residual(out, &h, adapter),
+            None => Ok(out),
+        }
     }
 
     /// Sinusoidal timestep embedding.

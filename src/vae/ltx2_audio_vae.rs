@@ -1,4 +1,4 @@
-//! LTX-2.3 Audio VAE decoder — pure flame-core, production checkpoint parity.
+//! LTX-2.3 Audio VAE encoder/decoder — pure flame-core, production checkpoint parity.
 //!
 //! Matches `AudioDecoder` from `ltx_core.model.audio_vae.audio_vae` for the
 //! LTX-2.3 22B {dev,distilled} checkpoints:
@@ -133,10 +133,15 @@ struct CausalConv2d {
     weight: Tensor,
     bias: Tensor,
     kernel: (usize, usize),
+    stride: (usize, usize),
 }
 
 impl CausalConv2d {
     fn load(weights: &Weights, prefix: &str) -> Result<Self> {
+        Self::load_with_stride(weights, prefix, (1, 1))
+    }
+
+    fn load_with_stride(weights: &Weights, prefix: &str, stride: (usize, usize)) -> Result<Self> {
         let weight = get_bf16(weights, &format!("{prefix}.weight"))?;
         let bias = get_bf16(weights, &format!("{prefix}.bias"))?;
         let dims = weight.shape().dims().to_vec();
@@ -144,6 +149,7 @@ impl CausalConv2d {
             weight,
             bias,
             kernel: (dims[2], dims[3]),
+            stride,
         })
     }
 
@@ -161,7 +167,7 @@ impl CausalConv2d {
             &padded,
             &self.weight,
             Some(&self.bias),
-            (1, 1), // stride
+            self.stride,
             (0, 0), // padding
             (1, 1), // dilation
             1,      // groups
@@ -305,6 +311,71 @@ impl UpStage {
 }
 
 // ---------------------------------------------------------------------------
+// Downsample — causal zero-pad then stride-2 conv.
+// ---------------------------------------------------------------------------
+
+struct Downsample {
+    conv: CausalConv2d,
+}
+
+impl Downsample {
+    fn load(weights: &Weights, prefix: &str) -> Result<Self> {
+        Ok(Self {
+            conv: CausalConv2d::load_with_stride(weights, &format!("{prefix}.conv"), (2, 2))?,
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        // LTX-2 audio uses causality_axis=HEIGHT:
+        // F.pad(x, (left=0, right=1, top=2, bottom=0)) before stride-2 conv.
+        let padded = pad2d_zero(x, 0, 1, 2, 0)?;
+        flame_core::cudnn::cudnn_conv2d_bf16(
+            &padded,
+            &self.conv.weight,
+            Some(&self.conv.bias),
+            (2, 2),
+            (0, 0),
+            (1, 1),
+            1,
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DownStage — list of ResnetBlocks + optional Downsample.
+// ---------------------------------------------------------------------------
+
+struct DownStage {
+    blocks: Vec<ResnetBlock>,
+    downsample: Option<Downsample>,
+}
+
+impl DownStage {
+    fn load(weights: &Weights, prefix: &str, n_blocks: usize, has_downsample: bool) -> Result<Self> {
+        let mut blocks = Vec::with_capacity(n_blocks);
+        for i in 0..n_blocks {
+            blocks.push(ResnetBlock::load(weights, &format!("{prefix}.block.{i}"))?);
+        }
+        let downsample = if has_downsample {
+            Some(Downsample::load(weights, &format!("{prefix}.downsample"))?)
+        } else {
+            None
+        };
+        Ok(Self { blocks, downsample })
+    }
+
+    fn forward(&self, mut x: Tensor) -> Result<Tensor> {
+        for block in &self.blocks {
+            x = block.forward(&x)?;
+        }
+        if let Some(down) = &self.downsample {
+            x = down.forward(&x)?;
+        }
+        Ok(x)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PerChannelStatistics — denormalize on the patched representation
 // ---------------------------------------------------------------------------
 
@@ -337,6 +408,99 @@ impl PerChannelStatistics {
         let denorm = flat.mul(&std)?.add(&mean)?;
         // [B, T, C*F] → [B, T, C, F] → [B, C, T, F]
         denorm.reshape(&[b, t, c, f])?.permute(&[0, 2, 1, 3])
+    }
+
+    /// `x`: `[B, 8, T, 16]`. Returns same shape, normalized via:
+    ///   rearrange "b c t f -> b t (c f)"
+    ///   (x_128 - mean) / std
+    ///   rearrange back.
+    fn normalize(&self, x: &Tensor) -> Result<Tensor> {
+        let d = x.shape().dims();
+        let (b, c, t, f) = (d[0], d[1], d[2], d[3]);
+        let cf = c * f;
+
+        let flat = x.permute(&[0, 2, 1, 3])?.reshape(&[b, t, cf])?;
+        let std = self.std.reshape(&[1, 1, cf])?;
+        let mean = self.mean.reshape(&[1, 1, cf])?;
+        let centered = flat.sub(&mean)?;
+        let normed = centered.div(&std)?;
+        normed.reshape(&[b, t, c, f])?.permute(&[0, 2, 1, 3])
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Public encoder
+// ---------------------------------------------------------------------------
+
+pub struct LTX2AudioVaeEncoder {
+    stats: PerChannelStatistics,
+    conv_in: CausalConv2d,
+    downs: Vec<DownStage>,
+    mid: MidBlock,
+    conv_out: CausalConv2d,
+}
+
+impl LTX2AudioVaeEncoder {
+    pub fn load(weights: &Weights) -> Result<Self> {
+        let stats = PerChannelStatistics::load(weights)?;
+        let conv_in = CausalConv2d::load(weights, "encoder.conv_in.conv")?;
+        let downs = vec![
+            DownStage::load(weights, "encoder.down.0", 2, true)?,
+            DownStage::load(weights, "encoder.down.1", 2, true)?,
+            DownStage::load(weights, "encoder.down.2", 2, false)?,
+        ];
+        let mid = MidBlock::load(weights, "encoder.mid")?;
+        let conv_out = CausalConv2d::load(weights, "encoder.conv_out.conv")?;
+        Ok(Self { stats, conv_in, downs, mid, conv_out })
+    }
+
+    /// Encode an LTX-2 log-mel spectrogram `[B, 2, T, 64]` into normalized
+    /// audio latents `[B, 8, T/4, 16]`.
+    pub fn encode_spectrogram(&self, spectrogram: &Tensor) -> Result<Tensor> {
+        let mut h = self.conv_in.forward(spectrogram)?;
+        for stage in &self.downs {
+            h = stage.forward(h)?;
+        }
+        h = self.mid.forward(&h)?;
+        h = pixel_norm(&h)?;
+        h = h.silu()?;
+        let latent_output = self.conv_out.forward(&h)?;
+
+        let dims = latent_output.shape().dims();
+        if dims.len() != 4 || dims[1] < LATENT_CH {
+            return Err(Error::InvalidOperation(format!(
+                "AudioVAE encoder: expected [B, >=8, T, F], got {:?}",
+                dims
+            )));
+        }
+        let means = latent_output.narrow(1, 0, LATENT_CH)?;
+        self.stats.normalize(&means)
+    }
+
+    /// Load from a full LTX-2.3 safetensors checkpoint. Strips the
+    /// `audio_vae.` prefix and only pulls encoder + stats keys into GPU.
+    pub fn from_file(path: &str, device: &Arc<CudaDevice>) -> Result<Self> {
+        eprintln!("Loading LTX-2.3 Audio VAE encoder from: {path}");
+        let raw = serialization::load_file_filtered(
+            std::path::Path::new(path),
+            device,
+            |k| k.starts_with("audio_vae.encoder.") || k.starts_with("audio_vae.per_channel_statistics."),
+        )?;
+
+        let mut normalized: Weights = HashMap::new();
+        for (key, value) in raw {
+            let stripped = key.strip_prefix("audio_vae.").unwrap_or(&key).to_string();
+            normalized.insert(stripped, value);
+        }
+
+        let enc_count = normalized.keys().filter(|k| k.starts_with("encoder.")).count();
+        let stat_count = normalized
+            .keys()
+            .filter(|k| k.starts_with("per_channel_statistics."))
+            .count();
+        eprintln!("  {enc_count} audio encoder keys, {stat_count} statistics keys");
+
+        Self::load(&normalized)
     }
 }
 

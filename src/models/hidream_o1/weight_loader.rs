@@ -436,6 +436,11 @@ impl HiDreamO1WeightLoader {
                 .map_err(|e| anyhow!("final_layer2.linear.bias: {e}"))?;
         }
 
+        // These are frozen base-model tensors. Keeping Linear::new's default
+        // requires_grad=true wastes backward memory once resident LoRAs are
+        // attached to the same path.
+        freeze_resident_weights(&mut model);
+
         // 9) All resident keys must have been consumed.
         if !weights.is_empty() {
             let leftover: Vec<&String> = weights.keys().take(8).collect();
@@ -451,6 +456,25 @@ impl HiDreamO1WeightLoader {
             config.num_layers
         );
         Ok(model)
+    }
+}
+
+fn freeze_resident_weights(model: &mut HiDreamO1Model) {
+    model.embed_tokens.weight = model.embed_tokens.weight.clone().requires_grad_(false);
+    if let Some(w) = model.norm.weight.take() {
+        model.norm.weight = Some(w.requires_grad_(false));
+    }
+    freeze_linear(&mut model.bottleneck_patch_embed.proj1);
+    freeze_linear(&mut model.bottleneck_patch_embed.proj2);
+    freeze_linear(&mut model.timestep_embedder.mlp_in);
+    freeze_linear(&mut model.timestep_embedder.mlp_out);
+    freeze_linear(&mut model.final_layer.linear);
+}
+
+fn freeze_linear(linear: &mut flame_core::nn::Linear) {
+    linear.weight = linear.weight.clone().requires_grad_(false);
+    if let Some(bias) = linear.bias.take() {
+        linear.bias = Some(bias.requires_grad_(false));
     }
 }
 

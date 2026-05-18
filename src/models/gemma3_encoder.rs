@@ -710,7 +710,8 @@ impl Gemma3Encoder {
 /// sin = emb.sin() * attention_scaling
 /// ```
 ///
-/// For "linear" rope_type: attention_scaling = 1/factor.
+/// For "linear" rope_type, HF divides inv_freq by `factor`; it does not
+/// scale cos/sin amplitudes.
 fn build_rope_table(
     max_seq_len: usize,
     head_dim: usize,
@@ -719,12 +720,12 @@ fn build_rope_table(
     device: &Arc<CudaDevice>,
 ) -> Result<(Tensor, Tensor)> {
     let half = head_dim / 2;
-    let attention_scaling = 1.0 / scaling_factor;
 
-    // inv_freq: [half] = 1 / theta^(2i/dim)
+    // inv_freq: [half] = (1 / theta^(2i/dim)) / scaling_factor
     let mut inv_freq = vec![0.0f64; half];
     for i in 0..half {
-        inv_freq[i] = 1.0 / theta.powf((2 * i) as f64 / head_dim as f64);
+        inv_freq[i] =
+            (1.0 / theta.powf((2 * i) as f64 / head_dim as f64)) / scaling_factor;
     }
 
     // Build [max_seq_len, half] cos/sin
@@ -734,8 +735,8 @@ fn build_rope_table(
     for pos in 0..max_seq_len {
         for i in 0..half {
             let angle = (pos as f64) * inv_freq[i];
-            let c = (angle.cos() * attention_scaling) as f32;
-            let s = (angle.sin() * attention_scaling) as f32;
+            let c = angle.cos() as f32;
+            let s = angle.sin() as f32;
             cos_data[pos * half + i] = c;
             sin_data[pos * half + i] = s;
         }

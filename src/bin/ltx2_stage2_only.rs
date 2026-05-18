@@ -33,7 +33,7 @@ const SEED: u64 = 42;
 // Deterministic normal noise — mirrors `make_noise` in ltx2_two_stage.rs so
 // both binaries share the exact same RNG semantics.
 fn make_noise(_numel: usize, seed: u64, shape: &[usize], device: &std::sync::Arc<flame_core::CudaDevice>) -> anyhow::Result<Tensor> {
-    flame_core::rng::set_seed(seed);
+    flame_core::rng::set_seed(seed)?;
     let t = Tensor::randn(Shape::from_dims(shape), 0.0, 1.0, device.clone())?;
     Ok(t.to_dtype(DType::BF16)?)
 }
@@ -58,11 +58,15 @@ fn main() -> anyhow::Result<()> {
     // --- Load cached text embeddings ---
     let cache_dir = format!("{OUTPUT_DIR}/embed_cache");
     let vc = flame_core::serialization::load_file(
-        std::path::Path::new(&format!("{cache_dir}/video_context.safetensors")), &device)?;
+        std::path::Path::new(&format!("{cache_dir}/video_context_ltx23_mask1024.safetensors")), &device)?;
     let ac = flame_core::serialization::load_file(
-        std::path::Path::new(&format!("{cache_dir}/audio_context.safetensors")), &device)?;
+        std::path::Path::new(&format!("{cache_dir}/audio_context_ltx23_mask1024.safetensors")), &device)?;
     let video_context = vc.get("video_context").unwrap().to_dtype(DType::BF16)?;
     let audio_context = ac.get("audio_context").unwrap().to_dtype(DType::BF16)?;
+    let text_mask = vc.get("encoder_attention_mask")
+        .or_else(|| ac.get("encoder_attention_mask"))
+        .ok_or_else(|| anyhow::anyhow!("stage2 cache missing encoder_attention_mask; rerun ltx2_two_stage first"))?
+        .to_dtype(DType::BF16)?;
     stats("video_context", &video_context)?;
     stats("audio_context", &audio_context)?;
 
@@ -109,8 +113,8 @@ fn main() -> anyhow::Result<()> {
     let t0 = Instant::now();
     let config = LTX2Config::default();
     let mut model = LTX2StreamingModel::load_globals(MODEL_PATH, &config)?;
-    model.init_offloader()?;
-    println!("  Loaded in {:.1}s", t0.elapsed().as_secs_f32());
+    model.init_offloader_streaming()?;
+    println!("  Loaded streaming offloader in {:.1}s", t0.elapsed().as_secs_f32());
 
     // --- Stage 2 noise injection ---
     println!("\n--- Stage 2: Refine ---");
@@ -187,7 +191,7 @@ fn main() -> anyhow::Result<()> {
             &video_x, &audio_x, &sigma_t,
             &video_context, &audio_context,
             FRAME_RATE,
-            None, None,
+            Some(&text_mask), Some(&text_mask),
         )?;
 
         // F32 Euler step — mirrors Python's `EulerDiffusionStep.step` which

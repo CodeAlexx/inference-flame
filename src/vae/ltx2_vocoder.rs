@@ -14,8 +14,8 @@
 //!   tanh final
 //!
 //! Base vocoder output: stereo 16 kHz (LTX-2.3 `input_sampling_rate`).
-//! Final 48 kHz BWE path is NOT yet wired — this module returns 16 kHz which
-//! the caller can upsample via linear/sinc as a fallback.
+//! `LTX2VocoderWithBWE` chains the same checkpoint's BWE generator and
+//! Hann-windowed sinc skip path to produce the final 48 kHz waveform.
 //!
 //! AMPBlock1 structure (`ltx2_audio_vae.resnet.py`):
 //!   for i in 0..3:
@@ -50,9 +50,9 @@ type Weights = HashMap<String, Tensor>;
 const CONV_PRE_KERNEL: usize = 7;
 const CONV_POST_KERNEL: usize = 7;
 
-// Production config (matches checkpoint inspection):
-const UPSAMPLE_RATES: [usize; 6] = [5, 2, 2, 2, 2, 2];
-const UPSAMPLE_KERNEL_SIZES: [usize; 6] = [11, 4, 4, 4, 4, 4];
+// Production configs (matches checkpoint inspection):
+const BASE_UPSAMPLE_RATES: [usize; 6] = [5, 2, 2, 2, 2, 2];
+const BWE_UPSAMPLE_RATES: [usize; 5] = [6, 5, 2, 2, 2];
 const INITIAL_CHANNELS: usize = 1536;
 const NUM_KERNELS_PER_STAGE: usize = 3; // AMPBlock1 count per upsample stage
 /// Per-resblock kernel size (Python's `resblock_kernel_sizes`).
@@ -668,22 +668,56 @@ pub struct LTX2Vocoder {
     act_post: ActParams,
     conv_post_w: Tensor,
     conv_post_b: Option<Tensor>,
+    upsample_rates: Vec<usize>,
+    upsample_kernel_sizes: Vec<usize>,
     channels_per_stage: Vec<usize>, // after each ups[i]
     final_channels: usize,
+    apply_final_activation: bool,
 }
 
 impl LTX2Vocoder {
     pub fn load(weights: &Weights, prefix: &str) -> Result<Self> {
+        Self::load_with_final_activation(weights, prefix, true)
+    }
+
+    pub fn load_with_final_activation(
+        weights: &Weights,
+        prefix: &str,
+        apply_final_activation: bool,
+    ) -> Result<Self> {
         let conv_pre_w = get(weights, &format!("{prefix}.conv_pre.weight"))?;
         let conv_pre_b = get(weights, &format!("{prefix}.conv_pre.bias"))?;
 
-        let mut ups = Vec::with_capacity(6);
-        let mut channels_per_stage = Vec::with_capacity(6);
-        for i in 0..UPSAMPLE_RATES.len() {
+        let mut num_ups = 0usize;
+        while weights.contains_key(&format!("{prefix}.ups.{num_ups}.weight")) {
+            num_ups += 1;
+        }
+        if num_ups == 0 {
+            return Err(Error::InvalidOperation(format!(
+                "Vocoder: no upsample weights found for prefix {prefix}"
+            )));
+        }
+
+        let upsample_rates: Vec<usize> = match num_ups {
+            6 => BASE_UPSAMPLE_RATES.to_vec(),
+            5 => BWE_UPSAMPLE_RATES.to_vec(),
+            _ => {
+                return Err(Error::InvalidOperation(format!(
+                    "Vocoder: unsupported upsample stage count {num_ups} for prefix {prefix}"
+                )))
+            }
+        };
+
+        let mut ups = Vec::with_capacity(num_ups);
+        let mut channels_per_stage = Vec::with_capacity(num_ups);
+        let mut upsample_kernel_sizes = Vec::with_capacity(num_ups);
+        for i in 0..num_ups {
             let w_raw = get(weights, &format!("{prefix}.ups.{i}.weight"))?;
             let b = get(weights, &format!("{prefix}.ups.{i}.bias"))?;
             // ConvTranspose1d weight shape: [C_in, C_out, K]
-            let c_out = w_raw.shape().dims()[1];
+            let w_dims = w_raw.shape().dims();
+            let c_out = w_dims[1];
+            upsample_kernel_sizes.push(w_dims[2]);
             channels_per_stage.push(c_out);
             // Pre-transform once at load time — this is the most expensive
             // op in the old hot path (flip + permute on a 26 MB weight).
@@ -693,8 +727,8 @@ impl LTX2Vocoder {
 
         let final_channels = *channels_per_stage.last().unwrap();
 
-        let mut resblocks = Vec::with_capacity(18);
-        for stage_i in 0..UPSAMPLE_RATES.len() {
+        let mut resblocks = Vec::with_capacity(num_ups * NUM_KERNELS_PER_STAGE);
+        for stage_i in 0..num_ups {
             let ch = channels_per_stage[stage_i];
             for kernel_i in 0..NUM_KERNELS_PER_STAGE {
                 let block_idx = stage_i * NUM_KERNELS_PER_STAGE + kernel_i;
@@ -724,8 +758,11 @@ impl LTX2Vocoder {
             act_post,
             conv_post_w,
             conv_post_b,
+            upsample_rates,
+            upsample_kernel_sizes,
             channels_per_stage,
             final_channels,
+            apply_final_activation,
         })
     }
 
@@ -765,9 +802,9 @@ impl LTX2Vocoder {
             eprintln!("[voc] conv_pre:    {:.3}s", t0.elapsed().as_secs_f32());
         }
 
-        for i in 0..UPSAMPLE_RATES.len() {
-            let stride = UPSAMPLE_RATES[i];
-            let k = UPSAMPLE_KERNEL_SIZES[i];
+        for i in 0..self.upsample_rates.len() {
+            let stride = self.upsample_rates[i];
+            let k = self.upsample_kernel_sizes[i];
             let padding = (k - stride) / 2;
             let (w_preconv, bi) = &self.ups[i];
 
@@ -819,7 +856,11 @@ impl LTX2Vocoder {
             1,
             1,
         )?;
-        let out = x.tanh()?;
+        let out = if self.apply_final_activation {
+            x.tanh()?
+        } else {
+            x
+        };
         sync();
         if profile {
             eprintln!("[voc] act_post:   {t_ap:.3}s");
@@ -853,5 +894,226 @@ impl LTX2Vocoder {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Vocoder + bandwidth extension
+// ---------------------------------------------------------------------------
+
+pub struct LTX2VocoderWithBWE {
+    vocoder: LTX2Vocoder,
+    bwe_generator: LTX2Vocoder,
+    mel_basis: Tensor,
+    stft_forward_basis: Tensor,
+    resample_filter_preconv: Tensor,
+    resample_ratio: usize,
+    resample_pad: usize,
+    resample_pad_left: usize,
+    resample_pad_right: usize,
+    hop_length: usize,
+    input_sr: usize,
+    output_sr: usize,
+}
+
+impl LTX2VocoderWithBWE {
+    pub fn from_file(path: &str, device: &Arc<CudaDevice>) -> Result<Self> {
+        eprintln!("Loading LTX-2.3 VocoderWithBWE from: {path}");
+        let raw = serialization::load_file_filtered(
+            std::path::Path::new(path),
+            device,
+            |k| k.starts_with("vocoder."),
+        )?;
+        let mut weights: Weights = HashMap::new();
+        for (key, value) in raw {
+            let short = key.strip_prefix("vocoder.").unwrap_or(&key).to_string();
+            weights.insert(short, value);
+        }
+
+        let vocoder = LTX2Vocoder::load_with_final_activation(&weights, "vocoder", true)?;
+        let bwe_generator =
+            LTX2Vocoder::load_with_final_activation(&weights, "bwe_generator", false)?;
+        let mel_basis = weights
+            .get("mel_stft.mel_basis")
+            .ok_or_else(|| Error::InvalidOperation("VocoderWithBWE: missing mel_stft.mel_basis".into()))?
+            .to_dtype(DType::BF16)?;
+        let stft_forward_basis = weights
+            .get("mel_stft.stft_fn.forward_basis")
+            .ok_or_else(|| {
+                Error::InvalidOperation(
+                    "VocoderWithBWE: missing mel_stft.stft_fn.forward_basis".into(),
+                )
+            })?
+            .to_dtype(DType::BF16)?;
+
+        let input_sr = 16_000usize;
+        let output_sr = 48_000usize;
+        let hop_length = 80usize;
+        let resample_ratio = output_sr / input_sr;
+        let (resample_filter, resample_pad, resample_pad_left, resample_pad_right) =
+            hann_sinc_resample_filter(device, resample_ratio)?;
+        let resample_filter_preconv = precompute_conv_transpose_weight(&resample_filter, 1)?;
+
+        eprintln!(
+            "  {} vocoder/BWE keys loaded; output sample rate {}Hz",
+            weights.len(),
+            output_sr
+        );
+
+        Ok(Self {
+            vocoder,
+            bwe_generator,
+            mel_basis,
+            stft_forward_basis,
+            resample_filter_preconv,
+            resample_ratio,
+            resample_pad,
+            resample_pad_left,
+            resample_pad_right,
+            hop_length,
+            input_sr,
+            output_sr,
+        })
+    }
+
+    pub fn output_sample_rate(&self) -> u32 {
+        self.output_sr as u32
+    }
+
+    pub fn forward(&self, mel: &Tensor) -> Result<Tensor> {
+        let mut x = self.vocoder.forward(mel)?;
+        let length_low_rate = x.shape().dims()[2];
+        let output_length = length_low_rate * self.output_sr / self.input_sr;
+
+        let remainder = length_low_rate % self.hop_length;
+        if remainder != 0 {
+            x = x.pad1d(0, self.hop_length - remainder)?;
+        }
+
+        let mel_bwe = self.compute_mel(&x)?;
+        let mel_for_bwe = mel_bwe.permute(&[0, 1, 3, 2])?;
+        let residual = self.bwe_generator.forward(&mel_for_bwe)?;
+        let skip = self.sinc_upsample(&x)?;
+
+        let residual_len = residual.shape().dims()[2];
+        let skip_len = skip.shape().dims()[2];
+        let mix_len = residual_len.min(skip_len);
+        let residual = if residual_len == mix_len {
+            residual
+        } else {
+            residual.narrow(2, 0, mix_len)?
+        };
+        let skip = if skip_len == mix_len {
+            skip
+        } else {
+            skip.narrow(2, 0, mix_len)?
+        };
+
+        let out = residual.add(&skip)?.clamp(-1.0, 1.0)?;
+        let out_len = out.shape().dims()[2];
+        if out_len > output_length {
+            out.narrow(2, 0, output_length)
+        } else {
+            Ok(out)
+        }
+    }
+
+    fn compute_mel(&self, audio: &Tensor) -> Result<Tensor> {
+        let dims = audio.shape().dims().to_vec();
+        let (b, n_ch, t) = (dims[0], dims[1], dims[2]);
+        let flat = audio.reshape(&[b * n_ch, t])?;
+        let win_length = self.stft_forward_basis.shape().dims()[2];
+        let left_pad = win_length.saturating_sub(self.hop_length);
+        let flat_padded = flat.unsqueeze(1)?.pad1d(left_pad, 0)?;
+
+        let spec = conv1d(
+            &flat_padded,
+            &self.stft_forward_basis,
+            None,
+            self.hop_length,
+            0,
+            1,
+            1,
+        )?;
+        let n_freqs = spec.shape().dims()[1] / 2;
+        let real = spec.narrow(1, 0, n_freqs)?;
+        let imag = spec.narrow(1, n_freqs, n_freqs)?;
+        let magnitude = real.mul(&real)?.add(&imag.mul(&imag)?)?.sqrt()?;
+
+        let n_mels = self.mel_basis.shape().dims()[0];
+        let t_frames = magnitude.shape().dims()[2];
+        let magnitude_t = magnitude.permute(&[0, 2, 1])?;
+        let mel_basis_t = self.mel_basis.permute(&[1, 0])?;
+        let mel = magnitude_t.matmul(&mel_basis_t)?.permute(&[0, 2, 1])?;
+        let mel = mel.clamp(1.0e-5, 1.0e10)?.log()?;
+        mel.reshape(&[b, n_ch, n_mels, t_frames])
+    }
+
+    fn sinc_upsample(&self, x: &Tensor) -> Result<Tensor> {
+        let x = if x.dtype() == DType::BF16 {
+            x.clone()
+        } else {
+            x.to_dtype(DType::BF16)?
+        };
+        let dims = x.shape().dims().to_vec();
+        let (b, c, l) = (dims[0], dims[1], dims[2]);
+        let x_bc = x.reshape(&[b * c, 1, l])?;
+        let x_pad = replicate_pad1d(&x_bc, self.resample_pad, self.resample_pad)?;
+        let k = self.resample_filter_preconv.shape().dims()[2];
+        let x_padded = flame_core::conv1d::conv_transpose1d_prepare(
+            &x_pad,
+            self.resample_ratio,
+            k - 1,
+            k - 1,
+        )?;
+        let y = conv1d(
+            &x_padded,
+            &self.resample_filter_preconv,
+            None,
+            1,
+            0,
+            1,
+            1,
+        )?
+        .mul_scalar(self.resample_ratio as f32)?;
+        let y_len = y.shape().dims()[2];
+        let crop_len = y_len - self.resample_pad_left - self.resample_pad_right;
+        y.narrow(2, self.resample_pad_left, crop_len)?
+            .reshape(&[b, c, crop_len])
+    }
+}
+
+fn hann_sinc_resample_filter(
+    device: &Arc<CudaDevice>,
+    ratio: usize,
+) -> Result<(Tensor, usize, usize, usize)> {
+    let rolloff = 0.99f32;
+    let lowpass_filter_width = 6.0f32;
+    let width = (lowpass_filter_width / rolloff).ceil() as usize;
+    let kernel_size = 2 * width * ratio + 1;
+    let pad = width;
+    let pad_left = 2 * width * ratio;
+    let pad_right = kernel_size - ratio;
+    let mut data = Vec::with_capacity(kernel_size);
+    for i in 0..kernel_size {
+        let time_axis = (i as f32 / ratio as f32 - width as f32) * rolloff;
+        let time_clamped = time_axis.clamp(-lowpass_filter_width, lowpass_filter_width);
+        let window = (time_clamped * std::f32::consts::PI / lowpass_filter_width / 2.0)
+            .cos()
+            .powi(2);
+        let sinc = if time_axis.abs() < 1.0e-8 {
+            1.0
+        } else {
+            let x = std::f32::consts::PI * time_axis;
+            x.sin() / x
+        };
+        data.push(sinc * window * rolloff / ratio as f32);
+    }
+    let filter = Tensor::from_vec_dtype(
+        data,
+        Shape::from_dims(&[1, 1, kernel_size]),
+        device.clone(),
+        DType::BF16,
+    )?;
+    Ok((filter, pad, pad_left, pad_right))
+}
+
 // Silence unused warnings on const tables we only index.
-const _: usize = UPSAMPLE_RATES[0] + UPSAMPLE_KERNEL_SIZES[0] + INITIAL_CHANNELS;
+const _: usize = BASE_UPSAMPLE_RATES[0] + BWE_UPSAMPLE_RATES[0] + INITIAL_CHANNELS;

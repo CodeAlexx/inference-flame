@@ -21,6 +21,7 @@
 pub mod bottleneck_patch_embed;
 pub mod decoder;
 pub mod final_layer;
+pub mod lora;
 pub mod model;
 pub mod mrope;
 pub mod pipeline;
@@ -30,6 +31,7 @@ pub mod weight_loader;
 
 pub use bottleneck_patch_embed::BottleneckPatchEmbed;
 pub use decoder::HiDreamDecoderLayer;
+pub use lora::{default_target_suffixes, shape_for_suffix, LoraAdapter, LoraRegistry};
 pub use final_layer::FinalLayer;
 pub use model::HiDreamO1Model;
 pub use weight_loader::HiDreamO1WeightLoader;

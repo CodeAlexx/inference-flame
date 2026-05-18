@@ -41,14 +41,11 @@ const LTX_CHECKPOINT: &str = "/home/alex/.serenity/models/checkpoints/ltx-2.3-22
 const UPSAMPLER_PATH: &str =
     "/home/alex/.serenity/models/checkpoints/ltx-2.3-spatial-upscaler-x2-1.0.safetensors";
 // Python's `upsample_video()` calls
-// `encoder.per_channel_statistics.un_normalize(latent)` where
-// `encoder` is built from the DISTILLED checkpoint and reads
-// `vae.per_channel_statistics.{mean,std}-of-means`. The diffusers VAE
-// `latents_mean`/`latents_std` are *different* numbers (max diff ~0.79) and
-// produce a different un-normalized latent — which caused stage 2 to collapse.
-// Load the distilled stats directly instead.
-const VAE_PATH: &str =
-    "/home/alex/.serenity/models/checkpoints/ltx-2.3-22b-distilled.safetensors";
+// `encoder.per_channel_statistics.un_normalize(latent)` and reads
+// `vae.per_channel_statistics.{mean,std}-of-means` from the full LTX checkpoint.
+// Do not use the diffusers VAE `latents_mean`/`latents_std`; those numbers are
+// different and caused stage 2 to collapse.
+const VAE_PATH: &str = LTX_CHECKPOINT;
 
 const OUTPUT_DIR: &str = "/home/alex/EriDiffusion/inference-flame/output";
 
@@ -62,6 +59,7 @@ const FRAME_RATE: f32 = 25.0;
 const LATENT_CHANNELS: usize = 128;
 const AUDIO_CHANNELS: usize = 8;
 const AUDIO_MEL_BINS: usize = 16;
+const TEXT_MAX_LEN: usize = 1024;
 
 fn main() -> anyhow::Result<()> {
     env_logger::init();
@@ -104,10 +102,10 @@ fn main() -> anyhow::Result<()> {
     // Text Encoding — cached to disk
     // ========================================
     let cache_dir = format!("{OUTPUT_DIR}/embed_cache");
-    let video_cache = format!("{cache_dir}/video_context.safetensors");
-    let audio_cache = format!("{cache_dir}/audio_context.safetensors");
+    let video_cache = format!("{cache_dir}/video_context_ltx23_mask1024.safetensors");
+    let audio_cache = format!("{cache_dir}/audio_context_ltx23_mask1024.safetensors");
 
-    let (video_context, audio_context) = if std::path::Path::new(&video_cache).exists()
+    let (video_context, audio_context, text_mask) = if std::path::Path::new(&video_cache).exists()
         && std::path::Path::new(&audio_cache).exists()
     {
         println!("\n--- Text Encoding (cached) ---");
@@ -120,8 +118,12 @@ fn main() -> anyhow::Result<()> {
         )?;
         let video_context = vc.get("video_context").unwrap().to_dtype(DType::BF16)?;
         let audio_context = ac.get("audio_context").unwrap().to_dtype(DType::BF16)?;
+        let text_mask = vc.get("encoder_attention_mask")
+            .or_else(|| ac.get("encoder_attention_mask"))
+            .ok_or_else(|| anyhow::anyhow!("cached LTX2 contexts are missing encoder_attention_mask; delete {video_cache} and {audio_cache}"))?
+            .to_dtype(DType::BF16)?;
         println!("  Loaded from cache in {:.1}s", t0.elapsed().as_secs_f32());
-        (video_context, audio_context)
+        (video_context, audio_context, text_mask)
     } else {
         println!("\n--- Text Encoding (Gemma-3) ---");
         let t0 = Instant::now();
@@ -135,7 +137,7 @@ fn main() -> anyhow::Result<()> {
         }
         let shard_refs: Vec<&str> = shards.iter().map(|s| s.as_str()).collect();
 
-        let (input_ids, attention_mask) = simple_tokenize(PROMPT, 256)?;
+        let (input_ids, attention_mask) = simple_tokenize(PROMPT, TEXT_MAX_LEN)?;
         let real_count = attention_mask.iter().filter(|&&m| m != 0).count();
         println!("  {} tokens ({} real)", input_ids.len(), real_count);
 
@@ -164,6 +166,7 @@ fn main() -> anyhow::Result<()> {
         let audio_context = feature_extractor::feature_extract_and_project(
             &all_hidden, &mask_out, audio_agg_w, audio_agg_b, 2048,
         )?;
+        let text_mask = feature_extractor::convert_to_additive_mask(&mask_out)?;
 
         // Free Gemma
         drop(encoder);
@@ -186,18 +189,20 @@ fn main() -> anyhow::Result<()> {
         std::fs::create_dir_all(&cache_dir)?;
         let mut vc = HashMap::new();
         vc.insert("video_context".to_string(), video_context.clone());
+        vc.insert("encoder_attention_mask".to_string(), text_mask.clone());
         flame_core::serialization::save_tensors(
             &vc, std::path::Path::new(&video_cache),
             flame_core::serialization::SerializationFormat::SafeTensors,
         )?;
         let mut ac = HashMap::new();
         ac.insert("audio_context".to_string(), audio_context.clone());
+        ac.insert("encoder_attention_mask".to_string(), text_mask.clone());
         flame_core::serialization::save_tensors(
             &ac, std::path::Path::new(&audio_cache),
             flame_core::serialization::SerializationFormat::SafeTensors,
         )?;
         println!("  Encoded + cached in {:.1}s", t0.elapsed().as_secs_f32());
-        (video_context, audio_context)
+        (video_context, audio_context, text_mask)
     };
 
     // ========================================
@@ -208,8 +213,8 @@ fn main() -> anyhow::Result<()> {
     let config = LTX2Config::default();
     let mut model = LTX2StreamingModel::load_globals(MODEL_PATH, &config)?;
 
-    model.init_offloader()?;
-    println!("  BlockOffloader ready in {:.1}s", t0.elapsed().as_secs_f32());
+    model.init_offloader_streaming()?;
+    println!("  Streaming BlockOffloader ready in {:.1}s", t0.elapsed().as_secs_f32());
 
     // ========================================
     // Stage 1: Denoise at HALF resolution
@@ -244,7 +249,7 @@ fn main() -> anyhow::Result<()> {
             &video_x, &audio_x, &sigma_t,
             &video_context, &audio_context,
             FRAME_RATE,
-            None, None,  // attention masks: None = pre-projected embeddings
+            Some(&text_mask), Some(&text_mask),
         )?;
 
         // Dump first-step velocity for diff against Python.
@@ -419,7 +424,7 @@ fn main() -> anyhow::Result<()> {
             &video_x, &audio_x, &sigma_t,
             &video_context, &audio_context,
             FRAME_RATE,
-            None, None,  // attention masks: None = pre-projected embeddings
+            Some(&text_mask), Some(&text_mask),
         )?;
 
         // F32 Euler step (see stage 1 loop above for rationale).
@@ -533,7 +538,7 @@ fn simple_tokenize(text: &str, max_len: usize) -> anyhow::Result<(Vec<i32>, Vec<
 }
 
 fn make_noise(_numel: usize, seed: u64, dims: &[usize], device: &std::sync::Arc<cudarc::driver::CudaDevice>) -> anyhow::Result<Tensor> {
-    flame_core::rng::set_seed(seed);
+    flame_core::rng::set_seed(seed)?;
     let t = Tensor::randn(Shape::from_dims(dims), 0.0, 1.0, device.clone())?;
     Ok(t.to_dtype(DType::BF16)?)
 }

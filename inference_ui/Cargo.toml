@@ -48,10 +48,18 @@ dirs = "5"
 # cudarc so a feature mismatch on the dependency would manifest as type
 # errors at the worker boundary.
 inference-flame = { path = ".." }
-flame-core = { path = "../../flame-core", default-features = false, features = ["cuda", "bf16_u16", "cudnn", "shared_storage"] }
+flame-core = { path = "../../flame-core", version = "=26.15.1", default-features = false, features = ["cuda", "bf16_u16", "cudnn", "shared_storage"] }
 cudarc = { version = "0.11.9", default-features = false, features = ["driver", "cublas", "cublaslt", "nvrtc", "cuda-12050", "f16"] }
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 
 [features]
 default = ["nvml"]
 nvml = ["dep:nvml-wrapper"]
+
+# Mirror inference-flame's cudarc patch — inference_ui is its own package
+# root (no shared workspace), so Cargo doesn't inherit the parent
+# inference-flame/Cargo.toml [patch] block. Without this, `cudarc::driver::
+# install_external_ptr_hook` (in cudarc-pinctx) is missing and flame-core
+# fails to compile when invoked from this crate.
+[patch.crates-io]
+cudarc = { path = "../../cudarc-pinctx" }

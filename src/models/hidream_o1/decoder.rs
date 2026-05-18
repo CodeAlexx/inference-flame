@@ -48,7 +48,7 @@ use std::sync::Arc;
 use flame_core::attention::sdpa as flame_sdpa;
 use flame_core::nn::Linear;
 use flame_core::norm::RMSNorm;
-use flame_core::{bf16_ops, cuda_ops_bf16, CudaDevice, Error, Result, Tensor};
+use flame_core::{bf16_ops, cuda_ops_bf16, CudaDevice, DType, Error, Result, Shape, Tensor};
 
 use super::HiDreamO1Config;
 
@@ -248,9 +248,11 @@ impl HiDreamDecoderLayer {
 
         let gate = self.gate_proj.forward(&normed2)?;
         let up = self.up_proj.forward(&normed2)?;
-        // SwiGLU = silu(gate) * up
-        let silu_gate = bf16_ops::silu_bf16(&gate)?;
-        let mlp_inner = silu_gate.mul(&up)?;
+        // SwiGLU = silu(gate) * up. Use Tensor::swiglu (fused BF16 kernel that
+        // records Op::FusedSwiGLU for autograd) instead of the inference-only
+        // `bf16_ops::silu_bf16` which returns a detached tensor — that path
+        // killed the `mlp.gate_proj` LoRA gradient in the trainer (G2 bug).
+        let mlp_inner = gate.swiglu(&up)?;
         let mlp_out = self.down_proj.forward(&mlp_inner)?;
 
         hidden_states.add(&mlp_out)
@@ -279,6 +281,39 @@ pub fn decoder_forward_with_weights(
     cos_sin: &(Tensor, Tensor),
     attention_mask: Option<&Tensor>,
     weights: &HashMap<String, Tensor>,
+) -> Result<Tensor> {
+    decoder_forward_with_weights_lora(
+        cfg,
+        layer_idx,
+        hidden_states,
+        cos_sin,
+        attention_mask,
+        weights,
+        None,
+        None,
+    )
+}
+
+/// LoRA-aware variant of [`decoder_forward_with_weights`].
+///
+/// When `lora` is `Some(&registry)`, each of the 7 fused-linear call sites
+/// in the layer looks up `(layer_idx, suffix)` in the registry and dispatches
+/// to `fused_linear3d_native_lora`. When the lookup misses (or `lora` is
+/// `None`), it falls through to the original `fused_linear3d_native` call,
+/// preserving byte-identical inference behavior.
+///
+/// See `super::lora::LoraRegistry` for the registry contract and target
+/// suffix naming.
+#[allow(clippy::too_many_arguments)]
+pub fn decoder_forward_with_weights_lora(
+    cfg: &HiDreamO1Config,
+    layer_idx: usize,
+    hidden_states: &Tensor,
+    cos_sin: &(Tensor, Tensor),
+    attention_mask: Option<&Tensor>,
+    weights: &HashMap<String, Tensor>,
+    lora: Option<&super::lora::LoraRegistry>,
+    two_pass_ar_len: Option<usize>,
 ) -> Result<Tensor> {
     // Instrumentation: HIDREAM_MEM_LOG=1 logs free MiB at each pre-attention
     // stage of layer 0 only (the OOM hits inside the first layer at 2048²).
@@ -343,11 +378,36 @@ pub fn decoder_forward_with_weights(
             (None, None, None)
         };
 
-    let q = flame_core::ops::fused_inference::fused_linear3d_native(&normed, q_w, q_b)?;
+    // Dispatch helper: when a matching LoRA adapter exists for this layer +
+    // suffix, route through `fused_linear3d_native_lora`; otherwise fall back
+    // to the plain `fused_linear3d_native` (byte-identical no-LoRA path).
+    let lora_linear = |x: &Tensor,
+                       w: &Tensor,
+                       b: Option<&Tensor>,
+                       suffix: &str|
+     -> Result<Tensor> {
+        match lora.and_then(|r| r.get(layer_idx, suffix)) {
+            Some(adapter) => {
+                let a_t = adapter.a_tensor()?;
+                let b_t = adapter.b_tensor()?;
+                flame_core::ops::fused_inference::fused_linear3d_native_lora(
+                    x,
+                    w,
+                    b,
+                    Some(&a_t),
+                    Some(&b_t),
+                    adapter.scale,
+                )
+            }
+            None => flame_core::ops::fused_inference::fused_linear3d_native(x, w, b),
+        }
+    };
+
+    let q = lora_linear(&normed, q_w, q_b, "self_attn.q_proj")?;
     log_mem("after_q_proj");
-    let k = flame_core::ops::fused_inference::fused_linear3d_native(&normed, k_w, k_b)?;
+    let k = lora_linear(&normed, k_w, k_b, "self_attn.k_proj")?;
     log_mem("after_k_proj");
-    let v = flame_core::ops::fused_inference::fused_linear3d_native(&normed, v_w, v_b)?;
+    let v = lora_linear(&normed, v_w, v_b, "self_attn.v_proj")?;
     log_mem("after_v_proj");
 
     // Reshape to [B, H, S, D] / [B, Hkv, S, D].
@@ -379,13 +439,15 @@ pub fn decoder_forward_with_weights(
     let v = repeat_kv(&v, n_rep)?;
     log_mem("after_repeat_kv");
 
-    // 2026-05-09: chunked Q-row SDPA. At 2048² (S=4350) the naive full-S×S
-    // attention matrix is ~1.2 GB BF16 transient per layer plus a 76 MB F32
-    // mask, dominating the 24 GB GPU's working set. Split Q into row chunks,
-    // slice the mask per chunk, run SDPA per chunk, concat. Memory drops
-    // ~Q/chunk_size×; latency stays similar (more kernel launches but same
-    // total math). Default chunk size 1024 (env: HIDREAM_SDPA_CHUNK).
-    let attn_out = chunked_sdpa(&q, &k, &v, attention_mask)?;
+    // ai-toolkit's HiDream-O1 `use_flash_attn=True` path avoids a 4D mixed
+    // mask. It runs causal attention on the AR/text prefix, full unmasked
+    // attention on all tokens, then replaces the AR rows. That unlocks cuDNN
+    // Flash SDPA for the large full pass; the old mixed-mask path falls back
+    // to slow streaming/chunked kernels at 2048².
+    let attn_out = match two_pass_ar_len {
+        Some(ar_len) if attention_mask.is_none() => two_pass_sdpa(&q, &k, &v, ar_len)?,
+        _ => chunked_sdpa(&q, &k, &v, attention_mask)?,
+    };
     log_mem("after_sdpa");
     let attn_out = attn_out
         .permute(&[0, 2, 1, 3])?
@@ -398,8 +460,7 @@ pub fn decoder_forward_with_weights(
     } else {
         None
     };
-    let attn_out =
-        flame_core::ops::fused_inference::fused_linear3d_native(&attn_out, o_w, o_b)?;
+    let attn_out = lora_linear(&attn_out, o_w, o_b, "self_attn.o_proj")?;
 
     let hidden_states = hidden_states.add(&attn_out)?;
 
@@ -411,12 +472,15 @@ pub fn decoder_forward_with_weights(
     let up_w = wget("mlp.up_proj.weight")?;
     let down_w = wget("mlp.down_proj.weight")?;
 
-    let gate = flame_core::ops::fused_inference::fused_linear3d_native(&normed2, gate_w, None)?;
-    let up = flame_core::ops::fused_inference::fused_linear3d_native(&normed2, up_w, None)?;
-    let silu_gate = bf16_ops::silu_bf16(&gate)?;
-    let mlp_inner = silu_gate.mul(&up)?;
-    let mlp_out =
-        flame_core::ops::fused_inference::fused_linear3d_native(&mlp_inner, down_w, None)?;
+    let gate = lora_linear(&normed2, gate_w, None, "mlp.gate_proj")?;
+    let up = lora_linear(&normed2, up_w, None, "mlp.up_proj")?;
+    // SwiGLU = silu(gate) * up. Use Tensor::swiglu (autograd-registered fused
+    // BF16 kernel) so the `mlp.gate_proj` LoRA branch sees gradient. The old
+    // `bf16_ops::silu_bf16` is an inference-only primitive (returns
+    // requires_grad=false, records no op) — using it here detached gate's
+    // autograd path and produced 72 dead LoRA params in G2.
+    let mlp_inner = gate.swiglu(&up)?;
+    let mlp_out = lora_linear(&mlp_inner, down_w, None, "mlp.down_proj")?;
 
     hidden_states.add(&mlp_out)
 }
@@ -463,26 +527,71 @@ fn repeat_kv(x: &Tensor, n_rep: usize) -> Result<Tensor> {
     stacked.reshape(&[b, h_kv * n_rep, s, d])
 }
 
-/// Chunked SDPA over Q rows.
+fn causal_keep_mask(seq_len: usize, device: Arc<CudaDevice>) -> Result<Tensor> {
+    let mut data = vec![0.0f32; seq_len * seq_len];
+    for i in 0..seq_len {
+        let row = i * seq_len;
+        for j in 0..=i {
+            data[row + j] = 1.0;
+        }
+    }
+    Tensor::from_vec_dtype(
+        data,
+        Shape::from_dims(&[1, 1, seq_len, seq_len]),
+        device,
+        DType::BF16,
+    )
+}
+
+fn two_pass_sdpa(q: &Tensor, k: &Tensor, v: &Tensor, ar_len: usize) -> Result<Tensor> {
+    let q_dims = q.shape().dims();
+    if q_dims.len() != 4 {
+        return Err(Error::InvalidOperation(format!(
+            "two_pass_sdpa: expected Q to be [B,H,S,D], got {:?}",
+            q_dims
+        )));
+    }
+    let seq_len = q_dims[2];
+    if ar_len == 0 {
+        return flame_sdpa(q, k, v, None);
+    }
+    if ar_len > seq_len {
+        return Err(Error::InvalidInput(format!(
+            "two_pass_sdpa: ar_len {} exceeds seq_len {}",
+            ar_len, seq_len
+        )));
+    }
+
+    let q_ar = q.narrow(2, 0, ar_len)?.contiguous()?;
+    let k_ar = k.narrow(2, 0, ar_len)?.contiguous()?;
+    let v_ar = v.narrow(2, 0, ar_len)?.contiguous()?;
+    let ar_mask = causal_keep_mask(ar_len, q.device().clone())?;
+    let out_ar = flame_sdpa(&q_ar, &k_ar, &v_ar, Some(&ar_mask))?;
+
+    if ar_len == seq_len {
+        return Ok(out_ar);
+    }
+
+    let out_full = flame_sdpa(q, k, v, None)?;
+    let out_gen = out_full.narrow(2, ar_len, seq_len - ar_len)?;
+    Tensor::cat(&[&out_ar, &out_gen], 2)
+}
+
+/// SDPA over Q rows.
 ///
-/// Splits the Q tensor into row-chunks along the sequence dimension and runs
-/// `flame_sdpa` independently per chunk. The full-shape `[B, H, Sq, Sk]`
-/// attention matrix is never materialized — the per-chunk shape is
-/// `[B, H, chunk, Sk]`, which is what bounds the transient memory peak.
+/// HiDream-O1 always supplies a mixed causal/full mask. The old implementation
+/// sliced Q into chunks and called generic SDPA per chunk; because each chunk
+/// was below flame-core's auto-stream threshold, that path still materialized
+/// FP32 score tensors repeatedly. At 2048² (`Sq` ≈ 4.3k) that dominates the
+/// pixel-space denoise loop.
 ///
-/// Mask shape: caller passes a `[B, 1, Sq, Sk]` (or broadcastable) tensor;
-/// it is sliced along dim 2 to match each Q chunk.
+/// For masked attention, route directly to flame-core's streaming BF16 SDPA so
+/// scores are tiled through a small workspace instead of materialized. Keep the
+/// old chunked generic path only as an unsupported-backend fallback.
 ///
-/// Chunk size: `HIDREAM_SDPA_CHUNK` env var (default 1024). At Sq=4350 with
-/// chunk=1024 you get 5 chunks (4×1024 + 254-row remainder), reducing the
-/// peak attention-matrix memory by ~4.25× and the mask working set by the
-/// same factor. Smaller chunks save more memory at the cost of more kernel
-/// launches; experimentally chunk=1024 keeps the per-step time within ~5%
-/// of the unchunked path while bringing the per-layer transient peak from
-/// ~12.6 GB down to ~3 GB.
-///
-/// When `Sq <= chunk`, falls through to a single `flame_sdpa` call (zero
-/// overhead vs the original code path).
+/// `HIDREAM_SDPA_CHUNK` controls the fallback workspace row chunk (default
+/// 1024). The optimized streaming launcher uses its own tile env vars
+/// (`STREAMING_SDPA_CHUNK_MAX`, `FLAME_SDPA_MAX_Q_TILE`, etc.).
 fn chunked_sdpa(
     q: &Tensor,
     k: &Tensor,
@@ -502,6 +611,38 @@ fn chunked_sdpa(
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(1024);
+
+    let needs_autograd = flame_core::autograd::AutogradContext::is_recording()
+        && (q.requires_grad() || k.requires_grad() || v.requires_grad());
+
+    let disable_direct_stream = std::env::var("HIDREAM_O1_DISABLE_STREAM_SDPA")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    if let Some(keep_mask) = mask.filter(|_| !needs_autograd && !disable_direct_stream) {
+        // Public flame SDPA masks use HiDream's multiplicative keep-mask
+        // convention (1 = attend, 0 = block). flame-core handles any backend
+        // conversion internally, so inference can use the streaming path while
+        // keeping the generic SDPA fallback numerically aligned.
+        match cuda_ops_bf16::sdpa_stream_bf16(
+            q,
+            k,
+            v,
+            Some(keep_mask),
+            chunk_size.max(1),
+            false,
+            None,
+        ) {
+            Ok(out) => return Ok(out),
+            Err(Error::Unsupported(reason)) => {
+                log::warn!(
+                    "hidream_o1: streaming masked SDPA unsupported ({}); falling back to generic chunked SDPA",
+                    reason
+                );
+            }
+            Err(err) => return Err(err),
+        }
+    }
 
     if sq <= chunk_size {
         return flame_sdpa(q, k, v, mask);

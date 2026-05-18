@@ -8,6 +8,7 @@
 //!                    [--output-image output.png]
 //!                    [--height 2048] [--width 2048]
 //!                    [--model-type dev|full]
+//!                    [--steps N] [--shift 3.0]
 //!                    [--seed 32] [--guidance-scale 5.0]
 //!
 //! Build only — does NOT run by default. Caller is expected to invoke the
@@ -20,7 +21,7 @@ use flame_core::{global_cuda_device, DType};
 
 use inference_flame::models::hidream_o1::{
     FlashFlowMatchEulerDiscreteScheduler, HiDreamO1Config, HiDreamO1Pipeline,
-    HiDreamO1WeightLoader,
+    HiDreamO1WeightLoader, LoraRegistry,
 };
 
 const DEFAULT_MODEL_PATH: &str = "/home/alex/HiDream-O1-Image-Dev-weights";
@@ -40,9 +41,16 @@ struct Args {
     height: usize,
     width: usize,
     model_type: String,
+    steps: Option<usize>,
+    shift: f32,
     seed: u64,
     guidance_scale: f32,
     allow_any_resolution: bool,
+    /// Optional PEFT-format LoRA checkpoint (e.g. a trainer-produced
+    /// `hidream_o1_lora_step{N}.safetensors`). When absent, inference
+    /// matches the pre-M4 path byte-for-byte. Rank + alpha are inferred
+    /// from the file (see `LoraRegistry::from_safetensors`).
+    lora_path: Option<PathBuf>,
 }
 
 impl Default for Args {
@@ -55,12 +63,15 @@ impl Default for Args {
             height: 2048,
             width: 2048,
             model_type: "dev".to_string(),
+            steps: None,
+            shift: 3.0,
             seed: 32,
             // Per inference.py: dev variant uses guidance_scale=0.0 (no CFG);
             // full variant uses 5.0. We default to dev here, but keep the
             // CLI flag to override.
             guidance_scale: 0.0,
             allow_any_resolution: false,
+            lora_path: None,
         }
     }
 }
@@ -104,6 +115,14 @@ fn parse_args() -> Result<Args> {
                 a.model_type = take(i)?.to_string();
                 i += 2;
             }
+            "--steps" | "--num-steps" | "--num_steps" | "--num-inference-steps" | "--num_inference_steps" => {
+                a.steps = Some(take(i)?.parse().context("--steps parse")?);
+                i += 2;
+            }
+            "--shift" => {
+                a.shift = take(i)?.parse().context("--shift parse")?;
+                i += 2;
+            }
             "--seed" => {
                 a.seed = take(i)?.parse().context("--seed parse")?;
                 i += 2;
@@ -116,6 +135,10 @@ fn parse_args() -> Result<Args> {
                 a.allow_any_resolution = true;
                 i += 1;
             }
+            "--lora-path" | "--lora_path" => {
+                a.lora_path = Some(PathBuf::from(take(i)?));
+                i += 2;
+            }
             "-h" | "--help" => {
                 println!("Usage: hidream_o1_infer [options]");
                 println!("  --model-path <dir>            (default: {DEFAULT_MODEL_PATH})");
@@ -125,9 +148,12 @@ fn parse_args() -> Result<Args> {
                 println!("  --height <int>                (default: 2048)");
                 println!("  --width <int>                 (default: 2048)");
                 println!("  --model-type dev|full         (default: dev)");
+                println!("  --steps <int>                 (default: dev=28, full=50)");
+                println!("  --shift <float>               (full scheduler shift; default: 3.0)");
                 println!("  --seed <int>                  (default: 32)");
                 println!("  --guidance-scale <float>      (default: 0.0 for dev, suggest 5.0 for full)");
                 println!("  --allow-any-resolution        (smoke-test: bypass predefined-resolution snap)");
+                println!("  --lora-path <safetensors>     (optional; PEFT-format LoRA checkpoint to apply)");
                 std::process::exit(0);
             }
             other => bail!("unknown arg: {other}"),
@@ -150,8 +176,16 @@ fn main() -> Result<()> {
     log::info!("[hidream_o1_infer] model={}", args.model_path.display());
     log::info!("[hidream_o1_infer] prompt: {}", &args.prompt);
     log::info!(
-        "[hidream_o1_infer] {}x{} model_type={} seed={} guidance_scale={}",
-        args.width, args.height, args.model_type, args.seed, args.guidance_scale,
+        "[hidream_o1_infer] {}x{} model_type={} steps={} shift={} seed={} guidance_scale={}",
+        args.width,
+        args.height,
+        args.model_type,
+        args.steps
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "default".to_string()),
+        args.shift,
+        args.seed,
+        args.guidance_scale,
     );
 
     // 1) Tokenizer.
@@ -172,10 +206,19 @@ fn main() -> Result<()> {
         .load_model(&config, &device)
         .context("HiDreamO1WeightLoader::load_model")?;
 
-    // 4) Scheduler — Dev uses 28-step Flash, Full uses 50-step Default.
+    // 4) Scheduler — Dev uses 28-step Flash, Full uses configurable Default.
     let scheduler = match args.model_type.as_str() {
-        "dev" => FlashFlowMatchEulerDiscreteScheduler::dev_28step(),
-        "full" => FlashFlowMatchEulerDiscreteScheduler::full_50step(),
+        "dev" => {
+            if let Some(steps) = args.steps {
+                if steps != 28 {
+                    bail!(
+                        "--model-type dev uses the fixed 28-step flash schedule; use --model-type full --steps {steps} for the configurable ai-toolkit-style path"
+                    );
+                }
+            }
+            FlashFlowMatchEulerDiscreteScheduler::dev_28step()
+        }
+        "full" => FlashFlowMatchEulerDiscreteScheduler::full_n_step(args.steps.unwrap_or(50), args.shift),
         other => bail!("--model-type must be 'dev' or 'full', got '{other}'"),
     };
 
@@ -190,6 +233,25 @@ fn main() -> Result<()> {
     )
     .context("HiDreamO1Pipeline::new")?;
     pipeline.set_allow_any_resolution(args.allow_any_resolution);
+
+    // 5a) Optional LoRA — load PEFT-format checkpoint and attach to pipeline.
+    //     Round-trips both PEFT canonical (`.lora_A.default.weight`) and
+    //     legacy (`.lora_A.weight`) key layouts; rank + alpha are inferred
+    //     from the file. With no `--lora-path`, pipeline.lora stays None and
+    //     generation is byte-identical to the pre-M4 path.
+    if let Some(lora_path) = args.lora_path.as_ref() {
+        log::info!("[hidream_o1_infer] loading LoRA: {}", lora_path.display());
+        let registry =
+            LoraRegistry::from_safetensors(lora_path, &pipeline.config, &pipeline.device)
+                .with_context(|| format!("LoraRegistry::from_safetensors({})", lora_path.display()))?;
+        log::info!(
+            "[hidream_o1_infer] LoRA attached: {} adapters, rank={}, alpha={}",
+            registry.len(),
+            registry.rank,
+            registry.alpha,
+        );
+        pipeline.set_lora(Some(registry));
+    }
 
     // 6) Generate.
     log::info!("[hidream_o1_infer] starting denoise loop...");

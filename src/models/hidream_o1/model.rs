@@ -73,8 +73,9 @@ use flame_core::{DType, Error, Result, Shape, Tensor};
 use flame_diffusion::BlockOffloader;
 
 use super::bottleneck_patch_embed::BottleneckPatchEmbed;
-use super::decoder::decoder_forward_with_weights;
+use super::decoder::decoder_forward_with_weights_lora;
 use super::final_layer::FinalLayer;
+use super::lora::LoraRegistry;
 use super::mrope::{interleaved_mrope_cos_sin, MRopePositions};
 use super::timestep_embedder::TimestepEmbedder;
 use super::HiDreamO1Config;
@@ -207,6 +208,35 @@ impl HiDreamO1Model {
     /// `index_select(dim=1, indices=where(vinput_mask))` to take only
     /// the L gen-image rows (matches `pipeline.py:329`:
     /// `x_pred[0, sample['vinput_mask'][0]]`).
+    /// LoRA-aware sibling of [`Self::forward`]. When `lora == None` this is
+    /// byte-identical to `forward`; when `Some`, every decoder layer's 7 fused
+    /// linears route through the registry per
+    /// [`super::decoder::decoder_forward_with_weights_lora`]. The same memory /
+    /// offloader semantics apply.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_lora(
+        &mut self,
+        input_ids: &Tensor,
+        timestep: &Tensor,
+        noise_patches: &Tensor,
+        position_ids_thw: &MRopePositions<'_>,
+        vinput_mask: &Tensor,
+        token_types_bin: &Tensor,
+        attention_mask: Option<&Tensor>,
+        lora: Option<&LoraRegistry>,
+    ) -> Result<Tensor> {
+        self.forward_inner(
+            input_ids,
+            timestep,
+            noise_patches,
+            position_ids_thw,
+            vinput_mask,
+            token_types_bin,
+            attention_mask,
+            lora,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &mut self,
@@ -215,8 +245,44 @@ impl HiDreamO1Model {
         noise_patches: &Tensor,
         position_ids_thw: &MRopePositions<'_>,
         vinput_mask: &Tensor,
+        token_types_bin: &Tensor,
         attention_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
+        self.forward_inner(
+            input_ids,
+            timestep,
+            noise_patches,
+            position_ids_thw,
+            vinput_mask,
+            token_types_bin,
+            attention_mask,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_inner(
+        &mut self,
+        input_ids: &Tensor,
+        timestep: &Tensor,
+        noise_patches: &Tensor,
+        position_ids_thw: &MRopePositions<'_>,
+        vinput_mask: &Tensor,
+        token_types_bin: &Tensor,
+        attention_mask: Option<&Tensor>,
+        lora: Option<&LoraRegistry>,
+    ) -> Result<Tensor> {
+        // `vinput_mask` is `(token_types == 1)` — image rows only. Currently
+        // only the caller uses it (for `gather_image_rows`); kept on the
+        // forward signature so signature shape stays parallel to the cache
+        // record and so future image-region routing inside the model has it.
+        // `token_types_bin` is `(token_types > 0)` — image rows + the TMS token
+        // (type=3). Drives `build_mixed_attention_mask` so the TMS row gets
+        // FULL attention, matching `qwen3_vl_transformers.py:1501-1502`.
+        // The two CANNOT be merged — Python uses them at different sites
+        // (`pipeline.py:69` builds `vinput_mask`; `qwen3_vl:1501` reads
+        // `token_types_bin`).
+        let _ = vinput_mask;
         // Instrumentation gate: HIDREAM_MEM_LOG=1 prints free MiB at each
         // major forward stage and per-layer (last log line before OOM
         // identifies the failing allocation).
@@ -246,14 +312,14 @@ impl HiDreamO1Model {
         //    where mask != 0. We build the [B, S_text, H] expanded mask /
         //    expanded t_emb host-side from input_ids (a tiny CPU op — text
         //    sequence is at most a few thousand tokens).
-        let t_emb = self.timestep_embedder.forward(timestep)?; // [B, H]
+        let t_emb = self.timestep_embedder.forward_lora(timestep, lora)?; // [B, H]
         log_mem("after.timestep_embed");
 
         let text_emb_with_t = self.scatter_tms_token(&text_emb, input_ids, &t_emb)?;
         log_mem("after.scatter_tms");
 
         // 3) patch embedding: [B, L, P*P*C] -> [B, L, H]
-        let patch_emb = self.bottleneck_patch_embed.forward(noise_patches)?;
+        let patch_emb = self.bottleneck_patch_embed.forward_lora(noise_patches, lora)?;
         log_mem("after.patch_embed");
 
         // 4) concat along seq dim: [B, S_total, H]  with S_total = S_text + L.
@@ -280,26 +346,50 @@ impl HiDreamO1Model {
         log_mem("after.cos_sin");
 
         // 6) attention mask: caller may pre-build (e.g. for CFG batching);
-        //    otherwise we synthesize from vinput_mask.
+        //    otherwise we synthesize from token_types_bin (NOT vinput_mask —
+        //    deep-investigation 2026-05-17 isolated a structural bug here:
+        //    Python reads `token_types_bin = (token_types > 0)` which is
+        //    True at type=3 (TMS) too; `vinput_mask = (token_types == 1)` is
+        //    False at TMS, so using it left the TMS row CAUSAL in Rust where
+        //    Python makes it FULL. See
+        //    `EriDiffusion-v2/docs/hidream_o1_g0_deep_investigation.md`).
         //
         //    Python (`qwen3_vl_transformers.py:1495-1504`):
         //      causal = full(min, [S, S]); causal = triu(causal, diag=1)  # 0 below+diag, -inf above
-        //      gen_positions = token_types[b].bool()   # [S]
+        //      gen_positions = token_types[b].bool()   # token_types_bin: type>0
         //      causal[gen_positions, :] = 0            # gen rows attend to ALL
         //
         //    We emit a multiplicative {0, 1} mask the SDPA path expects: 1
         //    where attention is allowed, 0 where blocked. The SDPA path
         //    (`flame_core/sdpa.rs:466-469`) converts to additive -inf
         //    internally.
-        let owned_mask;
-        let mask_ref = match attention_mask {
-            Some(m) => m,
-            None => {
-                owned_mask = self.build_mixed_attention_mask(b, s_total, vinput_mask)?;
-                &owned_mask
-            }
+        let disable_two_pass = std::env::var("HIDREAM_O1_DISABLE_TWO_PASS_ATTN")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let use_two_pass = attention_mask.is_none()
+            && b == 1
+            && !disable_two_pass
+            && !flame_core::autograd::AutogradContext::is_recording();
+        let two_pass_ar_len = if use_two_pass {
+            Some(Self::ar_prefix_len(b, s_total, token_types_bin)?)
+        } else {
+            None
         };
-        log_mem("after.build_mask");
+
+        let owned_mask;
+        let mask_ref = if two_pass_ar_len.is_some() {
+            None
+        } else {
+            Some(match attention_mask {
+                Some(m) => m,
+                None => {
+                    owned_mask =
+                        self.build_mixed_attention_mask(b, s_total, token_types_bin)?;
+                    &owned_mask
+                }
+            })
+        };
+        log_mem("after.attn_policy");
 
         // 7) decoder loop: 36 layers for 8B, streamed via BlockOffloader.
         //
@@ -318,6 +408,27 @@ impl HiDreamO1Model {
         offloader
             .prefetch_block(0)
             .map_err(|e| Error::InvalidInput(format!("prefetch block 0: {e}")))?;
+
+        // Instrumentation gate: HIDREAM_DUMP_LAYERS=<path.safetensors> writes
+        // the post-residual hidden state at the end of every decoder layer to
+        // a safetensors file. Keys: `hidden_layer_{i:02d}` (F32).
+        // Used by tests/parity/hidream_o1_g0_per_layer_ref.py + the parity
+        // binary's --per-layer-dump mode to validate that per-layer cosine
+        // drift is monotonic numerical noise vs a structural jump.
+        // Off when env var is absent — zero overhead in production.
+        let dump_layers_path: Option<String> =
+            std::env::var("HIDREAM_DUMP_LAYERS").ok().filter(|s| !s.is_empty());
+        let mut layer_dump: Option<HashMap<String, Tensor>> =
+            dump_layers_path.as_ref().map(|_| HashMap::with_capacity(total + 2));
+        if let Some(ref mut d) = layer_dump {
+            // Also save the input to layer 0 (the "embedding+patch+cat+mask" stack).
+            // We save in F32 for safe round-trip vs the Python ref dump (also F32).
+            d.insert(
+                "hidden_input_layer_00".to_string(),
+                hidden.to_dtype(DType::F32)?,
+            );
+        }
+
         for i in 0..total {
             // Per-layer log only for the first few layers to keep output small;
             // OOM in this port hits within the first layer at 2048².
@@ -325,7 +436,7 @@ impl HiDreamO1Model {
                 log_mem(&format!("layer{:02}.before_await", i));
             }
             let raw = offloader
-                .await_block(i)
+                .await_block_handle(i)
                 .map_err(|e| Error::InvalidInput(format!("await block {i}: {e}")))?;
             if mem_log && (i < 3 || i == total - 1) {
                 log_mem(&format!("layer{:02}.after_await", i));
@@ -335,31 +446,62 @@ impl HiDreamO1Model {
                     .prefetch_block(i + 1)
                     .map_err(|e| Error::InvalidInput(format!("prefetch block {}: {e}", i + 1)))?;
             }
-            let lw = Self::untranspose_block_weights(&raw)?;
+            let lw = Self::untranspose_block_weights(raw.weights())?;
             if mem_log && (i < 3 || i == total - 1) {
                 log_mem(&format!("layer{:02}.after_untranspose", i));
             }
-            hidden = decoder_forward_with_weights(
+            hidden = decoder_forward_with_weights_lora(
                 &cfg,
                 i,
                 &hidden,
                 &cos_sin,
-                Some(mask_ref),
+                mask_ref,
                 &lw,
+                lora,
+                two_pass_ar_len,
             )?;
+            drop(raw);
             if mem_log && (i < 3 || i == total - 1) {
                 log_mem(&format!("layer{:02}.after_forward", i));
+            }
+            if let Some(ref mut d) = layer_dump {
+                d.insert(
+                    format!("hidden_layer_{i:02}"),
+                    hidden.to_dtype(DType::F32)?,
+                );
             }
         }
         log_mem("after.layer_loop");
 
         // 8) final RMSNorm.
         let hidden = self.norm.forward(&hidden)?;
+        if let Some(ref mut d) = layer_dump {
+            d.insert(
+                "hidden_final_norm".to_string(),
+                hidden.to_dtype(DType::F32)?,
+            );
+        }
+
+        // Flush the dump (best-effort: an instrumentation error must not
+        // corrupt the production forward result).
+        if let (Some(path), Some(d)) = (dump_layers_path.as_ref(), layer_dump.as_ref()) {
+            if let Err(e) =
+                flame_core::serialization::save_file(d, std::path::Path::new(path))
+            {
+                eprintln!("[hidream_dump] WARN failed to write {}: {e}", path);
+            } else {
+                eprintln!(
+                    "[hidream_dump] wrote {} keys to {}",
+                    d.len(),
+                    path
+                );
+            }
+        }
 
         // 9) final pixel head — projects EVERY position. Caller filters by
         //    vinput_mask. (Per `pipeline.py:329` the gather is
         //    `x_pred[0, sample['vinput_mask'][0]]`.)
-        self.final_layer.forward(&hidden, None)
+        self.final_layer.forward_lora(&hidden, None, lora)
     }
 
     // -----------------------------------------------------------------------
@@ -372,7 +514,7 @@ impl HiDreamO1Model {
     /// 2D weights here. Same pattern as
     /// `inference-flame/src/models/sensenova_u1.rs::untranspose_block_weights`.
     fn untranspose_block_weights(
-        raw: &Arc<HashMap<String, Tensor>>,
+        raw: &HashMap<String, Tensor>,
     ) -> Result<HashMap<String, Tensor>> {
         let mut out = HashMap::with_capacity(raw.len());
         for (k, v) in raw.iter() {
@@ -423,15 +565,17 @@ impl HiDreamO1Model {
         };
 
         let tms = self.config.tms_token_id as f32;
-        let mut mask_data = vec![0.0f32; b * s_text * h];
+        let mut keep_text_data = vec![1.0f32; b * s_text * h];
+        let mut selector_data = vec![0.0f32; b * s_text * b];
         let mut any_hit = false;
         for bi in 0..b {
             for si in 0..s_text {
                 if id_host_f32[bi * s_text + si] == tms {
                     let row_off = (bi * s_text + si) * h;
                     for d in 0..h {
-                        mask_data[row_off + d] = 1.0;
+                        keep_text_data[row_off + d] = 0.0;
                     }
+                    selector_data[(bi * s_text + si) * b + bi] = 1.0;
                     any_hit = true;
                 }
             }
@@ -444,17 +588,19 @@ impl HiDreamO1Model {
             return Ok(text_emb.clone());
         }
 
-        let mask = Tensor::from_vec_dtype(
-            mask_data,
-            Shape::from_dims(&[b, s_text, h]),
+        let keep_text = Tensor::from_vec_dtype(
+            keep_text_data,
+            Shape::from_dims(&[b * s_text, h]),
+            self.device.clone(),
+            DType::BF16,
+        )?;
+        let selector = Tensor::from_vec_dtype(
+            selector_data,
+            Shape::from_dims(&[b * s_text, b]),
             self.device.clone(),
             DType::BF16,
         )?;
 
-        // t_emb: [B, H] → broadcast to [B, S, H] by repeat along seq dim.
-        // We want: every row of every batch becomes the corresponding t_emb[b].
-        // flame-core has a broadcast_to but it requires a unit dim to broadcast
-        // FROM; we have [B, H] and need [B, S, H]. Use unsqueeze + broadcast_to.
         let t_dims = t_emb.shape().dims();
         if t_dims.len() != 2 || t_dims[0] != b || t_dims[1] != h {
             return Err(Error::InvalidOperation(format!(
@@ -462,17 +608,23 @@ impl HiDreamO1Model {
                 t_dims, b, h
             )));
         }
-        let t_emb_3d = t_emb
-            .reshape(&[b, 1, h])?
-            .broadcast_to(&Shape::from_dims(&[b, s_text, h]))?;
 
-        // where_mask(mask, a, b) selects a where mask != 0.
-        Tensor::where_mask(&mask, &t_emb_3d, text_emb)
+        // Use matmul, not where/broadcast, so autograd reaches t_emb and the
+        // timestep MLP LoRA adapters. `selector` places each batch row's
+        // t_emb only at its <|tms_token|> row; `keep_text` zeros the original
+        // embedding at that row.
+        let text_flat = text_emb.reshape(&[b * s_text, h])?;
+        let text_kept = text_flat.mul(&keep_text)?;
+        let t_rows = selector.matmul(t_emb)?;
+        text_kept.add(&t_rows)?.reshape(&[b, s_text, h])
     }
 
     /// Build the **mixed causal/full** attention mask.
     ///
-    /// `vinput_mask`: `[B, S_total]` BF16, 1.0 at image rows, 0.0 at text rows.
+    /// `token_types_bin`: `[B, S_total]` BF16, 1.0 at gen rows (image + TMS),
+    /// 0.0 at pure-text rows. This is `(token_types > 0)` per
+    /// `qwen3_vl_transformers.py:1501`, NOT `vinput_mask` (which is
+    /// `token_types == 1` and excludes the TMS row).
     ///
     /// Output: `[B, 1, S_total, S_total]` BF16 with 1.0 = "attend" and
     /// 0.0 = "block". The SDPA path converts the binary mask to additive
@@ -482,27 +634,27 @@ impl HiDreamO1Model {
     /// ```
     /// for each batch:
     ///   start with strict-lower-tri ones (causal: row i ≥ col j)
-    ///   for every row i where vinput_mask[i] == 1:  set whole row i to 1
+    ///   for every row i where token_types_bin[i] == 1:  set whole row i to 1
     /// ```
-    /// Effect: text rows attend causally; image rows attend to everything.
-    /// (Cross-attention text→image is zero because the image columns sit
-    /// AFTER the text rows in S_total layout, so the lower-tri zero blocks
-    /// them. Image→text and image→image are full bidirectional. ✓ matches
-    /// the Python.)
+    /// Effect: text rows attend causally; gen rows (image AND TMS) attend
+    /// to everything. (Cross-attention text→image is zero because the image
+    /// columns sit AFTER the text rows in S_total layout, so the lower-tri
+    /// zero blocks them. Image→text, image→image, and TMS→all are full
+    /// bidirectional. ✓ matches Python.)
     fn build_mixed_attention_mask(
         &self,
         b: usize,
         s_total: usize,
-        vinput_mask: &Tensor,
+        token_types_bin: &Tensor,
     ) -> Result<Tensor> {
-        let vmask_dims = vinput_mask.shape().dims();
+        let vmask_dims = token_types_bin.shape().dims();
         if vmask_dims.len() != 2 || vmask_dims[0] != b || vmask_dims[1] != s_total {
             return Err(Error::InvalidOperation(format!(
-                "build_mixed_attention_mask: vinput_mask shape {:?} must be [{},{}]",
+                "build_mixed_attention_mask: token_types_bin shape {:?} must be [{},{}]",
                 vmask_dims, b, s_total
             )));
         }
-        let vmask_host = vinput_mask.to_dtype(DType::F32)?.to_vec_f32()?;
+        let vmask_host = token_types_bin.to_dtype(DType::F32)?.to_vec_f32()?;
 
         let mut data = vec![0.0f32; b * s_total * s_total];
         for bi in 0..b {
@@ -532,5 +684,34 @@ impl HiDreamO1Model {
         )?;
         Ok(mask_4d)
     }
-}
 
+    fn ar_prefix_len(b: usize, s_total: usize, token_types_bin: &Tensor) -> Result<usize> {
+        let vmask_dims = token_types_bin.shape().dims();
+        if vmask_dims.len() != 2 || vmask_dims[0] != b || vmask_dims[1] != s_total {
+            return Err(Error::InvalidOperation(format!(
+                "ar_prefix_len: token_types_bin shape {:?} must be [{},{}]",
+                vmask_dims, b, s_total
+            )));
+        }
+        if b != 1 {
+            return Err(Error::InvalidOperation(
+                "ar_prefix_len currently expects batch size 1".into(),
+            ));
+        }
+
+        let host = token_types_bin.to_dtype(DType::F32)?.to_vec_f32()?;
+        let mut ar_len = 0usize;
+        while ar_len < s_total && host[ar_len] == 0.0 {
+            ar_len += 1;
+        }
+        for (idx, value) in host.iter().enumerate().skip(ar_len) {
+            if *value == 0.0 {
+                return Err(Error::InvalidOperation(format!(
+                    "ar_prefix_len: token_types_bin is not prefix-AR at position {}",
+                    idx
+                )));
+            }
+        }
+        Ok(ar_len)
+    }
+}

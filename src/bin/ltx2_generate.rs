@@ -34,9 +34,8 @@ use inference_flame::sampling::ltx2_sampling::{linear_quadratic_schedule, LTX2_D
 use flame_core::{global_cuda_device, Shape, Tensor};
 use std::time::Instant;
 
-// Use dev-fp8 for testing FP8 resident path
 const MODEL_PATH: &str =
-    "/home/alex/.serenity/models/checkpoints/ltx-2.3-22b-dev-fp8.safetensors";
+    "/home/alex/.serenity/models/checkpoints/ltx-2.3-22b-dev.safetensors";
 const LTX_CHECKPOINT_FULL: &str =
     "/home/alex/.serenity/models/checkpoints/ltx-2.3-22b-dev.safetensors";
 const EMBEDDINGS_PATH: &str =
@@ -140,6 +139,10 @@ fn collect_neg_text() -> Option<String> {
         }
     }
     out
+}
+
+fn has_flag(flag: &str) -> bool {
+    std::env::args().any(|a| a == flag)
 }
 
 /// Tokenize via the HF `tokenizers` crate. Matches Python reference:
@@ -253,6 +256,7 @@ fn main() -> anyhow::Result<()> {
     let do_cfg = cfg_scale > 1.0;
     let neg_text = collect_neg_text().unwrap_or_else(|| DEFAULT_NEGATIVE.to_string());
     let neg_embeds_path: Option<String> = get_arg("--neg-embeds");
+    let fp8_resident = has_flag("--fp8-resident");
 
     println!("============================================================");
     println!("LTX-2.3 Video Generation — Pure Rust + CFG");
@@ -355,21 +359,25 @@ fn main() -> anyhow::Result<()> {
         model.add_lora(lora);
     }
 
-    // When any LoRA is attached, go straight to BlockOffloader — FP8-resident
-    // can't re-fuse deltas after dequant. Otherwise, try FP8 resident first.
+    // FP8 resident is an explicit debug/perf opt-in. The correctness path
+    // uses BlockOffloader so weight layout matches the native linear kernels.
     if !lora_specs.is_empty() {
         println!("  LoRA attached — skipping FP8 resident, using BlockOffloader");
-        model.init_offloader()?;
-        println!("  BlockOffloader initialized in {:.1}s", t0.elapsed().as_secs_f32());
-    } else {
+        model.init_offloader_streaming()?;
+        println!("  Streaming BlockOffloader initialized in {:.1}s", t0.elapsed().as_secs_f32());
+    } else if fp8_resident {
         match model.load_fp8_resident() {
             Ok(()) => println!("  FP8 resident loaded in {:.1}s", t0.elapsed().as_secs_f32()),
             Err(e) => {
                 println!("  FP8 resident failed ({e}), falling back to BlockOffloader");
-                model.init_offloader()?;
-                println!("  BlockOffloader initialized in {:.1}s", t0.elapsed().as_secs_f32());
+                model.init_offloader_streaming()?;
+                println!("  Streaming BlockOffloader initialized in {:.1}s", t0.elapsed().as_secs_f32());
             }
         }
+    } else {
+        println!("  Using BF16 streaming BlockOffloader (--fp8-resident opt-in disabled by default)");
+        model.init_offloader_streaming()?;
+        println!("  Streaming BlockOffloader initialized in {:.1}s", t0.elapsed().as_secs_f32());
     }
 
     // Stage 3: Noise + schedule
