@@ -72,6 +72,7 @@ struct Args {
     text_template: bool,
     skip_vae: bool,
     noise_from: Option<PathBuf>,
+    use_t2v_path: bool,
 }
 
 impl Args {
@@ -92,6 +93,7 @@ impl Args {
             text_template: true,
             skip_vae: false,
             noise_from: None,
+            use_t2v_path: false,
         }
     }
 }
@@ -152,6 +154,7 @@ fn parse_args() -> std::result::Result<Args, String> {
             "--no-text-template" => a.text_template = false,
             "--skip-vae" => a.skip_vae = true,
             "--noise-from" | "--noise_from" => a.noise_from = Some(PathBuf::from(next()?)),
+            "--use-t2v-path" | "--use_t2v_path" => a.use_t2v_path = true,
             "-h" | "--help" => {
                 print_usage();
                 std::process::exit(0);
@@ -187,6 +190,8 @@ Options:
   --skip-vae            skip VAE decode (capture lance.final_latent only)
   --noise-from  <PATH>  load Python's input.latent_noise.safetensors instead
                         of generating; eliminates RNG mismatch for parity
+  --use-t2v-path        use Lance::gen_step_t2v (G1+G2 fix: SOI/EOI brackets
+                        + Python-matching positions). Default: gen_step (T2I)
 "#
     );
 }
@@ -345,6 +350,7 @@ fn denoise_loop_capture(
     shift: f32,
     cfg_scale: f32,
     refs_dir: &Path,
+    use_t2v_path: bool,
 ) -> Result<Tensor> {
     if num_steps == 0 {
         return Err(anyhow!("denoise_loop_capture: num_steps must be > 0"));
@@ -377,8 +383,17 @@ fn denoise_loop_capture(
             t_tensor
         };
 
-        let v_cond = lance.gen_step(&x_t, &t_tensor, mrope, &mut cond_cache_local)?;
-        let v_uncond = lance.gen_step(&x_t, &t_tensor, mrope, &mut uncond_cache_local)?;
+        let (v_cond, v_uncond) = if use_t2v_path {
+            (
+                lance.gen_step_t2v(&x_t, &t_tensor, mrope, &mut cond_cache_local)?,
+                lance.gen_step_t2v(&x_t, &t_tensor, mrope, &mut uncond_cache_local)?,
+            )
+        } else {
+            (
+                lance.gen_step(&x_t, &t_tensor, mrope, &mut cond_cache_local)?,
+                lance.gen_step(&x_t, &t_tensor, mrope, &mut uncond_cache_local)?,
+            )
+        };
         let v = combine_cfg(&v_uncond, &v_cond, cfg_scale)?;
 
         if i == 0 {
@@ -514,6 +529,10 @@ fn stage2_denoise_capture(
 
     // ---- Denoise with step-0 capture ----
     let t1 = Instant::now();
+    log::info!(
+        "[parity_lance_t2v]   denoise path: {}",
+        if args.use_t2v_path { "gen_step_t2v (G1+G2)" } else { "gen_step (T2I)" }
+    );
     let latent = denoise_loop_capture(
         &lance,
         cfg.as_ref(),
@@ -525,6 +544,7 @@ fn stage2_denoise_capture(
         args.shift,
         args.cfg,
         refs_dir,
+        args.use_t2v_path,
     )?;
     log::info!(
         "[parity_lance_t2v]   denoise complete in {:.1}s",

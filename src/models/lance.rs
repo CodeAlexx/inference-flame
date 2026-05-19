@@ -4394,6 +4394,242 @@ impl Lance {
         let v_5d_thwc = v_flat.reshape(&[b, t, h, w, p])?; // [B, T, H, W, 48]
         v_5d_thwc.permute(&[0, 4, 1, 2, 3]) // [B, 48, T, H, W]
     }
+
+    // =======================================================================
+    // T2V denoise path (G1+G2+G4 from T2V_DENOISE_PORT.md)
+    // =======================================================================
+    //
+    // Lance Python feeds a 770-token "noise span" `[SOI, vae×768, EOI]` into
+    // `forward_inference` per denoise step, with positions in the SAME range
+    // as the text prefix (no +1000 shift — that shift only applies for T2I
+    // per `shift_position_ids(pro_type=10)`). See parity captures verified
+    // 2026-05-19:
+    //   - SOI = 151652, EOI = 151653
+    //   - SOI at noise-span idx 0 with diagonal position (L_text, L_text, L_text)
+    //   - VAE token (t, h, w) at noise-span idx `1 + t*H*W + h*W + w`
+    //     with position (L_text+1+2t, L_text+1+h, L_text+1+w)
+    //   - EOI at noise-span idx L_vae+1 with diagonal position
+    //     (M+1, M+1, M+1) where M = max VAE position across all 3 axes
+
+    /// Lance video bracket token ids (verified against `input_text_tokens`
+    /// capture at packed indices 65 and 835):
+    ///   `vision_start` = 151652, `vision_end` = 151653.
+    /// Tokenizer name in Qwen2.5-VL: `<|vision_start|>`, `<|vision_end|>`.
+    const VISION_START_TOKEN_ID: i32 = 151652;
+    const VISION_END_TOKEN_ID: i32 = 151653;
+
+    /// Build per-token mRoPE positions for the 770-token noise span used in
+    /// T2V denoise. Returns three `[L_noise]` I32 tensors in noise-span
+    /// order: `[SOI, vae(t=0,h=0,w=0), ..., vae(T-1,H-1,W-1), EOI]`.
+    ///
+    /// Verified against `current_pos_ids_post_shift.safetensors` (Python
+    /// parity capture, 2026-05-19):
+    ///   - SOI at idx 0: position `(L_text, L_text, L_text)`
+    ///   - VAE at idx `1+t*H*W+h*W+w`: position
+    ///     `(L_text+1+2t, L_text+1+h, L_text+1+w)`
+    ///   - EOI at idx L_vae+1: position `(M+1, M+1, M+1)` where M is the
+    ///     global max over all three axes of VAE positions, i.e.
+    ///     `M = L_text + max(1+2*(T-1), H, W)`.
+    fn build_t2v_noise_span_positions(
+        &self,
+        text_len: usize,
+        t_lat: usize,
+        h_lat: usize,
+        w_lat: usize,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        let dev = &self.config.device;
+        let l_vae = t_lat * h_lat * w_lat;
+        let l_noise = l_vae + 2;
+        let mut pos_t: Vec<f32> = Vec::with_capacity(l_noise);
+        let mut pos_h: Vec<f32> = Vec::with_capacity(l_noise);
+        let mut pos_w: Vec<f32> = Vec::with_capacity(l_noise);
+
+        // SOI: diagonal at L_text (continues from text prefix).
+        let l_text_f = text_len as f32;
+        pos_t.push(l_text_f);
+        pos_h.push(l_text_f);
+        pos_w.push(l_text_f);
+
+        // VAE: T-major H-mid W-fast enumeration matching the patchify layout
+        // `permute(0,2,3,4,1).reshape([L_vae, p])`. T-axis multiplier is 2.0
+        // per Qwen2.5-VL get_rope_index (tokens_per_second=2 *
+        // second_per_grid_t=1.0).
+        const T_AXIS_MULTIPLIER: f32 = 2.0;
+        let base_f = (text_len + 1) as f32;
+        let mut max_t = 0f32;
+        let mut max_h = 0f32;
+        let mut max_w = 0f32;
+        for it in 0..t_lat {
+            let t_val = base_f + (it as f32) * T_AXIS_MULTIPLIER;
+            for ih in 0..h_lat {
+                let h_val = base_f + ih as f32;
+                for iw in 0..w_lat {
+                    let w_val = base_f + iw as f32;
+                    pos_t.push(t_val);
+                    pos_h.push(h_val);
+                    pos_w.push(w_val);
+                    if t_val > max_t { max_t = t_val; }
+                    if h_val > max_h { max_h = h_val; }
+                    if w_val > max_w { max_w = w_val; }
+                }
+            }
+        }
+
+        // EOI: diagonal at (global_max + 1). The capture shows the same
+        // value used for all three axes — EOI is a text/bracket token, so
+        // it gets a diagonal position past the last image position.
+        let eoi_val = max_t.max(max_h).max(max_w) + 1.0;
+        pos_t.push(eoi_val);
+        pos_h.push(eoi_val);
+        pos_w.push(eoi_val);
+
+        let to_i32 = |v: Vec<f32>| -> Result<Tensor> {
+            Tensor::from_vec(v, Shape::from_dims(&[l_noise]), dev.clone())?
+                .to_dtype(DType::I32)
+        };
+        Ok((to_i32(pos_t)?, to_i32(pos_h)?, to_i32(pos_w)?))
+    }
+
+    /// **GEN STEP — T2V.** Like `gen_step` but mirrors Python's packed-
+    /// sequence T2V denoise path: forwards a 770-token noise span
+    /// `[SOI, vae×768, EOI]` through the language model and selects the
+    /// VAE-position outputs.
+    ///
+    /// Differences from `gen_step` (= G1, G2 from T2V_DENOISE_PORT.md):
+    ///   - **G1**: concatenates SOI and EOI text-token embeddings around
+    ///     the patchified VAE embeddings before forwarding.
+    ///   - **G2**: positions match Python's `get_rope_index` output (no
+    ///     +1000 shift; T-axis multiplied by 2).
+    ///   - Output `llm2vae` is applied to the full 770-token output, then
+    ///     the SOI/EOI slots are dropped (positions 0 and L_noise-1) and
+    ///     only the L_vae VAE slots are unpatchified.
+    ///
+    /// Time embedding is added ONLY to the VAE positions (mirrors Python
+    /// — bracket tokens carry pure text embedding, no time signal).
+    ///
+    /// Positional embedding `latent_pos_embed` is added ONLY to the VAE
+    /// positions (it's a per-resolution image embedding; bracket tokens
+    /// get nothing from it).
+    pub fn gen_step_t2v(
+        &self,
+        latent: &Tensor,
+        timestep: &Tensor,
+        mrope: &MropeFreqs,
+        cache: &mut KvCache,
+    ) -> Result<Tensor> {
+        // ---- Validate input latent shape: [B=1, C, T, H, W]. ----
+        let ldims = latent.shape().dims().to_vec();
+        if ldims.len() != 5 {
+            return Err(Error::InvalidInput(format!(
+                "Lance::gen_step_t2v: expected 5D latent [B, C, T, H, W], got {ldims:?}"
+            )));
+        }
+        let (b, c, t, h, w) = (ldims[0], ldims[1], ldims[2], ldims[3], ldims[4]);
+        let p = self.config.patch_latent_dim();
+        if c != p {
+            return Err(Error::InvalidInput(format!(
+                "Lance::gen_step_t2v: latent C={c} != patch_latent_dim={p}"
+            )));
+        }
+        if b != 1 {
+            return Err(Error::InvalidInput(format!(
+                "Lance::gen_step_t2v: only B=1 supported, got B={b}"
+            )));
+        }
+        let (pt, ph, pw) = self.config.latent_patch_size;
+        if (pt, ph, pw) != (1, 1, 1) {
+            return Err(Error::InvalidInput(format!(
+                "Lance::gen_step_t2v: only latent_patch_size=(1,1,1) supported, got ({pt},{ph},{pw})"
+            )));
+        }
+
+        // ---- 1. Patchify: [1, C, T, H, W] → [L_vae, C]. ----
+        let l_vae = t * h * w;
+        let latent_p = latent.permute(&[0, 2, 3, 4, 1])?; // [1, T, H, W, C]
+        let x_patch_2d = latent_p.reshape(&[l_vae, p])?; // [L_vae, C]
+        let x_patch_3d = x_patch_2d.reshape(&[1, l_vae, p])?; // [1, L_vae, C]
+
+        // ---- 2. vae2llm: [1, L_vae, C] → [1, L_vae, hidden]. ----
+        let mut h_vae = self.vae2llm.forward(&x_patch_3d)?;
+
+        // ---- 3. Time embedding (vae-only). ----
+        let t_dims = timestep.shape().dims();
+        if t_dims.len() != 1 || t_dims[0] != 1 {
+            return Err(Error::InvalidInput(format!(
+                "Lance::gen_step_t2v: expected scalar timestep [1], got {t_dims:?}"
+            )));
+        }
+        let t_scalar = timestep.to_dtype(DType::F32)?.to_vec()?[0];
+        let t_vec = vec![t_scalar; l_vae];
+        let t_tensor_f32 =
+            Tensor::from_vec(t_vec, Shape::from_dims(&[l_vae]), self.config.device.clone())?;
+        let t_tensor = if t_tensor_f32.dtype() != self.config.dtype {
+            t_tensor_f32.to_dtype(self.config.dtype)?
+        } else {
+            t_tensor_f32
+        };
+        let time_emb = self.time_embedder.forward(&t_tensor)?; // [L_vae, hidden]
+        let time_emb_3d = Self::to_3d(&time_emb)?;
+        h_vae = h_vae.add(&time_emb_3d)?;
+
+        // ---- 4. Latent pos embedding (vae-only). ----
+        let pos_emb =
+            self.latent_pos_embed
+                .build(t, h, w, &self.config.device, self.config.dtype)?; // [L_vae, hidden]
+        let pos_emb_3d = Self::to_3d(&pos_emb)?;
+        h_vae = h_vae.add(&pos_emb_3d)?;
+
+        // ---- 5. Embed SOI/EOI bracket tokens and concat. ----
+        // [SOI_id, EOI_id] → [2, hidden]. We keep one tensor and slice it
+        // into two [1, hidden] strips for cat.
+        let bracket_ids = Tensor::from_vec(
+            vec![Self::VISION_START_TOKEN_ID as f32, Self::VISION_END_TOKEN_ID as f32],
+            Shape::from_dims(&[2]),
+            self.config.device.clone(),
+        )?
+        .to_dtype(DType::I32)?;
+        let bracket_emb_2d = self.embed_text_tokens(&bracket_ids)?; // [2, hidden]
+        let soi_2d = bracket_emb_2d.narrow(0, 0, 1)?; // [1, hidden]
+        let eoi_2d = bracket_emb_2d.narrow(0, 1, 1)?; // [1, hidden]
+        let soi_3d = soi_2d.reshape(&[1, 1, soi_2d.shape().dims()[1]])?; // [1, 1, hidden]
+        let eoi_3d = eoi_2d.reshape(&[1, 1, eoi_2d.shape().dims()[1]])?; // [1, 1, hidden]
+
+        // h_vae is [1, L_vae, hidden]; concat on dim=1 → [1, L_noise=L_vae+2, hidden].
+        let h_noise = Tensor::cat(&[&soi_3d, &h_vae, &eoi_3d], 1)?;
+        let l_noise = l_vae + 2;
+        debug_assert_eq!(h_noise.shape().dims(), &[1, l_noise, self.config.hidden_size]);
+
+        // ---- 6. Gen-mask: all-gen for the noise span. ----
+        let gen_mask = self.build_uniform_gen_mask(l_noise, 1.0)?;
+
+        // ---- 7. Positions for the 770-token noise span. ----
+        let prefix_len = cache.seq_len(0);
+        let (pos_t_tensor, pos_h_tensor, pos_w_tensor) =
+            self.build_t2v_noise_span_positions(prefix_len, t, h, w)?;
+
+        // ---- 8. Block stack: is_causal=false, update_cache=false. ----
+        let h_out_3d = self.blocks.forward(
+            &h_noise,
+            &gen_mask,
+            &pos_t_tensor,
+            &pos_h_tensor,
+            &pos_w_tensor,
+            mrope,
+            false, // is_causal — non-causal within noise span
+            Some(cache),
+            false, // update_cache — READ-ONLY
+        )?;
+
+        // ---- 9. llm2vae over the full noise span, then drop SOI/EOI. ----
+        let v_noise_2d = self.llm2vae.forward(&h_out_3d)?; // [1, L_noise, C]
+        // Select VAE positions [1..1+L_vae) from the noise span.
+        let v_vae_3d = v_noise_2d.narrow(1, 1, l_vae)?; // [1, L_vae, C]
+        let v_vae_flat = v_vae_3d.reshape(&[l_vae, p])?; // [L_vae, C]
+
+        // ---- 10. Unpatchify: [L_vae, C] → [B, C, T, H, W]. ----
+        let v_5d_thwc = v_vae_flat.reshape(&[b, t, h, w, p])?; // [B, T, H, W, C]
+        v_5d_thwc.permute(&[0, 4, 1, 2, 3]) // [B, C, T, H, W]
+    }
 }
 
 // ===========================================================================
