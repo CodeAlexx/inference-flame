@@ -263,6 +263,9 @@ name = "klein9b_encode"
 path = "src/bin/klein9b_encode.rs"
 
 [[bin]]
+name = "klein9b_parity_dump"
+path = "src/bin/klein9b_parity_dump.rs"
+[[bin]]
 name = "klein9b_compare"
 path = "src/bin/klein9b_compare.rs"
 
@@ -502,6 +505,26 @@ name = "turbo_qwen_edit_offload"
 path = "benches/turbo_qwen_edit_offload.rs"
 harness = false
 required-features = ["turbo"]
+
+[[bin]]
+name = "lance_t2i"
+path = "src/bin/lance_t2i.rs"
+
+[[bin]]
+name = "lance_t2v"
+path = "src/bin/lance_t2v.rs"
+
+[[bin]]
+name = "parity_lance"
+path = "src/bin/parity_lance.rs"
+
+[[bin]]
+name = "lance_print_tokens"
+path = "src/bin/lance_print_tokens.rs"
+
+[[bin]]
+name = "lance_dump_prefill_hidden"
+path = "src/bin/lance_dump_prefill_hidden.rs"
 
 [[bin]]
 name = "sensenova_u1_gen"

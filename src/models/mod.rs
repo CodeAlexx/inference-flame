@@ -43,3 +43,4 @@ pub mod helios_dit;
 pub mod hidream_o1;
 pub mod hidream_i1;
 pub mod asymflux2;
+pub mod lance;

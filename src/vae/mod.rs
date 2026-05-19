@@ -12,6 +12,8 @@ pub mod wan21_vae;
 pub use wan21_vae::Wan21VaeDecoder;
 pub mod wan21_encoder;
 pub use wan21_encoder::Wan21VaeEncoder;
+pub mod wan22_vae;
+pub use wan22_vae::Wan22VaeDecoder;
 pub mod ltx2_audio_vae;
 pub use ltx2_audio_vae::{LTX2AudioVaeDecoder, LTX2AudioVaeEncoder};
 pub mod ltx2_vocoder;
