@@ -5980,6 +5980,101 @@ impl Lance {
             self.config.cfg_text_scale,
         )
     }
+
+    /// T2V denoise loop: like `denoise_loop` but uses `gen_step_t2v`
+    /// (G1+G2 fix — SOI/EOI bracketing + Python-matching mRoPE positions)
+    /// and applies `cfg_renorm` per Python `lance.py:1771-1783`.
+    ///
+    /// Inputs match `denoise_loop`. Cache requirements: `cond_cache` should
+    /// be prefilled with the cond chat-template-wrapped prompt; `uncond_cache`
+    /// with the chat-template-wrapped empty/negative prompt.
+    pub fn denoise_loop_t2v(
+        &self,
+        cond_cache: &KvCache,
+        uncond_cache: &KvCache,
+        initial_noise: &Tensor,
+        mrope: &MropeFreqs,
+        num_steps: usize,
+        shift: f32,
+        cfg_scale: f32,
+    ) -> Result<Tensor> {
+        if num_steps == 0 {
+            return Err(Error::InvalidInput(
+                "Lance::denoise_loop_t2v: num_steps must be > 0".into(),
+            ));
+        }
+
+        let timesteps = timestep_schedule(num_steps, shift, &self.config.device)?;
+        let timesteps_host: Vec<f32> = timesteps.to_dtype(DType::F32)?.to_vec()?;
+        if timesteps_host.len() != num_steps + 1 {
+            return Err(Error::InvalidInput(format!(
+                "Lance::denoise_loop_t2v: timestep_schedule returned {} values, expected {}",
+                timesteps_host.len(),
+                num_steps + 1
+            )));
+        }
+        let dts: Vec<f32> = (0..num_steps)
+            .map(|i| timesteps_host[i] - timesteps_host[i + 1])
+            .collect();
+
+        let mut cond_cache_local = cond_cache.clone();
+        let mut uncond_cache_local = uncond_cache.clone();
+        let mut x_t = initial_noise.clone();
+
+        for i in 0..num_steps {
+            let t = timesteps_host[i];
+            let t_tensor =
+                Tensor::from_vec(vec![t], Shape::from_dims(&[1]), self.config.device.clone())?;
+            let t_tensor = if t_tensor.dtype() != self.config.dtype {
+                t_tensor.to_dtype(self.config.dtype)?
+            } else {
+                t_tensor
+            };
+
+            let v_cond = self.gen_step_t2v(&x_t, &t_tensor, mrope, &mut cond_cache_local)?;
+            let v_uncond = self.gen_step_t2v(&x_t, &t_tensor, mrope, &mut uncond_cache_local)?;
+
+            // CFG combine then renorm (G4). Python defaults: min=0.0, max=1.0.
+            let v_cfg_pre = combine_cfg(&v_uncond, &v_cond, cfg_scale)?;
+            let v = cfg_renorm(&v_cfg_pre, &v_cond, 0.0, 1.0)?;
+
+            x_t = denoise_step(&x_t, &v, dts[i])?;
+
+            log::info!(
+                "[Lance denoise_t2v] step {}/{}, t={:.4}, dt={:.4}",
+                i + 1,
+                num_steps,
+                t,
+                dts[i]
+            );
+        }
+        Ok(x_t)
+    }
+
+    /// One-call T2V entry. Prefills both cond and uncond text caches, then
+    /// runs `denoise_loop_t2v` with config defaults. The T2V analogue of
+    /// `t2i_with_cfg`.
+    pub fn t2v_with_cfg(
+        &self,
+        cond_tokens: &Tensor,
+        uncond_tokens: &Tensor,
+        initial_noise: &Tensor,
+        mrope: &MropeFreqs,
+    ) -> Result<Tensor> {
+        let mut cond_cache = self.new_kv_cache();
+        self.prefill_text_context(cond_tokens, mrope, &mut cond_cache)?;
+        let mut uncond_cache = self.new_kv_cache();
+        self.prefill_text_context(uncond_tokens, mrope, &mut uncond_cache)?;
+        self.denoise_loop_t2v(
+            &cond_cache,
+            &uncond_cache,
+            initial_noise,
+            mrope,
+            self.config.num_inference_steps,
+            self.config.timestep_shift,
+            self.config.cfg_text_scale,
+        )
+    }
 }
 
 #[cfg(test)]

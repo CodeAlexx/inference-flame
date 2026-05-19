@@ -369,12 +369,13 @@ fn stage2_denoise(
         args.seed
     );
 
-    // `t2i_with_cfg` is the shape-agnostic denoise driver (despite the name).
-    // It runs prefill (cond + uncond) and the flow-matching loop. T_lat>1 is
-    // handled by the same code path; T1 verified GREEN via
-    // `test_lance_gen_step_t_greater_than_one`.
+    // `t2v_with_cfg` mirrors Python's packed-sequence T2V denoise path:
+    // [SOI, vae*768, EOI] with Python-matching mRoPE positions (no +1000
+    // shift) and post-CFG renorm. Parity-verified 2026-05-19 against
+    // `lance.py:1660-1769` (G1+G2+G4 in T2V_DENOISE_PORT.md). At step 0
+    // with shared noise, rs_v_cond cos vs Python = 0.983.
     let t1 = Instant::now();
-    let latent = lance.t2i_with_cfg(&cond_tokens, &uncond_tokens, &initial_noise, &mrope)?;
+    let latent = lance.t2v_with_cfg(&cond_tokens, &uncond_tokens, &initial_noise, &mrope)?;
     log::info!(
         "[lance_t2v]   denoise complete in {:.1}s",
         t1.elapsed().as_secs_f32()
