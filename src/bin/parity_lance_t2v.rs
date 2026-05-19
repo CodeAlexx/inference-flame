@@ -34,7 +34,7 @@ use std::time::Instant;
 use anyhow::{anyhow, Context, Result};
 use flame_core::{CudaDevice, DType, Shape, Tensor};
 use inference_flame::models::lance::{
-    combine_cfg, denoise_step, timestep_schedule, Lance, LanceConfig,
+    cfg_renorm, combine_cfg, denoise_step, timestep_schedule, Lance, LanceConfig,
 };
 use inference_flame::vae::wan22_vae::Wan22VaeDecoder;
 use rand::{Rng, SeedableRng};
@@ -73,6 +73,7 @@ struct Args {
     skip_vae: bool,
     noise_from: Option<PathBuf>,
     use_t2v_path: bool,
+    cfg_renorm: bool,
 }
 
 impl Args {
@@ -94,6 +95,7 @@ impl Args {
             skip_vae: false,
             noise_from: None,
             use_t2v_path: false,
+            cfg_renorm: false,
         }
     }
 }
@@ -155,6 +157,7 @@ fn parse_args() -> std::result::Result<Args, String> {
             "--skip-vae" => a.skip_vae = true,
             "--noise-from" | "--noise_from" => a.noise_from = Some(PathBuf::from(next()?)),
             "--use-t2v-path" | "--use_t2v_path" => a.use_t2v_path = true,
+            "--cfg-renorm" | "--cfg_renorm" => a.cfg_renorm = true,
             "-h" | "--help" => {
                 print_usage();
                 std::process::exit(0);
@@ -192,6 +195,8 @@ Options:
                         of generating; eliminates RNG mismatch for parity
   --use-t2v-path        use Lance::gen_step_t2v (G1+G2 fix: SOI/EOI brackets
                         + Python-matching positions). Default: gen_step (T2I)
+  --cfg-renorm          apply Python cfg_renorm_type="global" post-CFG scale-
+                        clamp (G4). Default: off.
 "#
     );
 }
@@ -351,6 +356,7 @@ fn denoise_loop_capture(
     cfg_scale: f32,
     refs_dir: &Path,
     use_t2v_path: bool,
+    apply_cfg_renorm: bool,
 ) -> Result<Tensor> {
     if num_steps == 0 {
         return Err(anyhow!("denoise_loop_capture: num_steps must be > 0"));
@@ -394,12 +400,21 @@ fn denoise_loop_capture(
                 lance.gen_step(&x_t, &t_tensor, mrope, &mut uncond_cache_local)?,
             )
         };
-        let v = combine_cfg(&v_uncond, &v_cond, cfg_scale)?;
+        let v_pre_renorm = combine_cfg(&v_uncond, &v_cond, cfg_scale)?;
+        let v = if apply_cfg_renorm {
+            // Python lance.py:1771-1783 defaults: cfg_renorm_min=0.0, max=1.0.
+            cfg_renorm(&v_pre_renorm, &v_cond, 0.0, 1.0)?
+        } else {
+            v_pre_renorm.clone()
+        };
 
         if i == 0 {
             save_capture("step0.v_cond", &v_cond, refs_dir)?;
             save_capture("step0.v_uncond", &v_uncond, refs_dir)?;
-            save_capture("step0.v_cfg", &v, refs_dir)?;
+            save_capture("step0.v_cfg", &v_pre_renorm, refs_dir)?;
+            if apply_cfg_renorm {
+                save_capture("step0.v_cfg_renormed", &v, refs_dir)?;
+            }
             // dt scalar for parity (Python computes the same on its side from
             // the timestep_shift schedule — useful to verify the schedule
             // itself matches).
@@ -530,8 +545,9 @@ fn stage2_denoise_capture(
     // ---- Denoise with step-0 capture ----
     let t1 = Instant::now();
     log::info!(
-        "[parity_lance_t2v]   denoise path: {}",
-        if args.use_t2v_path { "gen_step_t2v (G1+G2)" } else { "gen_step (T2I)" }
+        "[parity_lance_t2v]   denoise path: {} {}",
+        if args.use_t2v_path { "gen_step_t2v (G1+G2)" } else { "gen_step (T2I)" },
+        if args.cfg_renorm { "+ cfg_renorm (G4)" } else { "" }
     );
     let latent = denoise_loop_capture(
         &lance,
@@ -545,6 +561,7 @@ fn stage2_denoise_capture(
         args.cfg,
         refs_dir,
         args.use_t2v_path,
+        args.cfg_renorm,
     )?;
     log::info!(
         "[parity_lance_t2v]   denoise complete in {:.1}s",

@@ -5787,6 +5787,44 @@ pub fn combine_cfg(uncond: &Tensor, cond: &Tensor, scale: f32) -> Result<Tensor>
     uncond.add(&scaled)
 }
 
+/// CFG-renorm per `lance.py:1771-1783` (`cfg_renorm_type="global"`):
+///
+/// ```text
+///   scale = clamp(norm(v_cond) / norm(v_cfg), min=renorm_min, max=renorm_max)
+///   v_out = v_cfg * scale
+/// ```
+///
+/// L2 norm is computed over the entire tensor (Python `torch.norm(v)` with
+/// no dim argument). For `renorm_min=0, renorm_max=1` this scales `v_cfg`
+/// down whenever its global norm exceeds the cond norm, keeping the
+/// magnitude in-distribution. Without renorm, large `cfg_scale` lets the
+/// guidance amplify out-of-distribution.
+///
+/// The default Lance T2V config uses `renorm_min=0.0, renorm_max=1.0`.
+pub fn cfg_renorm(v_cfg: &Tensor, v_cond: &Tensor, renorm_min: f32, renorm_max: f32) -> Result<Tensor> {
+    if v_cfg.shape().dims() != v_cond.shape().dims() {
+        return Err(Error::InvalidInput(format!(
+            "cfg_renorm: v_cfg shape {:?} != v_cond shape {:?}",
+            v_cfg.shape().dims(),
+            v_cond.shape().dims()
+        )));
+    }
+    // Compute scalar L2 norms via host-side reduce. The tensors here are
+    // small (typical T2V latent has ~37K F32 elements) so the host-bound
+    // sum is fine — same pattern as Python's `torch.norm` call (which
+    // also collapses to scalar). All-F32 to keep numerics consistent
+    // with Python's float() cast on the ratio.
+    let v_cfg_f32: Vec<f32> = v_cfg.to_dtype(DType::F32)?.to_vec()?;
+    let v_cond_f32: Vec<f32> = v_cond.to_dtype(DType::F32)?.to_vec()?;
+    let norm_cfg: f32 = v_cfg_f32.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let norm_cond: f32 = v_cond_f32.iter().map(|x| x * x).sum::<f32>().sqrt();
+    // Guard against div-by-zero on a fully-zero v_cfg (degenerate, but
+    // safe-clamp the ratio rather than NaN-propagate).
+    let ratio = if norm_cfg > 0.0 { norm_cond / norm_cfg } else { renorm_max };
+    let scale = ratio.clamp(renorm_min, renorm_max);
+    v_cfg.mul_scalar(scale)
+}
+
 impl Lance {
     /// Run the full flow-matching denoise loop with classifier-free guidance.
     ///
