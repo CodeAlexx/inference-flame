@@ -75,6 +75,7 @@ struct Args {
     use_t2v_path: bool,
     cfg_renorm: bool,
     empty_uncond: bool,
+    capture_layers: Vec<usize>,
 }
 
 impl Args {
@@ -98,6 +99,7 @@ impl Args {
             use_t2v_path: false,
             cfg_renorm: false,
             empty_uncond: false,
+            capture_layers: Vec::new(),
         }
     }
 }
@@ -161,6 +163,12 @@ fn parse_args() -> std::result::Result<Args, String> {
             "--use-t2v-path" | "--use_t2v_path" => a.use_t2v_path = true,
             "--cfg-renorm" | "--cfg_renorm" => a.cfg_renorm = true,
             "--empty-uncond" | "--empty_uncond" => a.empty_uncond = true,
+            "--capture-layers" | "--capture_layers" => {
+                a.capture_layers = next()?
+                    .split(',')
+                    .map(|s| s.trim().parse::<usize>().map_err(|e| e.to_string()))
+                    .collect::<std::result::Result<Vec<_>, String>>()?;
+            }
             "-h" | "--help" => {
                 print_usage();
                 std::process::exit(0);
@@ -203,6 +211,11 @@ Options:
   --empty-uncond        skip uncond text prefill — uncond_cache stays empty.
                         Tests G3 hypothesis (Python cfg_text_context for T2V
                         modality=text is effectively empty).
+  --capture-layers <L>  comma-separated layer indices (0..35) to capture
+                        post-block hidden state at on the step-0 cond pass.
+                        Saved as step0.block{{idx:02}}_cond.safetensors. Used
+                        with shared --noise-from to localize where Rust
+                        diverges from Python across the block stack.
 "#
     );
 }
@@ -363,6 +376,7 @@ fn denoise_loop_capture(
     refs_dir: &Path,
     use_t2v_path: bool,
     apply_cfg_renorm: bool,
+    capture_layers: &[usize],
 ) -> Result<Tensor> {
     if num_steps == 0 {
         return Err(anyhow!("denoise_loop_capture: num_steps must be > 0"));
@@ -396,10 +410,31 @@ fn denoise_loop_capture(
         };
 
         let (v_cond, v_uncond) = if use_t2v_path {
-            (
-                lance.gen_step_t2v(&x_t, &t_tensor, mrope, &mut cond_cache_local)?,
-                lance.gen_step_t2v(&x_t, &t_tensor, mrope, &mut uncond_cache_local)?,
-            )
+            let v_cond = if i == 0 && !capture_layers.is_empty() {
+                let (v, captures) = lance.gen_step_t2v_capture_layers(
+                    &x_t,
+                    &t_tensor,
+                    mrope,
+                    &mut cond_cache_local,
+                    capture_layers,
+                )?;
+                for (layer_idx, hidden) in captures {
+                    let name = if layer_idx == usize::MAX {
+                        // Sentinel: pre-block-0 input (= post-vae2llm +
+                        // time + pos + brackets). Should match Python's
+                        // `step0.packed_sequence_vae`.
+                        "step0.pre_block0_cond".to_string()
+                    } else {
+                        format!("step0.block{:02}_cond", layer_idx)
+                    };
+                    save_capture(&name, &hidden, refs_dir)?;
+                }
+                v
+            } else {
+                lance.gen_step_t2v(&x_t, &t_tensor, mrope, &mut cond_cache_local)?
+            };
+            let v_uncond = lance.gen_step_t2v(&x_t, &t_tensor, mrope, &mut uncond_cache_local)?;
+            (v_cond, v_uncond)
         } else {
             (
                 lance.gen_step(&x_t, &t_tensor, mrope, &mut cond_cache_local)?,
@@ -572,6 +607,7 @@ fn stage2_denoise_capture(
         refs_dir,
         args.use_t2v_path,
         args.cfg_renorm,
+        &args.capture_layers,
     )?;
     log::info!(
         "[parity_lance_t2v]   denoise complete in {:.1}s",

@@ -4056,6 +4056,30 @@ impl Lance {
         if t.dtype() != dt { t.to_dtype(dt) } else { Ok(t) }
     }
 
+    /// Build the `[B=1, L_noise]` gen-mask for the T2V noise span:
+    /// SOI (idx 0) and EOI (idx L_noise-1) get **und routing (=0.0)**;
+    /// VAE positions (idx 1..L_noise-1) get **gen routing (=1.0)**.
+    ///
+    /// Mirrors Python `qwen2_navit.py:282-318` where:
+    /// - `packed_und_token_indexes` = SOI/EOI positions → q_proj (und path)
+    /// - `packed_vae_token_indexes` (= gen positions) → q_proj_moe_gen (gen path)
+    ///
+    /// The Rust MoT layer routes via `where_mask(gen_mask, gen_path, und_path)`
+    /// per-token, so the mask MUST be 0 at bracket positions for them to
+    /// route through the und/text branch. Previously this used a uniform
+    /// all-1.0 mask, which routed SOI/EOI through the gen path — produced
+    /// a real 1% cos divergence at block 0 alone (parity-verified
+    /// 2026-05-19).
+    fn build_t2v_noise_gen_mask(&self, l_noise: usize) -> Result<Tensor> {
+        let dev = &self.config.device;
+        let dt = self.config.dtype;
+        let mut raw = vec![1.0f32; l_noise];
+        raw[0] = 0.0; // SOI → und
+        raw[l_noise - 1] = 0.0; // EOI → und
+        let t = Tensor::from_vec(raw, Shape::from_dims(&[1, l_noise]), dev.clone())?;
+        if t.dtype() != dt { t.to_dtype(dt) } else { Ok(t) }
+    }
+
     /// **PREFILL.** Embed text token ids, run them through the 36-block
     /// stack with `is_causal=true, gen_mask=all_und=0, update_cache=true`,
     /// and store per-layer K/V into `cache`.
@@ -4600,7 +4624,10 @@ impl Lance {
         debug_assert_eq!(h_noise.shape().dims(), &[1, l_noise, self.config.hidden_size]);
 
         // ---- 6. Gen-mask: all-gen for the noise span. ----
-        let gen_mask = self.build_uniform_gen_mask(l_noise, 1.0)?;
+        // SOI (idx 0) and EOI (idx L_noise-1) get und routing (=0.0);
+        // VAE positions get gen routing (=1.0). See
+        // build_t2v_noise_gen_mask doc for why.
+        let gen_mask = self.build_t2v_noise_gen_mask(l_noise)?;
 
         // ---- 7. Positions for the 770-token noise span. ----
         let prefix_len = cache.seq_len(0);
@@ -4629,6 +4656,153 @@ impl Lance {
         // ---- 10. Unpatchify: [L_vae, C] → [B, C, T, H, W]. ----
         let v_5d_thwc = v_vae_flat.reshape(&[b, t, h, w, p])?; // [B, T, H, W, C]
         v_5d_thwc.permute(&[0, 4, 1, 2, 3]) // [B, C, T, H, W]
+    }
+
+    /// Diagnostic variant of `gen_step_t2v`. Unrolls the block stack so the
+    /// caller can dump the hidden state after specified layer indices.
+    /// Returns `(v_pred, captures)` where `captures[i] = (layer_idx,
+    /// post-block hidden state of shape [1, L_noise, hidden])` for each
+    /// requested `layer_idx`.
+    ///
+    /// Used by `parity_lance_t2v --capture-layers <list>` to localize
+    /// where Rust diverges from Python across the 36-block stack. Not
+    /// intended for production callers.
+    pub fn gen_step_t2v_capture_layers(
+        &self,
+        latent: &Tensor,
+        timestep: &Tensor,
+        mrope: &MropeFreqs,
+        cache: &mut KvCache,
+        capture_after: &[usize],
+    ) -> Result<(Tensor, Vec<(usize, Tensor)>)> {
+        // Identical setup to `gen_step_t2v` up through position-id build.
+        let ldims = latent.shape().dims().to_vec();
+        if ldims.len() != 5 {
+            return Err(Error::InvalidInput(format!(
+                "gen_step_t2v_capture_layers: expected 5D latent, got {ldims:?}"
+            )));
+        }
+        let (b, c, t, h, w) = (ldims[0], ldims[1], ldims[2], ldims[3], ldims[4]);
+        let p = self.config.patch_latent_dim();
+        if c != p || b != 1 {
+            return Err(Error::InvalidInput(format!(
+                "gen_step_t2v_capture_layers: bad shape (b={b}, c={c}, expect c={p})"
+            )));
+        }
+        let (pt, ph, pw) = self.config.latent_patch_size;
+        if (pt, ph, pw) != (1, 1, 1) {
+            return Err(Error::InvalidInput(format!(
+                "gen_step_t2v_capture_layers: only latent_patch_size=(1,1,1) supported, got ({pt},{ph},{pw})"
+            )));
+        }
+        let l_vae = t * h * w;
+        let latent_p = latent.permute(&[0, 2, 3, 4, 1])?;
+        let x_patch_2d = latent_p.reshape(&[l_vae, p])?;
+        let x_patch_3d = x_patch_2d.reshape(&[1, l_vae, p])?;
+        let mut h_vae = self.vae2llm.forward(&x_patch_3d)?;
+        let t_scalar = timestep.to_dtype(DType::F32)?.to_vec()?[0];
+        let t_vec = vec![t_scalar; l_vae];
+        let t_tensor_f32 =
+            Tensor::from_vec(t_vec, Shape::from_dims(&[l_vae]), self.config.device.clone())?;
+        let t_tensor = if t_tensor_f32.dtype() != self.config.dtype {
+            t_tensor_f32.to_dtype(self.config.dtype)?
+        } else {
+            t_tensor_f32
+        };
+        let time_emb = self.time_embedder.forward(&t_tensor)?;
+        let time_emb_3d = Self::to_3d(&time_emb)?;
+        h_vae = h_vae.add(&time_emb_3d)?;
+        let pos_emb =
+            self.latent_pos_embed
+                .build(t, h, w, &self.config.device, self.config.dtype)?;
+        let pos_emb_3d = Self::to_3d(&pos_emb)?;
+        h_vae = h_vae.add(&pos_emb_3d)?;
+        let bracket_ids = Tensor::from_vec(
+            vec![Self::VISION_START_TOKEN_ID as f32, Self::VISION_END_TOKEN_ID as f32],
+            Shape::from_dims(&[2]),
+            self.config.device.clone(),
+        )?
+        .to_dtype(DType::I32)?;
+        let bracket_emb_2d = self.embed_text_tokens(&bracket_ids)?;
+        let soi_2d = bracket_emb_2d.narrow(0, 0, 1)?;
+        let eoi_2d = bracket_emb_2d.narrow(0, 1, 1)?;
+        let soi_3d = soi_2d.reshape(&[1, 1, soi_2d.shape().dims()[1]])?;
+        let eoi_3d = eoi_2d.reshape(&[1, 1, eoi_2d.shape().dims()[1]])?;
+        let h_noise = Tensor::cat(&[&soi_3d, &h_vae, &eoi_3d], 1)?;
+        let l_noise = l_vae + 2;
+        // SOI (idx 0) and EOI (idx L_noise-1) get und routing (=0.0);
+        // VAE positions get gen routing (=1.0). See
+        // build_t2v_noise_gen_mask doc for why.
+        let gen_mask = self.build_t2v_noise_gen_mask(l_noise)?;
+        let prefix_len = cache.seq_len(0);
+        let (pos_t_tensor, pos_h_tensor, pos_w_tensor) =
+            self.build_t2v_noise_span_positions(prefix_len, t, h, w)?;
+
+        // ---- Manual block-stack loop with per-layer captures. ----
+        // Always dump the pre-block-0 input under the sentinel index
+        // `usize::MAX` so callers can verify that h_noise matches
+        // Python's packed_sequence_vae before chasing in-stack divergence.
+        let mut captures: Vec<(usize, Tensor)> = Vec::new();
+        let mut want = std::collections::HashSet::new();
+        for &i in capture_after {
+            want.insert(i);
+        }
+        captures.push((usize::MAX, h_noise.clone()));
+        let mut h_cur = h_noise;
+        let mut cache_opt = Some(&mut *cache);
+        for (layer_idx, block) in self.blocks.blocks.iter().enumerate() {
+            h_cur = block.forward(
+                &h_cur,
+                &gen_mask,
+                &pos_t_tensor,
+                &pos_h_tensor,
+                &pos_w_tensor,
+                mrope,
+                false,
+                layer_idx,
+                cache_opt.as_deref_mut(),
+                false,
+            )?;
+            if want.contains(&layer_idx) {
+                captures.push((layer_idx, h_cur.clone()));
+            }
+        }
+
+        // Final paired RMSNorm (mirrors LanceBlockStack::forward tail).
+        let h_und = {
+            let dims = h_cur.shape().dims().to_vec();
+            let hidden = *dims.last().unwrap();
+            let batch: usize = dims[..dims.len() - 1].iter().product();
+            let x_2d = h_cur.reshape(&[batch, hidden])?;
+            let out = flame_core::cuda_ops_bf16::rms_norm_bf16(
+                &x_2d,
+                Some(&self.blocks.final_norm),
+                self.blocks.rms_norm_eps,
+            )?;
+            out.reshape(&dims)?
+        };
+        let h_gen = {
+            let dims = h_cur.shape().dims().to_vec();
+            let hidden = *dims.last().unwrap();
+            let batch: usize = dims[..dims.len() - 1].iter().product();
+            let x_2d = h_cur.reshape(&[batch, hidden])?;
+            let out = flame_core::cuda_ops_bf16::rms_norm_bf16(
+                &x_2d,
+                Some(&self.blocks.final_norm_moe_gen),
+                self.blocks.rms_norm_eps,
+            )?;
+            out.reshape(&dims)?
+        };
+        let mask_bn1 = gen_mask.reshape(&[1, l_noise, 1])?;
+        let h_out_3d = Tensor::where_mask(&mask_bn1, &h_gen, &h_und)?;
+
+        // llm2vae + slice + unpatchify (same as gen_step_t2v tail).
+        let v_noise_2d = self.llm2vae.forward(&h_out_3d)?;
+        let v_vae_3d = v_noise_2d.narrow(1, 1, l_vae)?;
+        let v_vae_flat = v_vae_3d.reshape(&[l_vae, p])?;
+        let v_5d_thwc = v_vae_flat.reshape(&[b, t, h, w, p])?;
+        let v_pred = v_5d_thwc.permute(&[0, 4, 1, 2, 3])?;
+        Ok((v_pred, captures))
     }
 }
 
