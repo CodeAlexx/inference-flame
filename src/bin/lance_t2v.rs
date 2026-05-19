@@ -353,16 +353,24 @@ fn stage2_denoise(
     let cond_tokens = ids_to_tensor(cond_ids, device)?;
     let uncond_tokens = ids_to_tensor(uncond_ids, device)?;
 
-    // Initial noise: [1, patch_latent_dim, T_lat, H_lat, W_lat].
+    // Initial noise: torch.randn-compatible Philox stream (= bit-identical
+    // to Python's `torch.randn((L, C), generator=Generator(device='cuda').
+    // manual_seed(seed))` inside Lance). Reshape (L, C) → (T, H, W, C) →
+    // permute (C, T, H, W) → unsqueeze batch, mirroring how Lance Python's
+    // `randn(L, C)` packed-sequence maps onto the [B, C, T, H, W] gen_step
+    // input. Verified by `parity_lance_t2v --noise-from` cross-check.
     let c = cfg.patch_latent_dim();
-    let noise_n = c * t_lat * h_latent * w_latent;
-    let noise = deterministic_normal_noise(args.seed, noise_n);
-    let initial_noise = Tensor::from_vec(
-        noise,
-        Shape::from_dims(&[1, c, t_lat, h_latent, w_latent]),
+    let l = t_lat * h_latent * w_latent;
+    let noise_lc = flame_core::rng::randn_torch(
+        args.seed,
+        Shape::from_dims(&[l, c]),
         device.clone(),
-    )?
-    .to_dtype(cfg.dtype)?;
+    )?;
+    let initial_noise = noise_lc
+        .reshape(&[t_lat, h_latent, w_latent, c])?
+        .permute(&[3, 0, 1, 2])?
+        .reshape(&[1, c, t_lat, h_latent, w_latent])?
+        .to_dtype(cfg.dtype)?;
     log::info!(
         "[lance_t2v]   initial noise shape={:?}, seed={}",
         initial_noise.shape().dims(),
