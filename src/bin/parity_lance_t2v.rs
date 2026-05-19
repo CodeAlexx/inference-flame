@@ -74,6 +74,7 @@ struct Args {
     noise_from: Option<PathBuf>,
     use_t2v_path: bool,
     cfg_renorm: bool,
+    empty_uncond: bool,
 }
 
 impl Args {
@@ -96,6 +97,7 @@ impl Args {
             noise_from: None,
             use_t2v_path: false,
             cfg_renorm: false,
+            empty_uncond: false,
         }
     }
 }
@@ -158,6 +160,7 @@ fn parse_args() -> std::result::Result<Args, String> {
             "--noise-from" | "--noise_from" => a.noise_from = Some(PathBuf::from(next()?)),
             "--use-t2v-path" | "--use_t2v_path" => a.use_t2v_path = true,
             "--cfg-renorm" | "--cfg_renorm" => a.cfg_renorm = true,
+            "--empty-uncond" | "--empty_uncond" => a.empty_uncond = true,
             "-h" | "--help" => {
                 print_usage();
                 std::process::exit(0);
@@ -197,6 +200,9 @@ Options:
                         + Python-matching positions). Default: gen_step (T2I)
   --cfg-renorm          apply Python cfg_renorm_type="global" post-CFG scale-
                         clamp (G4). Default: off.
+  --empty-uncond        skip uncond text prefill — uncond_cache stays empty.
+                        Tests G3 hypothesis (Python cfg_text_context for T2V
+                        modality=text is effectively empty).
 "#
     );
 }
@@ -527,7 +533,11 @@ fn stage2_denoise_capture(
     )?;
 
     let mut uncond_cache = lance.new_kv_cache();
-    lance.prefill_text_context(&uncond_tokens, &mrope, &mut uncond_cache)?;
+    if !args.empty_uncond {
+        lance.prefill_text_context(&uncond_tokens, &mrope, &mut uncond_cache)?;
+    } else {
+        log::info!("[parity_lance_t2v]   --empty-uncond: skipping uncond text prefill (G3 test)");
+    }
     let uncond_prefix_len = uncond_cache.seq_len(0);
     save_scalar(
         "cache.uncond_prefix_len",
