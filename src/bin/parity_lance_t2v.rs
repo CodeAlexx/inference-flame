@@ -71,6 +71,7 @@ struct Args {
     refs_out: PathBuf,
     text_template: bool,
     skip_vae: bool,
+    noise_from: Option<PathBuf>,
 }
 
 impl Args {
@@ -90,6 +91,7 @@ impl Args {
             refs_out: PathBuf::from("inference-flame/ports/lance/parity/refs_t2v_rust"),
             text_template: true,
             skip_vae: false,
+            noise_from: None,
         }
     }
 }
@@ -149,6 +151,7 @@ fn parse_args() -> std::result::Result<Args, String> {
             "--refs-out" | "--refs_out" => a.refs_out = PathBuf::from(next()?),
             "--no-text-template" => a.text_template = false,
             "--skip-vae" => a.skip_vae = true,
+            "--noise-from" | "--noise_from" => a.noise_from = Some(PathBuf::from(next()?)),
             "-h" | "--help" => {
                 print_usage();
                 std::process::exit(0);
@@ -182,6 +185,8 @@ Options:
   --refs-out    <DIR>   capture output dir         [default: inference-flame/ports/lance/parity/refs_t2v_rust]
   --no-text-template    disable chat-template wrap (raw tokens)
   --skip-vae            skip VAE decode (capture lance.final_latent only)
+  --noise-from  <PATH>  load Python's input.latent_noise.safetensors instead
+                        of generating; eliminates RNG mismatch for parity
 "#
     );
 }
@@ -223,6 +228,63 @@ fn ids_to_tensor(ids: &[i32], device: &Arc<CudaDevice>) -> Result<Tensor> {
     let t = Tensor::from_vec(f, Shape::from_dims(&[n]), device.clone())?;
     t.to_dtype(DType::I32)
         .map_err(|e| anyhow!("cast tokens to I32: {e}"))
+}
+
+/// Load Python's `input.latent_noise.safetensors` (key `input.latent_noise`,
+/// shape `(L, C)` where `L = T_lat * H_lat * W_lat`, dtype BF16) and reshape
+/// to the Rust gen_step input layout `[1, C, T_lat, H_lat, W_lat]`.
+///
+/// The Python noise is captured straight from `torch.randn(L, C)` inside
+/// Lance, where row L=i corresponds to packed-sequence position i. Lance
+/// Python enumerates positions T-major then H then W (row-major over
+/// `(T_lat, H_lat, W_lat)`), so reshape `(L, C) → (T, H, W, C)` is direct.
+/// Then permute `(3, 0, 1, 2) → (C, T, H, W)` and add a batch dim.
+///
+/// This matches Rust's `gen_step` patchify path:
+///   `latent.permute(0, 2, 3, 4, 1).reshape(L, C)` → `(L=THW, C)` Python-form.
+///
+/// Returns (capture_lc_f32, model_input_5d_f32).
+fn load_python_noise(
+    path: &Path,
+    t_lat: usize,
+    h_lat: usize,
+    w_lat: usize,
+    c: usize,
+    device: &Arc<CudaDevice>,
+) -> Result<(Tensor, Tensor)> {
+    let map = flame_core::serialization::load_file(path, device)
+        .with_context(|| format!("load_file({})", path.display()))?;
+    let key = "input.latent_noise";
+    let t = map
+        .get(key)
+        .ok_or_else(|| anyhow!("{} missing key '{}'; found {:?}", path.display(), key, map.keys().collect::<Vec<_>>()))?
+        .clone();
+    let l = t_lat * h_lat * w_lat;
+    let dims = t.shape().dims().to_vec();
+    if dims != [l, c] {
+        return Err(anyhow!(
+            "noise file shape {:?} != expected [L={}, C={}]; check geometry matches gen_refs_lance_t2v.py run",
+            dims,
+            l,
+            c
+        ));
+    }
+    let lc_f32 = t.to_dtype(DType::F32)?;
+    // Reshape (L, C) → (T, H, W, C) → permute (C, T, H, W) → unsqueeze batch.
+    let thw_c = lc_f32.reshape(&[t_lat, h_lat, w_lat, c])?;
+    let c_thw = thw_c.permute(&[3, 0, 1, 2])?;
+    let model_5d = c_thw.reshape(&[1, c, t_lat, h_lat, w_lat])?;
+    log::info!(
+        "[parity_lance_t2v] loaded Python noise from {} (shape (L,C)=({},{}) → [1,{},{},{},{}])",
+        path.display(),
+        l,
+        c,
+        c,
+        t_lat,
+        h_lat,
+        w_lat
+    );
+    Ok((lc_f32, model_5d))
 }
 
 // Same deterministic Box-Muller noise generator as parity_lance.rs / lance_t2v.rs.
@@ -392,15 +454,26 @@ fn stage2_denoise_capture(
 
     // ---- Capture: input.latent_noise ----
     let c = cfg.patch_latent_dim();
-    let noise_n = c * t_lat * h_latent * w_latent;
-    let noise = deterministic_normal_noise(args.seed, noise_n);
-    let initial_noise_f32 = Tensor::from_vec(
-        noise.clone(),
-        Shape::from_dims(&[1, c, t_lat, h_latent, w_latent]),
-        device.clone(),
-    )?;
-    save_capture("input.latent_noise", &initial_noise_f32, refs_dir)?;
-    let initial_noise = initial_noise_f32.to_dtype(cfg.dtype)?;
+    let initial_noise = if let Some(path) = args.noise_from.as_ref() {
+        // Same-seed preflight: load Python's noise tensor (L, C) so the
+        // RNG-mismatch confound is eliminated. Save the capture in the
+        // (L, C) layout so diff_t2v.py's flatten ordering matches the
+        // Python-side capture.
+        let (lc_f32, model_5d_f32) =
+            load_python_noise(path, t_lat, h_latent, w_latent, c, device)?;
+        save_capture("input.latent_noise", &lc_f32, refs_dir)?;
+        model_5d_f32.to_dtype(cfg.dtype)?
+    } else {
+        let noise_n = c * t_lat * h_latent * w_latent;
+        let noise = deterministic_normal_noise(args.seed, noise_n);
+        let initial_noise_f32 = Tensor::from_vec(
+            noise.clone(),
+            Shape::from_dims(&[1, c, t_lat, h_latent, w_latent]),
+            device.clone(),
+        )?;
+        save_capture("input.latent_noise", &initial_noise_f32, refs_dir)?;
+        initial_noise_f32.to_dtype(cfg.dtype)?
+    };
 
     // ---- Load Lance + mRoPE ----
     let t0 = Instant::now();
