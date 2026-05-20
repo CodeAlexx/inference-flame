@@ -748,6 +748,20 @@ impl Qwen25VLVisionTower {
         grid_thw: &[[u32; 3]],
         capture_layers: &[usize],
     ) -> Result<(Tensor, std::collections::HashMap<String, Tensor>)> {
+        self.forward_capture_with_opts(pixel_values, grid_thw, capture_layers, false)
+    }
+
+    /// Same as [`forward_capture`], but with a `force_fullatt` override that
+    /// makes EVERY block use the full-attention mask (i.e., treats
+    /// `fullatt_block_indexes` as `0..num_layers`). Used by the Phase G drift
+    /// investigation to isolate the windowed-attention path.
+    pub fn forward_capture_with_opts(
+        &self,
+        pixel_values: &Tensor,
+        grid_thw: &[[u32; 3]],
+        capture_layers: &[usize],
+        force_fullatt: bool,
+    ) -> Result<(Tensor, std::collections::HashMap<String, Tensor>)> {
         let cfg = &self.cfg;
         let mut captures = std::collections::HashMap::new();
 
@@ -790,8 +804,37 @@ impl Qwen25VLVisionTower {
 
         captures.insert("pre_block_0".to_string(), h.clone());
 
+        // Dump cu_window_seqlens + window_index when the diagnostic env flag
+        // is set. Phase G investigation only; gated so production paths
+        // never pay for this.
+        if std::env::var("VIT_DUMP_WINDOW_META").as_deref() == Ok("1") {
+            eprintln!(
+                "[VIT_DUMP_WINDOW_META] seq_len={} cu_window_seqlens.len={} cu_seqlens_full={:?}",
+                seq_len,
+                cu_window_seqlens.len(),
+                cu_seqlens_full
+            );
+            eprintln!(
+                "[VIT_DUMP_WINDOW_META] cu_window_seqlens (first 32): {:?}",
+                &cu_window_seqlens[..cu_window_seqlens.len().min(32)]
+            );
+            eprintln!(
+                "[VIT_DUMP_WINDOW_META] cu_window_seqlens (last 8): {:?}",
+                &cu_window_seqlens[cu_window_seqlens.len().saturating_sub(8)..]
+            );
+            eprintln!(
+                "[VIT_DUMP_WINDOW_META] window_index.len={} first16={:?} last16={:?}",
+                window_index.len(),
+                &window_index[..window_index.len().min(16)],
+                &window_index[window_index.len().saturating_sub(16)..]
+            );
+            if force_fullatt {
+                eprintln!("[VIT_DUMP_WINDOW_META] force_fullatt=TRUE — every block uses mask_full");
+            }
+        }
+
         for layer_idx in 0..cfg.num_layers {
-            let mask = if cfg.fullatt_block_indexes.contains(&layer_idx) {
+            let mask = if force_fullatt || cfg.fullatt_block_indexes.contains(&layer_idx) {
                 &mask_full
             } else {
                 &mask_window

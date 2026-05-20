@@ -27,6 +27,7 @@ struct Args {
     refs_dir: PathBuf,
     image: PathBuf,
     resolution: u32,
+    force_fullatt: bool,
 }
 
 impl Args {
@@ -36,6 +37,7 @@ impl Args {
             refs_dir: PathBuf::from("ports/lance/parity/refs_vit_real_image"),
             image: PathBuf::new(),
             resolution: 476,
+            force_fullatt: false,
         };
         let argv: Vec<String> = std::env::args().collect();
         let mut i = 1;
@@ -56,6 +58,10 @@ impl Args {
                 "--resolution" => {
                     a.resolution = argv[i + 1].parse().expect("--resolution int");
                     i += 2;
+                }
+                "--force-fullatt" | "--force_fullatt" => {
+                    a.force_fullatt = true;
+                    i += 1;
                 }
                 "-h" | "--help" => {
                     println!(
@@ -145,8 +151,15 @@ fn main() -> Result<()> {
     let tower = Qwen25VLVisionTower::from_weights(raw, cfg.clone(), device.clone())?;
 
     // ---- Forward with per-block captures ----
-    let (post_merger, captures) =
-        tower.forward_capture(&pixel_values, &grid_thw_vec, CAPTURE_LAYERS)?;
+    if args.force_fullatt {
+        println!("--force-fullatt: every block uses the FULL attention mask");
+    }
+    let (post_merger, captures) = tower.forward_capture_with_opts(
+        &pixel_values,
+        &grid_thw_vec,
+        CAPTURE_LAYERS,
+        args.force_fullatt,
+    )?;
     println!("Forward done. Captures: {}", captures.len());
 
     // ---- Load Python captures ----
