@@ -31,6 +31,8 @@ pub mod wan;
 pub mod hunyuan15_dit;
 pub mod kandinsky5_dit;
 pub mod qwen25vl_encoder;
+pub mod qwen25vl_vit;
+pub use qwen25vl_vit::{Qwen25VLVisionTower, Qwen25VLVitConfig};
 pub mod ernie_image;
 pub mod acestep_condition;
 pub mod acestep_dit;

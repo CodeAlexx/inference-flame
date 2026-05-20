@@ -406,6 +406,10 @@ name = "wan_smoke"
 path = "src/bin/wan_smoke.rs"
 
 [[bin]]
+name = "qwen25vl_vit_smoke"
+path = "src/bin/qwen25vl_vit_smoke.rs"
+
+[[bin]]
 name = "lanpaint_gpu_smoke"
 path = "src/bin/lanpaint_gpu_smoke.rs"
 
