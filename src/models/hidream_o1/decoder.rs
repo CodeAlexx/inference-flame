@@ -15,7 +15,7 @@
 //!     │     (per-head) q_norm  /  k_norm           ← `head_dim`-RMSNorm, NOT hidden-RMSNorm
 //!     │     RoPE (half-split, MRoPE table)
 //!     │     repeat_kv (GQA: 8 → 32)
-//!     │     SDPA (mixed causal/full mask supplied by caller)
+//!     │     SDPA (structured prefix-causal/full policy)
 //!     │     o_proj
 //!     ├─► residual ●  +
 //!     ├─► RMSNorm (post_attention_layernorm)
@@ -28,9 +28,9 @@
 //!   stride-3 T/H/W interleave) rather than 1D-RoPE built from sequence
 //!   positions inside the layer. The half-split kernel (`rope_halfsplit_bf16`)
 //!   is the same — only the per-position table changes.
-//! - Caller supplies a **mixed causal/full mask**: causal triangle on
-//!   text rows, bidirectional ones on image rows
-//!   (`qwen3_vl_transformers.py:1497-1504`). See edge case #5/#6.
+//! - Caller supplies a structured prefix-causal/full policy: causal triangle
+//!   on text/AR rows, bidirectional attention on image rows
+//!   (`qwen3_vl_transformers.py:1497-1504`).
 //!
 //! Why this re-implements rather than re-uses `Qwen3Encoder::layer_forward`:
 //! `Qwen3Encoder` owns `weights: HashMap<String, Tensor>` and its
@@ -45,10 +45,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use flame_core::attention::sdpa as flame_sdpa;
+use flame_core::attention::{sdpa as flame_sdpa, sdpa_prefix_causal_full};
 use flame_core::nn::Linear;
 use flame_core::norm::RMSNorm;
-use flame_core::{bf16_ops, cuda_ops_bf16, CudaDevice, DType, Error, Result, Shape, Tensor};
+use flame_core::{bf16_ops, cuda_ops_bf16, CudaDevice, Error, Result, Tensor};
 
 use super::HiDreamO1Config;
 
@@ -148,10 +148,9 @@ impl HiDreamDecoderLayer {
     /// `hidden_states`: `[B, S, hidden]` BF16.
     /// `cos_sin`: a precomputed `(cos, sin)` pair, each `[1, S, head_dim/2]`
     ///            BF16, produced by `mrope::interleaved_mrope_cos_sin`.
-    /// `attention_mask`: optional `[B, 1, S, S]` (or `[1, 1, S, S]` /
-    ///   `[1, S, S]` — the SDPA path broadcasts) **multiplicative**
-    ///   mask: 1.0 = attend, 0.0 = block. The caller is responsible for
-    ///   the mixed causal/full layout (`model.rs::build_mixed_attention_mask`).
+    /// `attention_mask`: legacy explicit mask override. Production O1 passes
+    ///   `None` and uses `two_pass_ar_len` with structured prefix-causal/full
+    ///   attention so the hot full pass stays on cuDNN.
     ///
     /// Returns `[B, S, hidden]` BF16.
     pub fn forward(
@@ -445,7 +444,7 @@ pub fn decoder_forward_with_weights_lora(
     // Flash SDPA for the large full pass; the old mixed-mask path falls back
     // to slow streaming/chunked kernels at 2048².
     let attn_out = match two_pass_ar_len {
-        Some(ar_len) if attention_mask.is_none() => two_pass_sdpa(&q, &k, &v, ar_len)?,
+        Some(ar_len) if attention_mask.is_none() => sdpa_prefix_causal_full(&q, &k, &v, ar_len)?,
         _ => chunked_sdpa(&q, &k, &v, attention_mask)?,
     };
     log_mem("after_sdpa");
@@ -527,63 +526,11 @@ fn repeat_kv(x: &Tensor, n_rep: usize) -> Result<Tensor> {
     stacked.reshape(&[b, h_kv * n_rep, s, d])
 }
 
-fn causal_keep_mask(seq_len: usize, device: Arc<CudaDevice>) -> Result<Tensor> {
-    let mut data = vec![0.0f32; seq_len * seq_len];
-    for i in 0..seq_len {
-        let row = i * seq_len;
-        for j in 0..=i {
-            data[row + j] = 1.0;
-        }
-    }
-    Tensor::from_vec_dtype(
-        data,
-        Shape::from_dims(&[1, 1, seq_len, seq_len]),
-        device,
-        DType::BF16,
-    )
-}
-
-fn two_pass_sdpa(q: &Tensor, k: &Tensor, v: &Tensor, ar_len: usize) -> Result<Tensor> {
-    let q_dims = q.shape().dims();
-    if q_dims.len() != 4 {
-        return Err(Error::InvalidOperation(format!(
-            "two_pass_sdpa: expected Q to be [B,H,S,D], got {:?}",
-            q_dims
-        )));
-    }
-    let seq_len = q_dims[2];
-    if ar_len == 0 {
-        return flame_sdpa(q, k, v, None);
-    }
-    if ar_len > seq_len {
-        return Err(Error::InvalidInput(format!(
-            "two_pass_sdpa: ar_len {} exceeds seq_len {}",
-            ar_len, seq_len
-        )));
-    }
-
-    let q_ar = q.narrow(2, 0, ar_len)?.contiguous()?;
-    let k_ar = k.narrow(2, 0, ar_len)?.contiguous()?;
-    let v_ar = v.narrow(2, 0, ar_len)?.contiguous()?;
-    let ar_mask = causal_keep_mask(ar_len, q.device().clone())?;
-    let out_ar = flame_sdpa(&q_ar, &k_ar, &v_ar, Some(&ar_mask))?;
-
-    if ar_len == seq_len {
-        return Ok(out_ar);
-    }
-
-    let out_full = flame_sdpa(q, k, v, None)?;
-    let out_gen = out_full.narrow(2, ar_len, seq_len - ar_len)?;
-    Tensor::cat(&[&out_ar, &out_gen], 2)
-}
-
 /// SDPA over Q rows.
 ///
-/// HiDream-O1 always supplies a mixed causal/full mask. The old implementation
-/// sliced Q into chunks and called generic SDPA per chunk; because each chunk
-/// was below flame-core's auto-stream threshold, that path still materialized
-/// FP32 score tensors repeatedly. At 2048² (`Sq` ≈ 4.3k) that dominates the
-/// pixel-space denoise loop.
+/// Legacy explicit-mask SDPA over Q rows. Production HiDream-O1 uses
+/// `sdpa_prefix_causal_full`; this exists only for callers that pass an
+/// explicit mask override.
 ///
 /// For masked attention, route directly to flame-core's streaming BF16 SDPA so
 /// scores are tiled through a small workspace instead of materialized. Keep the

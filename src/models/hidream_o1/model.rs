@@ -26,7 +26,7 @@
 //!         ▼  cat([text_emb, patch_emb], dim=1)                [B, S_total, H]
 //!         │                          ─ qwen3_vl_transformers.py:1458-1459
 //!         │
-//!         │  build mixed causal/full mask from `vinput_mask`  [B, 1, S, S]
+//!         │  derive prefix-causal/full attention split from `token_types`
 //!         │  build MRoPE cos/sin from position_ids            [1, S, head_dim/2]
 //!         ▼
 //!     for layer in self.layers:
@@ -201,8 +201,8 @@ impl HiDreamO1Model {
     ///   `pipeline.py:279`: with refs, `(token_types==1 | ==2)`).
     ///   The mask drives both the per-row attention pattern (full vs.
     ///   causal) and the caller-side gather of `x_pred`.
-    /// - `attention_mask`: an optional override. When `None`, we build
-    ///   one from `vinput_mask` (the standard path).
+    /// - `attention_mask`: legacy override. Production O1 passes `None` and
+    ///   uses `token_types_bin` to drive structured prefix-causal/full SDPA.
     ///
     /// # Returns
     /// `x_pred : [B, S_total, P*P*C]` BF16. The caller is expected to
@@ -278,8 +278,9 @@ impl HiDreamO1Model {
         // forward signature so signature shape stays parallel to the cache
         // record and so future image-region routing inside the model has it.
         // `token_types_bin` is `(token_types > 0)` — image rows + the TMS token
-        // (type=3). Drives `build_mixed_attention_mask` so the TMS row gets
-        // FULL attention, matching `qwen3_vl_transformers.py:1501-1502`.
+        // (type=3). It drives the structured prefix-causal/full attention split
+        // so the TMS row gets FULL attention, matching
+        // `qwen3_vl_transformers.py:1501-1502`.
         // The two CANNOT be merged — Python uses them at different sites
         // (`pipeline.py:69` builds `vinput_mask`; `qwen3_vl:1501` reads
         // `token_types_bin`).
@@ -346,50 +347,23 @@ impl HiDreamO1Model {
         )?;
         log_mem("after.cos_sin");
 
-        // 6) attention mask: caller may pre-build (e.g. for CFG batching);
-        //    otherwise we synthesize from token_types_bin (NOT vinput_mask —
-        //    deep-investigation 2026-05-17 isolated a structural bug here:
-        //    Python reads `token_types_bin = (token_types > 0)` which is
-        //    True at type=3 (TMS) too; `vinput_mask = (token_types == 1)` is
-        //    False at TMS, so using it left the TMS row CAUSAL in Rust where
-        //    Python makes it FULL. See
-        //    `EriDiffusion-v2/docs/hidream_o1_g0_deep_investigation.md`).
+        // 6) attention policy. Production O1 uses the structured
+        // prefix-causal/full SDPA primitive instead of materializing the old
+        // mixed binary mask. That keeps the hot full pass on cuDNN and avoids
+        // a second route that can silently diverge from the fast path.
         //
         //    Python (`qwen3_vl_transformers.py:1495-1504`):
         //      causal = full(min, [S, S]); causal = triu(causal, diag=1)  # 0 below+diag, -inf above
         //      gen_positions = token_types[b].bool()   # token_types_bin: type>0
         //      causal[gen_positions, :] = 0            # gen rows attend to ALL
         //
-        //    We emit a multiplicative {0, 1} mask the SDPA path expects: 1
-        //    where attention is allowed, 0 where blocked. The SDPA path
-        //    (`flame_core/sdpa.rs:466-469`) converts to additive -inf
-        //    internally.
-        let disable_two_pass = std::env::var("HIDREAM_O1_DISABLE_TWO_PASS_ATTN")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        let use_two_pass = attention_mask.is_none()
-            && b == 1
-            && !disable_two_pass
-            && !flame_core::autograd::AutogradContext::is_recording();
-        let two_pass_ar_len = if use_two_pass {
-            Some(Self::ar_prefix_len(b, s_total, token_types_bin)?)
-        } else {
-            None
-        };
-
-        let owned_mask;
-        let mask_ref = if two_pass_ar_len.is_some() {
-            None
-        } else {
-            Some(match attention_mask {
-                Some(m) => m,
-                None => {
-                    owned_mask =
-                        self.build_mixed_attention_mask(b, s_total, token_types_bin)?;
-                    &owned_mask
-                }
-            })
-        };
+        if attention_mask.is_some() {
+            return Err(Error::InvalidInput(
+                "HiDream-O1 no longer accepts a materialized binary attention_mask; use structured prefix-causal/full attention".into(),
+            ));
+        }
+        let two_pass_ar_len = Some(Self::ar_prefix_len(b, s_total, token_types_bin)?);
+        let mask_ref: Option<&Tensor> = None;
         log_mem("after.attn_policy");
 
         // 7) decoder loop: 36 layers for 8B, streamed via BlockOffloader.
@@ -671,72 +645,6 @@ impl HiDreamO1Model {
         text_kept.add(&t_rows)?.reshape(&[b, s_text, h])
     }
 
-    /// Build the **mixed causal/full** attention mask.
-    ///
-    /// `token_types_bin`: `[B, S_total]` BF16, 1.0 at gen rows (image + TMS),
-    /// 0.0 at pure-text rows. This is `(token_types > 0)` per
-    /// `qwen3_vl_transformers.py:1501`, NOT `vinput_mask` (which is
-    /// `token_types == 1` and excludes the TMS row).
-    ///
-    /// Output: `[B, 1, S_total, S_total]` BF16 with 1.0 = "attend" and
-    /// 0.0 = "block". The SDPA path converts the binary mask to additive
-    /// `-inf` internally (`flame_core/sdpa.rs:466-469`).
-    ///
-    /// Algorithm (mirrors `qwen3_vl_transformers.py:1497-1504`):
-    /// ```
-    /// for each batch:
-    ///   start with strict-lower-tri ones (causal: row i ≥ col j)
-    ///   for every row i where token_types_bin[i] == 1:  set whole row i to 1
-    /// ```
-    /// Effect: text rows attend causally; gen rows (image AND TMS) attend
-    /// to everything. (Cross-attention text→image is zero because the image
-    /// columns sit AFTER the text rows in S_total layout, so the lower-tri
-    /// zero blocks them. Image→text, image→image, and TMS→all are full
-    /// bidirectional. ✓ matches Python.)
-    fn build_mixed_attention_mask(
-        &self,
-        b: usize,
-        s_total: usize,
-        token_types_bin: &Tensor,
-    ) -> Result<Tensor> {
-        let vmask_dims = token_types_bin.shape().dims();
-        if vmask_dims.len() != 2 || vmask_dims[0] != b || vmask_dims[1] != s_total {
-            return Err(Error::InvalidOperation(format!(
-                "build_mixed_attention_mask: token_types_bin shape {:?} must be [{},{}]",
-                vmask_dims, b, s_total
-            )));
-        }
-        let vmask_host = token_types_bin.to_dtype(DType::F32)?.to_vec_f32()?;
-
-        let mut data = vec![0.0f32; b * s_total * s_total];
-        for bi in 0..b {
-            // Per-row logic.
-            for i in 0..s_total {
-                let is_image_row = vmask_host[bi * s_total + i] != 0.0;
-                let row_off = (bi * s_total + i) * s_total;
-                if is_image_row {
-                    // Bidirectional attention — open everything.
-                    for j in 0..s_total {
-                        data[row_off + j] = 1.0;
-                    }
-                } else {
-                    // Causal — j <= i.
-                    for j in 0..=i {
-                        data[row_off + j] = 1.0;
-                    }
-                }
-            }
-        }
-
-        let mask_4d = Tensor::from_vec_dtype(
-            data,
-            Shape::from_dims(&[b, 1, s_total, s_total]),
-            self.device.clone(),
-            DType::BF16,
-        )?;
-        Ok(mask_4d)
-    }
-
     fn ar_prefix_len(b: usize, s_total: usize, token_types_bin: &Tensor) -> Result<usize> {
         let vmask_dims = token_types_bin.shape().dims();
         if vmask_dims.len() != 2 || vmask_dims[0] != b || vmask_dims[1] != s_total {
@@ -747,7 +655,7 @@ impl HiDreamO1Model {
         }
         if b != 1 {
             return Err(Error::InvalidOperation(
-                "ar_prefix_len currently expects batch size 1".into(),
+                "HiDream-O1 structured attention currently expects batch size 1".into(),
             ));
         }
 
