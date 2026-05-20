@@ -4,6 +4,7 @@ pub mod models;
 pub mod sampling;
 pub mod offload;
 pub mod offload_api;
+pub mod preprocess;
 pub mod mux;
 pub mod lora_merge;
 pub mod lora;
