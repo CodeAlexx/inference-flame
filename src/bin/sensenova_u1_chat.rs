@@ -20,6 +20,10 @@ use flame_core::{CudaDevice, DType, Shape, Tensor};
 use image::imageops::FilterType;
 use image::GenericImageView;
 use inference_flame::models::sensenova_u1::SenseNovaU1;
+use inference_flame::preprocess::common::{
+    chw_normalize_from_rgb, load_image_rgb_white_bg, resize_dynamic, smart_resize_qwen,
+    IMAGENET_MEAN, IMAGENET_STD,
+};
 use tokenizers::models::bpe::BPE;
 use tokenizers::pre_tokenizers::byte_level::ByteLevel;
 use tokenizers::{AddedToken, Tokenizer};
@@ -32,9 +36,6 @@ const IMG_CONTEXT: &str = "<IMG_CONTEXT>";
 const IMG_START_ID: i32 = 151670;
 const IMG_CONTEXT_ID: i32 = 151669;
 const IM_END_ID: i32 = 151645;
-
-const IMAGENET_MEAN: [f32; 3] = [0.485, 0.456, 0.406];
-const IMAGENET_STD: [f32; 3] = [0.229, 0.224, 0.225];
 
 #[derive(Debug)]
 struct Args {
@@ -197,37 +198,11 @@ fn build_chat_query(system: &str, user: &str) -> String {
 // Image preprocessing (mirror of utils.py::load_image_native).
 // ---------------------------------------------------------------------------
 
-/// Smart-resize: round each side to a multiple of `factor` (== patch_size /
-/// downsample_ratio = 32) such that total pixels ∈ [min_pixels, max_pixels].
-fn smart_resize(h: u32, w: u32, factor: u32, min_pixels: u32, max_pixels: u32) -> (u32, u32) {
-    fn round_by(v: f32, f: u32) -> u32 {
-        ((v / f as f32).round() as u32).max(1) * f
-    }
-    fn ceil_by(v: f32, f: u32) -> u32 {
-        ((v / f as f32).ceil() as u32).max(1) * f
-    }
-    fn floor_by(v: f32, f: u32) -> u32 {
-        ((v / f as f32).floor() as u32).max(1) * f
-    }
-    let h_bar = factor.max(round_by(h as f32, factor));
-    let w_bar = factor.max(round_by(w as f32, factor));
-    if h_bar * w_bar > max_pixels {
-        let beta = ((h as f32 * w as f32) / max_pixels as f32).sqrt();
-        let h2 = factor.max(floor_by(h as f32 / beta, factor));
-        let w2 = factor.max(floor_by(w as f32 / beta, factor));
-        (h2, w2)
-    } else if h_bar * w_bar < min_pixels {
-        let beta = (min_pixels as f32 / (h as f32 * w as f32)).sqrt();
-        let h2 = ceil_by(h as f32 * beta, factor);
-        let w2 = ceil_by(w as f32 * beta, factor);
-        (h2, w2)
-    } else {
-        (h_bar, w_bar)
-    }
-}
-
 /// Load + smart-resize + ImageNet-normalize + patchify into `[grid_h*grid_w, 3*16*16]`
 /// BF16 device tensor. Returns the tensor plus `(grid_h, grid_w)` post-merge token grid.
+///
+/// Phase F: backed by `preprocess::common`. The RGBA blend now PIL-correctly
+/// rounds before u8 cast (was truncating); opaque inputs are byte-identical.
 fn load_image_native(
     path: &Path,
     patch_size: usize,
@@ -236,30 +211,12 @@ fn load_image_native(
     max_pixels: u32,
     device: &Arc<CudaDevice>,
 ) -> Result<(Tensor, usize, usize)> {
-    let img = image::open(path).with_context(|| format!("open {}", path.display()))?;
-    // RGBA → RGB on white background; otherwise straight to RGB.
-    let img = match img.color() {
-        image::ColorType::Rgba8 | image::ColorType::Rgba16 => {
-            let (w, h) = img.dimensions();
-            let mut bg = image::RgbImage::from_pixel(w, h, image::Rgb([255, 255, 255]));
-            let rgba = img.to_rgba8();
-            for (x, y, p) in rgba.enumerate_pixels() {
-                let alpha = p.0[3] as f32 / 255.0;
-                let r = (p.0[0] as f32 * alpha + 255.0 * (1.0 - alpha)) as u8;
-                let g = (p.0[1] as f32 * alpha + 255.0 * (1.0 - alpha)) as u8;
-                let b = (p.0[2] as f32 * alpha + 255.0 * (1.0 - alpha)) as u8;
-                bg.put_pixel(x, y, image::Rgb([r, g, b]));
-            }
-            image::DynamicImage::ImageRgb8(bg)
-        }
-        _ => image::DynamicImage::ImageRgb8(img.to_rgb8()),
-    };
+    let img = load_image_rgb_white_bg(path)?;
 
     let factor = (patch_size as f32 / downsample_ratio).round() as u32; // 32
     let (orig_w, orig_h) = img.dimensions();
-    let (new_h, new_w) = smart_resize(orig_h, orig_w, factor, min_pixels, max_pixels);
-    let resized = img.resize_exact(new_w, new_h, FilterType::Triangle);
-    let resized = resized.to_rgb8();
+    let (new_h, new_w) = smart_resize_qwen(orig_h, orig_w, factor, min_pixels, max_pixels);
+    let resized = resize_dynamic(&img, new_w, new_h, FilterType::Triangle);
     let h = new_h as usize;
     let w = new_w as usize;
     if h % patch_size != 0 || w % patch_size != 0 {
@@ -272,15 +229,7 @@ fn load_image_native(
 
     // Build CHW f32 normalized tensor on host.
     let n = h * w;
-    let mut chw = vec![0f32; 3 * n];
-    for (i, p) in resized.pixels().enumerate() {
-        let r = p.0[0] as f32 / 255.0;
-        let g = p.0[1] as f32 / 255.0;
-        let b = p.0[2] as f32 / 255.0;
-        chw[i] = (r - IMAGENET_MEAN[0]) / IMAGENET_STD[0];
-        chw[n + i] = (g - IMAGENET_MEAN[1]) / IMAGENET_STD[1];
-        chw[2 * n + i] = (b - IMAGENET_MEAN[2]) / IMAGENET_STD[2];
-    }
+    let chw = chw_normalize_from_rgb(&resized, IMAGENET_MEAN, IMAGENET_STD);
 
     // Patchify on host: [C=3, grid_h, ps, grid_w, ps] → permute [grid_h, grid_w, C, ps, ps] → reshape [grid_h*grid_w, C*ps*ps].
     let p = patch_size;

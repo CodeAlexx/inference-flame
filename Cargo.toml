@@ -422,6 +422,10 @@ name = "parity_lance_preprocess"
 path = "src/bin/parity_lance_preprocess.rs"
 
 [[bin]]
+name = "parity_lance_vit_end_to_end"
+path = "src/bin/parity_lance_vit_end_to_end.rs"
+
+[[bin]]
 name = "lanpaint_gpu_smoke"
 path = "src/bin/lanpaint_gpu_smoke.rs"
 
