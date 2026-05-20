@@ -7,8 +7,8 @@
 //! (set at `NaResize` level, see `na_resize.py:24`). The `image` crate does not
 //! ship an exact PIL-BICUBIC + antialias filter, so we use
 //! [`image::imageops::FilterType::CatmullRom`], which is the closest cubic
-//! kernel available. Numerical equality with the Python pipeline is therefore
-//! approximate; Phase D (skeptic) will quantify the gap.
+//! kernel available. Numerical equality is therefore approximate; Phase D
+//! measured cos = 0.999991 on the Lance JPEG fixture at resolution 476.
 
 use anyhow::{anyhow, Result};
 use image::{imageops::FilterType, DynamicImage, GenericImageView, RgbImage};
@@ -63,27 +63,54 @@ impl BucketResize {
 
     /// Find nearest bucket, then deterministic center-crop + bicubic resize.
     ///
-    /// At `scale=(1,1) ratio=(r,r)` torchvision's `RandomResizedCrop` reduces
-    /// to: take the largest centered rectangle of aspect ratio `r` that fits
-    /// inside the source, then resize to `(bucket_h, bucket_w)`.
+    /// Mirrors torchvision's `RandomResizedCrop.get_params` with
+    /// `scale=(1,1) ratio=(r,r)` (Lance's `NaResize`). The primary path is:
+    ///
+    /// ```text
+    /// area  = w_src * h_src
+    /// w_try = round(sqrt(area * r))
+    /// h_try = round(sqrt(area / r))
+    /// ```
+    ///
+    /// If `(w_try, h_try)` fits inside the source, use that as the centered
+    /// crop. Otherwise fall back to the "largest centered rectangle of aspect
+    /// `r` inside source" math. Lance is in eval mode (deterministic center
+    /// crop) — see `bucket_resize.py` upstream comment: "虽然名字叫 random,
+    /// 但在这个 setting 下是 center crop, 无随机性".
     pub fn apply(&self, img: &DynamicImage) -> RgbImage {
         let (w_src, h_src) = img.dimensions();
         let bucket = self.find_nearest_bucket(w_src, h_src);
         let r = bucket.ratio;
 
-        // Largest centered (w_crop, h_crop) with w_crop/h_crop == r, fitting inside src.
-        let src_ratio = w_src as f32 / h_src as f32;
-        let (w_crop, h_crop) = if src_ratio > r {
-            // Source is wider → constrain height, crop width.
-            let h_c = h_src as f32;
-            let w_c = h_c * r;
-            (w_c.round() as u32, h_src)
+        // Primary path: torchvision sqrt math at scale=(1,1) ratio=(r,r).
+        let area = (w_src as f32) * (h_src as f32);
+        let w_try = ((area * r).sqrt()).round() as i64;
+        let h_try = ((area / r).sqrt()).round() as i64;
+
+        let (w_crop, h_crop) = if w_try > 0
+            && w_try <= w_src as i64
+            && h_try > 0
+            && h_try <= h_src as i64
+        {
+            (w_try as u32, h_try as u32)
         } else {
-            // Source is taller (or equal) → constrain width, crop height.
-            let w_c = w_src as f32;
-            let h_c = w_c / r;
-            (w_src, h_c.round() as u32)
+            // Fallback: largest centered (w_crop, h_crop) with w_crop/h_crop == r,
+            // fitting inside source. Mirrors torchvision get_params fallback.
+            let src_ratio = w_src as f32 / h_src as f32;
+            let (w_c, h_c) = if src_ratio > r {
+                // Source is wider → constrain height, crop width.
+                let h_c = h_src as f32;
+                let w_c = h_c * r;
+                (w_c.round() as u32, h_src)
+            } else {
+                // Source is taller (or equal) → constrain width, crop height.
+                let w_c = w_src as f32;
+                let h_c = w_c / r;
+                (w_src, h_c.round() as u32)
+            };
+            (w_c, h_c)
         };
+
         let w_crop = w_crop.min(w_src).max(1);
         let h_crop = h_crop.min(h_src).max(1);
         let x0 = (w_src - w_crop) / 2;

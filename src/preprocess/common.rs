@@ -16,6 +16,13 @@ pub const HALF_HALF_STD: [f32; 3] = [0.5, 0.5, 0.5];
 /// Python preprocessing for transparent inputs.
 pub fn load_image_rgb_white_bg(path: &std::path::Path) -> Result<DynamicImage> {
     let img = image::open(path).with_context(|| format!("open {}", path.display()))?;
+    // Palette ("P") promotion: PIL's `Image.open` then `.convert("RGBA")` is mirrored
+    // here implicitly because the `image` 0.24 PNG decoder sets `Transformations::EXPAND`,
+    // which expands palette PNGs to Rgba8 when a tRNS chunk is present (and to Rgb8
+    // otherwise — same composite result as PIL since alpha=255 everywhere). Verified
+    // against png-0.17 transform.rs::ColorType::Indexed branch. Therefore no explicit
+    // palette promotion is required: the Rgba8|Rgba16 branch below already handles
+    // the transparent-palette case.
     match img.color() {
         image::ColorType::Rgba8 | image::ColorType::Rgba16 => {
             let (w, h) = img.dimensions();
@@ -23,9 +30,10 @@ pub fn load_image_rgb_white_bg(path: &std::path::Path) -> Result<DynamicImage> {
             let rgba = img.to_rgba8();
             for (x, y, p) in rgba.enumerate_pixels() {
                 let alpha = p.0[3] as f32 / 255.0;
-                let r = (p.0[0] as f32 * alpha + 255.0 * (1.0 - alpha)) as u8;
-                let g = (p.0[1] as f32 * alpha + 255.0 * (1.0 - alpha)) as u8;
-                let b = (p.0[2] as f32 * alpha + 255.0 * (1.0 - alpha)) as u8;
+                // PIL `paste` rounds; matches Lance Python preprocessing.
+                let r = (p.0[0] as f32 * alpha + 255.0 * (1.0 - alpha)).round() as u8;
+                let g = (p.0[1] as f32 * alpha + 255.0 * (1.0 - alpha)).round() as u8;
+                let b = (p.0[2] as f32 * alpha + 255.0 * (1.0 - alpha)).round() as u8;
                 bg.put_pixel(x, y, image::Rgb([r, g, b]));
             }
             Ok(DynamicImage::ImageRgb8(bg))

@@ -192,8 +192,8 @@ pub fn patchify_video_with_merge(
         ));
     }
 
-    // Host materialization: Tensor::to_vec always returns F32, auto-casting
-    // BF16 if needed. For F32 input this is a straight D2H copy.
+    // F32 input materializes via to_vec for the 9-axis permute below. Tensor::to_vec
+    // always returns F32 (auto-casting BF16); for F32 input this is a plain D2H copy.
     let src = cthw.to_vec().context("materialize CTHW to host F32")?;
 
     // Source layout: [C, T, H, W] row-major. Strides:

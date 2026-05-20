@@ -14,6 +14,7 @@ struct Args {
     image: PathBuf,
     resolution: u32,
     refs_dir: PathBuf,
+    refs_file: String,
 }
 
 impl Args {
@@ -22,7 +23,9 @@ impl Args {
             image: PathBuf::new(),
             resolution: 476,
             refs_dir: PathBuf::from("ports/lance/parity/refs_preprocess"),
+            refs_file: "preprocess_refs.safetensors".to_string(),
         };
+        let mut rgba = false;
         let argv: Vec<String> = std::env::args().collect();
         let mut i = 1;
         while i < argv.len() {
@@ -39,9 +42,13 @@ impl Args {
                     a.refs_dir = PathBuf::from(&argv[i + 1]);
                     i += 2;
                 }
+                "--rgba" => {
+                    rgba = true;
+                    i += 1;
+                }
                 "-h" | "--help" => {
                     println!(
-                        "parity_lance_preprocess --image PATH [--resolution INT] [--refs-dir PATH]"
+                        "parity_lance_preprocess --image PATH [--resolution INT] [--refs-dir PATH] [--rgba]"
                     );
                     std::process::exit(0);
                 }
@@ -51,8 +58,12 @@ impl Args {
                 }
             }
         }
+        if rgba {
+            a.image = PathBuf::from("/tmp/preprocess_rgba_test.png");
+            a.refs_file = "preprocess_refs_rgba.safetensors".to_string();
+        }
         if a.image.as_os_str().is_empty() {
-            eprintln!("--image is required");
+            eprintln!("--image is required (or pass --rgba for synthetic RGBA fixture)");
             std::process::exit(2);
         }
         a
@@ -92,7 +103,7 @@ fn main() -> Result<()> {
     let device = flame_core::global_cuda_device();
     let args = Args::parse();
 
-    let refs_path = args.refs_dir.join("preprocess_refs.safetensors");
+    let refs_path = args.refs_dir.join(&args.refs_file);
     println!("Loading Python refs: {}", refs_path.display());
     let refs = flame_core::serialization::load_file(&refs_path, &device)
         .with_context(|| format!("load {}", refs_path.display()))?;
@@ -169,12 +180,12 @@ fn main() -> Result<()> {
         "-"
     );
 
-    let pass = shape_match && grid_match && cos >= 0.99;
+    let pass = shape_match && grid_match && cos >= 0.999;
     if pass {
-        println!("\n=== PARITY OK (cos >= 0.99, grid_thw + shape match) ===");
+        println!("\n=== PARITY OK (cos >= 0.999, grid_thw + shape match) ===");
         Ok(())
     } else {
-        println!("\n=== PARITY FAIL ===");
+        println!("\n=== PARITY FAIL (cos threshold 0.999) ===");
         std::process::exit(1);
     }
 }
