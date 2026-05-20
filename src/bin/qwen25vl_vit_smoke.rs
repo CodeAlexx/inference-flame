@@ -6,9 +6,8 @@
 //!    `[[1, 4, 4]]` → expect output shape `[4, 2048]` and no NaN/Inf.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
-use flame_core::{CudaDevice, DType, Result, Shape, Tensor};
+use flame_core::{DType, Result, Shape, Tensor};
 use inference_flame::models::qwen25vl_vit::{Qwen25VLVisionTower, Qwen25VLVitConfig};
 
 fn expected_keys(cfg: &Qwen25VLVitConfig) -> Vec<String> {
@@ -39,10 +38,7 @@ fn expected_keys(cfg: &Qwen25VLVitConfig) -> Vec<String> {
 
 fn main() -> Result<()> {
     std::env::set_var("FLAME_ALLOC_POOL", "0");
-    let device = CudaDevice::new(0).map_err(|e| {
-        flame_core::Error::Cuda(format!("CudaDevice::new(0) failed: {e:?}"))
-    })?;
-    let device = Arc::new(device);
+    let device = flame_core::global_cuda_device();
 
     let ckpt = PathBuf::from("/home/alex/.serenity/models/lance/Lance_3B_Video/model.safetensors");
     println!("=== qwen25vl_vit_smoke ===");

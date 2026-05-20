@@ -581,12 +581,12 @@ impl Qwen25VLVisionTower {
                 full_idx.push((base + j) as i32);
             }
         }
-        let idx_t = Tensor::from_vec_dtype(
+        let idx_t = Tensor::from_vec(
             full_idx.iter().map(|&v| v as f32).collect(),
             Shape::from_dims(&[seq_len]),
             self.device.clone(),
-            DType::I32,
-        )?;
+        )?
+        .to_dtype(DType::I32)?;
         let out = x.index_select0(&idx_t)?;
         out.reshape(&[seq_len, last])
     }
@@ -806,12 +806,12 @@ impl Qwen25VLVisionTower {
         for &v in &rev {
             rev_idx.push(v as i32);
         }
-        let idx_t = Tensor::from_vec_dtype(
+        let idx_t = Tensor::from_vec(
             rev_idx.iter().map(|&v| v as f32).collect(),
             Shape::from_dims(&[n_units]),
             self.device.clone(),
-            DType::I32,
-        )?;
+        )?
+        .to_dtype(DType::I32)?;
         let out = merged.index_select0(&idx_t)?.reshape(&[n_units, last])?;
         Ok(out)
     }
