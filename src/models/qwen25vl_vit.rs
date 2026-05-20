@@ -736,6 +736,91 @@ impl Qwen25VLVisionTower {
     ///             by `spatial_merge_size`.
     ///
     /// Returns `[N_patches / spatial_merge_unit, out_hidden_size]` BF16.
+    /// Diagnostic forward: returns `(post_merger, captures)` where
+    /// `captures` always contains `"pre_block_0"` and an entry per
+    /// `capture_layers` keyed `"block.{idx}"`.
+    ///
+    /// The plain [`forward`] entry point just calls this and discards the
+    /// captures.
+    pub fn forward_capture(
+        &self,
+        pixel_values: &Tensor,
+        grid_thw: &[[u32; 3]],
+        capture_layers: &[usize],
+    ) -> Result<(Tensor, std::collections::HashMap<String, Tensor>)> {
+        let cfg = &self.cfg;
+        let mut captures = std::collections::HashMap::new();
+
+        let expected: usize = grid_thw.iter().map(|&[t, h, w]| (t * h * w) as usize).sum();
+        let got = pixel_values.shape().dims()[0];
+        if expected != got {
+            return Err(Error::InvalidInput(format!(
+                "qwen25vl_vit forward: pixel_values has {got} patches but grid_thw implies {expected}"
+            )));
+        }
+        let flat_dim = cfg.flat_patch_dim();
+        if pixel_values.shape().dims()[1] != flat_dim {
+            return Err(Error::InvalidInput(format!(
+                "qwen25vl_vit forward: pixel_values last dim {} != expected {}",
+                pixel_values.shape().dims()[1],
+                flat_dim
+            )));
+        }
+
+        let mut h = self.patch_embed(pixel_values)?;
+        let (pos_ids_orig, window_index, cu_window_seqlens, cu_seqlens_full, max_grid, seq_len) =
+            self.window_layout(grid_thw);
+        debug_assert_eq!(seq_len, h.shape().dims()[0]);
+        h = self.reorder_by_window(&h, &window_index)?;
+
+        let unit = cfg.spatial_merge_unit();
+        let mut pos_ids_reord: Vec<(u32, u32)> = Vec::with_capacity(seq_len);
+        for &wi in &window_index {
+            let base = (wi as usize) * unit;
+            for j in 0..unit {
+                pos_ids_reord.push(pos_ids_orig[base + j]);
+            }
+        }
+        let (cos, sin) = self.build_rope_cossin(&pos_ids_reord, max_grid)?;
+
+        let mask_full =
+            Self::build_block_mask(seq_len, &cu_seqlens_full, &self.device)?;
+        let mask_window =
+            Self::build_block_mask(seq_len, &cu_window_seqlens, &self.device)?;
+
+        captures.insert("pre_block_0".to_string(), h.clone());
+
+        for layer_idx in 0..cfg.num_layers {
+            let mask = if cfg.fullatt_block_indexes.contains(&layer_idx) {
+                &mask_full
+            } else {
+                &mask_window
+            };
+            h = self.block_forward(layer_idx, &h, &cos, &sin, mask)?;
+            if capture_layers.contains(&layer_idx) {
+                captures.insert(format!("block.{layer_idx}"), h.clone());
+            }
+        }
+
+        let merged = self.patch_merger(&h)?;
+        let rev = Self::argsort_window_index(&window_index);
+        let n_units = window_index.len();
+        let last = cfg.out_hidden_size;
+        let mut rev_idx: Vec<i32> = Vec::with_capacity(n_units);
+        for &v in &rev {
+            rev_idx.push(v as i32);
+        }
+        let idx_t = Tensor::from_vec(
+            rev_idx.iter().map(|&v| v as f32).collect(),
+            Shape::from_dims(&[n_units]),
+            self.device.clone(),
+        )?
+        .to_dtype(DType::I32)?;
+        let out = merged.index_select0(&idx_t)?.reshape(&[n_units, last])?;
+        captures.insert("post_merger".to_string(), out.clone());
+        Ok((out, captures))
+    }
+
     pub fn forward(&self, pixel_values: &Tensor, grid_thw: &[[u32; 3]]) -> Result<Tensor> {
         let cfg = &self.cfg;
 

@@ -410,6 +410,10 @@ name = "qwen25vl_vit_smoke"
 path = "src/bin/qwen25vl_vit_smoke.rs"
 
 [[bin]]
+name = "parity_lance_vit"
+path = "src/bin/parity_lance_vit.rs"
+
+[[bin]]
 name = "lanpaint_gpu_smoke"
 path = "src/bin/lanpaint_gpu_smoke.rs"
 
