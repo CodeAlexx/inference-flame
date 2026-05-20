@@ -5,4 +5,6 @@
 //!   RGBA→RGB composite, CHW-normalize, resize wrappers, smart_resize.
 //! - Future model-specific submodules sit on top.
 
+pub mod bucket_resize;
 pub mod common;
+pub mod qwen25vl;

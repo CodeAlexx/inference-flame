@@ -410,6 +410,10 @@ name = "qwen25vl_vit_smoke"
 path = "src/bin/qwen25vl_vit_smoke.rs"
 
 [[bin]]
+name = "prepare_image_smoke"
+path = "src/bin/prepare_image_smoke.rs"
+
+[[bin]]
 name = "parity_lance_vit"
 path = "src/bin/parity_lance_vit.rs"
 
