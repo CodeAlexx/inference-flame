@@ -14,6 +14,11 @@ pub mod wan21_encoder;
 pub use wan21_encoder::Wan21VaeEncoder;
 pub mod wan22_vae;
 pub use wan22_vae::Wan22VaeDecoder;
+// Wan2.2 VAE encoder (z_dim=48) lives at crate::models::wan::encoder per
+// the existing Wan2.2 TI2V-5B module organization. Re-exported here so
+// the canonical import path is `inference_flame::vae::Wan22VaeEncoder`,
+// matching the convention used by other VAEs in this module.
+pub use crate::models::wan::Wan22VaeEncoder;
 pub mod ltx2_audio_vae;
 pub use ltx2_audio_vae::{LTX2AudioVaeDecoder, LTX2AudioVaeEncoder};
 pub mod ltx2_vocoder;
