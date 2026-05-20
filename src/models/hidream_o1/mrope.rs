@@ -154,14 +154,19 @@ pub fn build_mrope_positions(
         }
     };
 
-    // 2) The first `image_token_id` slot defines `ed` in Python.
-    //    For HiDream T2I, `<|vision_start|>` is at index `vs_idx`; the very
-    //    next token is the first `image_token_id` (since pipeline.py:51-52
-    //    sets vision_tokens[0] = vision_start_token_id and the rest =
-    //    image_token_id and concatenates after the text). So `ed = vs_idx + 1`.
+    // 2) The first `image_token_id` slot defines `ed` in Python, but the
+    //    generated-image position block starts immediately after the text
+    //    span, not at `ed`. For T2I, `<|vision_start|>` is the first generated
+    //    image slot and the first real `image_token_id` follows it:
     //
-    //    `text_len = ed - st - skip` where `st = 0` for the first iteration,
-    //    `skip = skip_vision_start_token[0] = 1`.
+    //      full stream: [ text..., vision_start, image_token, image_token, ... ]
+    //      text_len   = ed - st - skip = (vs_idx + 1) - 0 - 1 = vs_idx
+    //      image pos  = [text_len .. text_len + image_len)
+    //
+    //    The cache/inference vmask uses exactly that same range. Starting the
+    //    patch positions at `ed` shifts every image patch by one slot and
+    //    leaves the first generated patch at the default `[0,0,0]`, which does
+    //    not match the reference `_get_rope_index_t2i`.
     let ed = match input_ids.iter().position(|&id| id == image_token_id) {
         Some(i) => i,
         None => vs_idx + 1, // Fallback: assume the slot right after vs.
@@ -194,7 +199,7 @@ pub fn build_mrope_positions(
     //      llm_pos_ids_list.append(stack([t_idx, h_idx, w_idx]) + fix_point + st_idx)
     //      fix_point = 0
     //    With st_idx=0, that gives the per-patch coords + 4096 + 0 = +4096.
-    let patch_start = ed; // first patch slot is at `ed`
+    let patch_start = text_len;
     if skip > 0 {
         // gen-image branch: fix_point shift
         let mut fp_eff = fp;

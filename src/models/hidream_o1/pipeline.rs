@@ -50,7 +50,7 @@ pub struct HiDreamO1Pipeline {
     pub config: HiDreamO1Config,
     pub device: Arc<CudaDevice>,
     pub dtype: DType,
-    /// Backward-compatible debug flag. Current ai-toolkit O1 only rounds to
+    /// Backward-compatible debug flag. Current edv2-reference O1 only rounds to
     /// the patch multiple, so this flag no longer changes normal generation.
     pub allow_any_resolution: bool,
     /// Optional LoRA adapters routed through `model.forward_lora`. When
@@ -63,7 +63,7 @@ pub struct HiDreamO1Pipeline {
 /// Legacy predefined resolutions list.
 ///
 /// Older HiDream-O1 scripts snapped requests to these 2048-area presets.
-/// Current ai-toolkit's O1 pipeline only rounds to the patch multiple; keep
+/// Current edv2-reference's O1 pipeline only rounds to the patch multiple; keep
 /// the list for tests/docs that still reference the old behavior.
 pub const PREDEFINED_RESOLUTIONS: &[(usize, usize)] = &[
     (2048, 2048),
@@ -393,7 +393,7 @@ impl HiDreamO1Pipeline {
         guidance_scale: f32,
     ) -> AnyResult<Tensor> {
         let p = self.config.patch_size;
-        // 1) Current ai-toolkit O1 rounds to the patch multiple only.
+        // 1) Current edv2-reference O1 rounds to the patch multiple only.
         let rounded_width = (width / p) * p;
         let rounded_height = (height / p) * p;
         if rounded_width == 0 || rounded_height == 0 {

@@ -2,7 +2,7 @@
 //!
 //! The original `wan/modules/t5.py::umt5_xxl` class builds a flat module
 //! with keys like `blocks.{i}.attn.q.weight`, but the community releases
-//! (including `ai-toolkit/umt5_xxl_encoder`) ship the weights in HF
+//! (including `edv2-reference/umt5_xxl_encoder`) ship the weights in HF
 //! `T5EncoderModel` layout:
 //!
 //! ```text

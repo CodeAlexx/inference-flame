@@ -3,7 +3,7 @@
 //! Loads SDXL UNet base, builds SDXLUNet, then attaches a `LoraStack` via
 //! `set_lora`. The base weights are NEVER mutated — at every linear
 //! chokepoint the model adds `scale * up(down(x))` from any matching LoRA
-//! entries to the base output. This matches how ai-toolkit, OneTrainer,
+//! entries to the base output. This matches how edv2-reference, OneTrainer,
 //! and musubi-tuner all apply LoRAs at sampling time.
 //!
 //! Conv LoRAs (4D weights) are skipped at LoraStack load time — they

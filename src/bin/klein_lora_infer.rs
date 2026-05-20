@@ -5,7 +5,7 @@
 //! `LoraStack` via `set_lora`. The base weights are NEVER mutated — at
 //! every double/single-block linear chokepoint the model adds
 //! `scale * up(down(x))` from any matching LoRA entries to the base
-//! matmul output. This matches how ai-toolkit, OneTrainer, and
+//! matmul output. This matches how edv2-reference, OneTrainer, and
 //! musubi-tuner all apply LoRAs at sampling time.
 //!
 //! Klein-4B single-block linear1 is `[3*inner+2*mlp_hidden, inner_dim]`,

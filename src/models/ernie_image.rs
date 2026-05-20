@@ -451,7 +451,7 @@ impl ErnieImageModel {
     /// per-block matmul outputs. Base weights are not mutated. Targets
     /// expected: `layers.<i>.self_attention.{to_q,to_k,to_v,to_out.0}` and
     /// `layers.<i>.mlp.{gate_proj,up_proj,linear_fc2}` plus their
-    /// `.weight` suffix when looked up via the AiToolkit format mapper.
+    /// `.weight` suffix when looked up via the DiffusionModel format mapper.
     pub fn set_lora(&mut self, lora: Arc<crate::lora::LoraStack>) {
         self.lora = Some(lora);
     }

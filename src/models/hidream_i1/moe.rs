@@ -1,6 +1,6 @@
 //! Mixture-of-Experts FeedForward (SwiGLU experts + shared expert).
 //!
-//! Mirrors `ai-toolkit/.../hidream/src/models/moe.py`:
+//! Mirrors `edv2-reference/.../hidream/src/models/moe.py`:
 //!
 //! ```python
 //! class MOEFeedForwardSwiGLU(nn.Module):
@@ -24,7 +24,7 @@
 //!      to the destination row (`token_idx = idxs // top_k`).
 //!
 //! ## I1 specifics + LoRA filter
-//! ai-toolkit's canonical YAML (`train_lora_hidream_48.yaml`) excludes
+//! edv2-reference's canonical YAML (`train_lora_hidream_48.yaml`) excludes
 //! `ff_i.experts` and `ff_i.gate` from LoRA (the router stays frozen). The
 //! forward path still has to compute everything. We tag the candidate LoRA
 //! sites with `// LORA-TARGET: ...` comments so the trainer can wrap them

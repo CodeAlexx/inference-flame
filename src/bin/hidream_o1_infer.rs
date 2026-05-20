@@ -212,7 +212,7 @@ fn main() -> Result<()> {
             if let Some(steps) = args.steps {
                 if steps != 28 {
                     bail!(
-                        "--model-type dev uses the fixed 28-step flash schedule; use --model-type full --steps {steps} for the configurable ai-toolkit-style path"
+                        "--model-type dev uses the fixed 28-step flash schedule; use --model-type full --steps {steps} for the configurable edv2-reference-style path"
                     );
                 }
             }

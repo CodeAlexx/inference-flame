@@ -8,10 +8,9 @@
 //! a `LoRALinear` module replacing a `Linear` field wouldn't fit; we'd have to
 //! refactor 7 call sites × 36 layers and rewrite the offloader contract.
 //!
-//! Instead we keep LoRA tensors in this registry, keyed by the same logical
-//! module paths ai-toolkit saves after its O1 key conversion. Decoder-layer
-//! adapters use `"layers.{i}.{suffix}"`; resident O1 heads use keys such as
-//! `"x_embedder.proj1"` and `"final_layer2.linear"`.
+//! Instead we keep LoRA tensors in this registry, keyed by model logical
+//! module paths. Decoder-layer adapters use `"layers.{i}.{suffix}"`; resident
+//! O1 heads use keys such as `"x_embedder.proj1"` and `"final_layer2.linear"`.
 //!
 //! ## Initialization (PEFT convention)
 //!
@@ -25,10 +24,10 @@
 //!
 //! ## Target modules
 //!
-//! Current ai-toolkit O1 defaults set `transformer_only: false` and ignore
-//! `lm_head`, `patch_embed`, and `visual`, so the effective T2I target set is:
-//! 7 decoder linears in each language layer plus the O1 pixel/timestep heads
-//! (`x_embedder.{proj1,proj2}`, `t_embedder1.mlp.{0,2}`, `final_layer2.linear`).
+//! The transformer-only parity target is the 7 decoder linears in each
+//! language layer. EDV2 enables the O1 pixel/timestep heads by default because
+//! known-good public O1 LoRAs include them:
+//! `x_embedder.{proj1,proj2}`, `t_embedder1.mlp.{0,2}`, `final_layer2.linear`.
 //!
 //! Defaults: `rank = 32`, `alpha = 32` — matches
 //! `train_lora_hidream_48.yaml:26-27` (`network.linear`, `network.linear_alpha`).
@@ -58,8 +57,8 @@ use super::HiDreamO1Config;
 
 /// One LoRA adapter (A, B, scale).
 ///
-/// `a`: `[rank, Cin]` BF16, `requires_grad = true`.
-/// `b`: `[Cout, rank]` BF16, `requires_grad = true`.
+/// `a`: `[rank, Cin]`, `requires_grad = true`.
+/// `b`: `[Cout, rank]`, `requires_grad = true`.
 /// `scale`: typically `alpha / rank` (PEFT convention).
 ///
 /// `a` and `b` are held as `Parameter` so that the optimizer's `set_data`
@@ -67,6 +66,7 @@ use super::HiDreamO1Config;
 /// [`LoraAdapter::a_tensor`] / [`LoraAdapter::b_tensor`]. Earlier (M1) this
 /// stored raw `Tensor`s; that version pinned the initial state and silently
 /// no-op'd training because the decoder kept reading the pre-step values.
+#[derive(Clone)]
 pub struct LoraAdapter {
     pub a: Parameter,
     pub b: Parameter,
@@ -90,6 +90,7 @@ impl LoraAdapter {
 /// Key format: `"layers.{i}.{suffix}"` where `suffix` is e.g.
 /// `"self_attn.q_proj"`. This is the convention `decoder_forward_with_weights`
 /// uses when calling `get`.
+#[derive(Clone)]
 pub struct LoraRegistry {
     pub adapters: HashMap<String, LoraAdapter>,
     pub rank: usize,
@@ -98,7 +99,7 @@ pub struct LoraRegistry {
 
 /// The 7 standard LoRA target suffixes for HiDream-O1 decoder layers.
 ///
-/// Source: every `nn.Linear` inside ai-toolkit's `Qwen3VLTextDecoderLayer`
+/// Source: every `nn.Linear` inside edv2-reference's `Qwen3VLTextDecoderLayer`
 /// (`qwen3_vl_transformers.py:486-598` — `self_attn.{q,k,v,o}_proj` and
 /// `mlp.{gate,up,down}_proj`), restricted to `transformer_block_names =
 /// ["layers"]` as declared by `HidreamO1Model.get_transformer_block_names`
@@ -115,7 +116,8 @@ pub fn default_target_suffixes() -> &'static [&'static str] {
     ]
 }
 
-/// Non-decoder HiDream-O1 linears targeted by current ai-toolkit defaults.
+/// Non-decoder HiDream-O1 linears. These are compatibility targets; the
+/// reference training code only includes them when `transformer_only` is false.
 pub fn default_resident_target_keys() -> &'static [&'static str] {
     &[
         "x_embedder.proj1",
@@ -126,12 +128,12 @@ pub fn default_resident_target_keys() -> &'static [&'static str] {
     ]
 }
 
-/// Substrings ai-toolkit refuses to LoRA-adapt for O1
+/// Substrings edv2-reference refuses to LoRA-adapt for O1
 /// (`train_lora_hidream_48.yaml`'s `network_kwargs.ignore_if_contains`).
 ///
 /// The static target list above already excludes all three, but keep the
 /// blacklist here so any future dynamic target enumerator preserves
-/// ai-toolkit parity.
+/// edv2-reference parity.
 pub const IGNORE_IF_CONTAINS: &[&str] = &["lm_head", "patch_embed", "visual"];
 
 /// Compute `(Cin, Cout)` for a given target suffix on this config.
@@ -175,12 +177,45 @@ pub fn shape_for_key(cfg: &HiDreamO1Config, key: &str) -> Option<(usize, usize)>
 pub fn add_lora_residual(base: Tensor, input: &Tensor, adapter: &LoraAdapter) -> Result<Tensor> {
     let a = adapter.a_tensor()?;
     let b = adapter.b_tensor()?;
-    let a_t = a.transpose()?;
-    let b_t = b.transpose()?;
-    let xa = input.matmul(&a_t)?;
-    let xab = xa.matmul(&b_t)?;
-    let residual = xab.mul_scalar(adapter.scale)?;
+    validate_lora_compute_dtype("add_lora_residual", &a, &b)?;
+    let residual = if a.dtype() == DType::F32 {
+        // The reference LoRA path keeps adapter weights in F32, casts the
+        // activation into the LoRA branch dtype, then casts the residual back.
+        let input_f32 = input.to_dtype(DType::F32)?;
+        let a_t = a.transpose()?.contiguous()?;
+        let b_t = b.transpose()?.contiguous()?;
+        let xa = input_f32.matmul(&a_t)?;
+        let xab = xa.matmul(&b_t)?;
+        xab.mul_scalar(adapter.scale)?
+    } else {
+        let a_t = a.transpose()?;
+        let b_t = b.transpose()?;
+        let xa = input.matmul(&a_t)?;
+        let xab = xa.matmul(&b_t)?;
+        xab.mul_scalar(adapter.scale)?
+    };
+    let residual = if residual.dtype() != base.dtype() {
+        residual.to_dtype(base.dtype())?
+    } else {
+        residual
+    };
     base.add(&residual)
+}
+
+fn validate_lora_compute_dtype(context: &str, a: &Tensor, b: &Tensor) -> Result<()> {
+    if a.dtype() != b.dtype() {
+        return Err(Error::InvalidInput(format!(
+            "{context}: lora_a and lora_b must have the same dtype, got {:?} and {:?}",
+            a.dtype(),
+            b.dtype()
+        )));
+    }
+    match a.dtype() {
+        DType::BF16 | DType::F32 => Ok(()),
+        other => Err(Error::InvalidInput(format!(
+            "{context}: unsupported LoRA dtype {other:?}; expected BF16 or F32"
+        ))),
+    }
 }
 
 impl LoraRegistry {
@@ -189,9 +224,9 @@ impl LoraRegistry {
     /// `num_layers` controls the per-layer fan-out: every entry in
     /// `target_suffixes` gets an adapter for `i in 0..num_layers`.
     ///
-    /// Tensors are placed on `device` in BF16 with `requires_grad = true`,
-    /// so AdamW (or any flame-core optimizer) will pick them up when
-    /// `iter_trainable()` is enumerated.
+    /// Tensors are placed on `device` in BF16 with `requires_grad = true`.
+    /// Training code that needs reference parity should call
+    /// [`Self::new_with_dtype_and_resident`] with `DType::F32`.
     pub fn new(
         cfg: &HiDreamO1Config,
         rank: usize,
@@ -200,38 +235,91 @@ impl LoraRegistry {
         seed: u64,
         device: &Arc<CudaDevice>,
     ) -> Result<Self> {
+        Self::new_with_dtype_and_resident(
+            cfg,
+            rank,
+            alpha,
+            target_suffixes,
+            seed,
+            device,
+            DType::BF16,
+            true,
+        )
+    }
+
+    pub fn new_with_dtype(
+        cfg: &HiDreamO1Config,
+        rank: usize,
+        alpha: f32,
+        target_suffixes: &[&str],
+        seed: u64,
+        device: &Arc<CudaDevice>,
+        dtype: DType,
+    ) -> Result<Self> {
+        Self::new_with_dtype_and_resident(
+            cfg,
+            rank,
+            alpha,
+            target_suffixes,
+            seed,
+            device,
+            dtype,
+            true,
+        )
+    }
+
+    pub fn new_with_dtype_and_resident(
+        cfg: &HiDreamO1Config,
+        rank: usize,
+        alpha: f32,
+        target_suffixes: &[&str],
+        seed: u64,
+        device: &Arc<CudaDevice>,
+        dtype: DType,
+        include_resident_targets: bool,
+    ) -> Result<Self> {
+        match dtype {
+            DType::BF16 | DType::F32 => {}
+            other => {
+                return Err(Error::InvalidInput(format!(
+                    "LoraRegistry::new: unsupported LoRA dtype {other:?}; expected BF16 or F32"
+                )));
+            }
+        }
         let scale = alpha / (rank as f32);
         let mut adapters = HashMap::new();
-        for (k, key) in default_resident_target_keys().iter().enumerate() {
-            let (cin, cout) = shape_for_key(cfg, key).ok_or_else(|| {
-                Error::InvalidInput(format!(
-                    "LoraRegistry::new: unknown resident target key {key:?}"
-                ))
-            })?;
-            let adapter_seed = seed.wrapping_add(10_000).wrapping_add(k as u64 * 17);
-            use rand::{rngs::StdRng, Rng, SeedableRng};
-            let bound = 1.0 / (cin as f32).sqrt();
-            let mut rng = StdRng::seed_from_u64(adapter_seed);
-            let a_data: Vec<f32> = (0..rank * cin)
-                .map(|_| (rng.gen::<f32>() * 2.0 - 1.0) * bound)
-                .collect();
-            let a = Tensor::from_vec(a_data, Shape::from_dims(&[rank, cin]), device.clone())?
-                .to_dtype(DType::BF16)?
+        if include_resident_targets {
+            for (k, key) in default_resident_target_keys().iter().enumerate() {
+                let (cin, cout) = shape_for_key(cfg, key).ok_or_else(|| {
+                    Error::InvalidInput(format!(
+                        "LoraRegistry::new: unknown resident target key {key:?}"
+                    ))
+                })?;
+                let adapter_seed = seed.wrapping_add(10_000).wrapping_add(k as u64 * 17);
+                use rand::{rngs::StdRng, Rng, SeedableRng};
+                let bound = 1.0 / (cin as f32).sqrt();
+                let mut rng = StdRng::seed_from_u64(adapter_seed);
+                let a_data: Vec<f32> = (0..rank * cin)
+                    .map(|_| (rng.gen::<f32>() * 2.0 - 1.0) * bound)
+                    .collect();
+                let a = Tensor::from_vec(a_data, Shape::from_dims(&[rank, cin]), device.clone())?
+                    .to_dtype(dtype)?
+                    .requires_grad_(true);
+                let b = Tensor::zeros_dtype(
+                    Shape::from_dims(&[cout, rank]),
+                    dtype,
+                    device.clone(),
+                )?
                 .requires_grad_(true);
-            let b = Tensor::zeros_dtype(
-                Shape::from_dims(&[cout, rank]),
-                DType::BF16,
-                device.clone(),
-            )?
-            .requires_grad_(true);
-            adapters.insert(
-                (*key).to_string(),
-                LoraAdapter {
-                    a: Parameter::new(a),
-                    b: Parameter::new(b),
-                    scale,
-                },
-            );
+                adapters.insert(
+                    (*key).to_string(),
+                    LoraAdapter {
+                        a: Parameter::new(a),
+                        b: Parameter::new(b),
+                        scale,
+                    },
+                );
+            }
         }
         for layer_idx in 0..cfg.num_layers {
             for (k, suffix) in target_suffixes.iter().enumerate() {
@@ -245,11 +333,11 @@ impl LoraRegistry {
                     .wrapping_add((layer_idx as u64) * 131)
                     .wrapping_add(k as u64 * 17);
                 // PEFT/Kaiming uniform init on A — matches torch nn.Linear
-                // default and ai-toolkit's PEFT LoRA init. B is zero, so the
+                // default and edv2-reference's PEFT LoRA init. B is zero, so the
                 // initial residual is identically zero regardless of A's
                 // magnitude. Prior init (std=1e-4 Gaussian) was ~84× under
-                // Kaiming magnitude and caused step-1 loss spike to ~35 vs
-                // AIT's ~0.1 (see docs/o1_strict_parity_report.md). Matches
+                // Kaiming magnitude and caused a step-1 loss spike (see
+                // docs/o1_strict_parity_report.md). Matches
                 // `eridiffusion-core::LoRALinear::new` pattern used by chroma
                 // and other trainers.
                 use rand::{rngs::StdRng, Rng, SeedableRng};
@@ -263,11 +351,11 @@ impl LoraRegistry {
                     Shape::from_dims(&[rank, cin]),
                     device.clone(),
                 )?
-                .to_dtype(DType::BF16)?;
+                .to_dtype(dtype)?;
                 let a = a_raw;
                 let b = Tensor::zeros_dtype(
                     Shape::from_dims(&[cout, rank]),
-                    DType::BF16,
+                    dtype,
                     device.clone(),
                 )?;
                 let a = a.requires_grad_(true);
@@ -346,7 +434,7 @@ impl LoraRegistry {
         out
     }
 
-    /// Number of adapters (resident targets plus per-layer decoder targets).
+    /// Number of adapters in this registry.
     pub fn len(&self) -> usize {
         self.adapters.len()
     }
@@ -355,14 +443,14 @@ impl LoraRegistry {
         self.adapters.is_empty()
     }
 
-    /// Load a registry from an ai-toolkit-style or older Rust safetensors file.
+    /// Load a registry from an edv2-reference-style or older Rust safetensors file.
     ///
     /// Accepted key layouts (per adapter):
     ///   - PEFT canonical (with `default` adapter infix — BUG-2 fix):
     ///     `base_model.model.model.language_model.layers.{i}.{suffix}.lora_A.default.weight`
     ///   - Legacy canonical (no infix):
     ///     `base_model.model.model.language_model.layers.{i}.{suffix}.lora_A.weight`
-    ///   - Ai-toolkit O1:
+    ///   - Reference O1:
     ///     `diffusion_model.language_model.layers.{i}.{suffix}.lora_A.weight`
     ///     `diffusion_model.x_embedder.proj1.lora_A.weight`
     ///   - Short:
@@ -377,8 +465,25 @@ impl LoraRegistry {
         cfg: &HiDreamO1Config,
         device: &Arc<CudaDevice>,
     ) -> Result<Self> {
+        Self::from_safetensors_with_dtype(path, cfg, device, DType::BF16)
+    }
+
+    pub fn from_safetensors_with_dtype(
+        path: &Path,
+        cfg: &HiDreamO1Config,
+        device: &Arc<CudaDevice>,
+        dtype: DType,
+    ) -> Result<Self> {
+        match dtype {
+            DType::BF16 | DType::F32 => {}
+            other => {
+                return Err(Error::InvalidInput(format!(
+                    "from_safetensors: unsupported LoRA dtype {other:?}; expected BF16 or F32"
+                )));
+            }
+        }
         let raw = flame_core::serialization::load_file(path, device)?;
-        // Accept ai-toolkit O1 (`diffusion_model.*.lora_A.weight`), our older
+        // Accept edv2-reference O1 (`diffusion_model.*.lora_A.weight`), our older
         // PEFT-canonical wrapper (`base_model.model.model.language_model.*`),
         // and short internal keys.
         let old_prefix = "base_model.model.model.language_model.";
@@ -414,14 +519,14 @@ impl LoraRegistry {
                 .ok_or_else(|| {
                     Error::InvalidInput(format!("from_safetensors: missing A tensor {a_full}"))
                 })?
-                .to_dtype(DType::BF16)?
+                .to_dtype(dtype)?
                 .requires_grad_(true);
             let b_t = raw
                 .get(&b_full)
                 .ok_or_else(|| {
                     Error::InvalidInput(format!("from_safetensors: missing B tensor {b_full}"))
                 })?
-                .to_dtype(DType::BF16)?
+                .to_dtype(dtype)?
                 .requires_grad_(true);
             let a_dims = a_t.shape().dims();
             if a_dims.len() != 2 {
@@ -480,13 +585,29 @@ impl LoraRegistry {
         })
     }
 
-    /// Save to ai-toolkit's post-conversion O1 layout:
+    /// Save to the generic HiDream-O1 LoRA layout:
     ///   `diffusion_model.language_model.layers.{i}...lora_A.weight`
     ///   `diffusion_model.x_embedder.proj1.lora_A.weight`
     ///
     /// `from_safetensors` still accepts the older PEFT wrapper format so
     /// previously-trained Rust checkpoints remain loadable.
     pub fn save_safetensors(&self, path: &Path) -> Result<()> {
+        self.save_safetensors_with_export_scale(path, 1.0)
+    }
+
+    /// Save a weights-only LoRA, optionally scaling the exported B matrices.
+    ///
+    /// HiDream-O1 is unusually sensitive to full-strength style LoRAs in the
+    /// 512/1024 dev sampler. Scaling `B` at export leaves the training update
+    /// path unchanged while producing an ordinary LoRA file that external
+    /// loaders can use without an inference-only strength knob.
+    pub fn save_safetensors_with_export_scale(&self, path: &Path, export_scale: f32) -> Result<()> {
+        if !export_scale.is_finite() || export_scale <= 0.0 {
+            return Err(Error::InvalidInput(format!(
+                "save_safetensors: export_scale must be finite and > 0, got {export_scale}"
+            )));
+        }
+        let _guard = flame_core::autograd::AutogradContext::no_grad();
         let mut out: HashMap<String, Tensor> = HashMap::with_capacity(self.adapters.len() * 2);
         let mut keys: Vec<&String> = self.adapters.keys().collect();
         keys.sort();
@@ -496,9 +617,22 @@ impl LoraRegistry {
             let a_key = format!("{save_key}.lora_A.weight");
             let b_key = format!("{save_key}.lora_B.weight");
             out.insert(a_key, ad.a.tensor()?);
-            out.insert(b_key, ad.b.tensor()?);
+            let b = ad.b.tensor()?;
+            let b = if (export_scale - 1.0).abs() > f32::EPSILON {
+                b.mul_scalar(export_scale)?
+            } else {
+                b
+            };
+            out.insert(b_key, b);
         }
-        flame_core::serialization::save_file(&out, path)?;
+        let mut meta = HashMap::new();
+        meta.insert("ss_training_comment".to_string(), "edv2 trainer".to_string());
+        meta.insert("modelspec.architecture".to_string(), "hidream-o1/lora".to_string());
+        meta.insert("modelspec.base_model".to_string(), "hidream_o1".to_string());
+        meta.insert("ss_network_dim".to_string(), self.rank.to_string());
+        meta.insert("ss_network_alpha".to_string(), self.alpha.to_string());
+        meta.insert("edv2.export_scale".to_string(), export_scale.to_string());
+        flame_core::serialization::save_tensors_with_metadata(&out, &meta, path)?;
         Ok(())
     }
 }

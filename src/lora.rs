@@ -1,5 +1,5 @@
 //! Runtime LoRA application for inference — the canonical "wrap forward, never
-//! mutate base" pattern used by ai-toolkit, OneTrainer, and musubi-tuner.
+//! mutate base" pattern used by edv2-reference, OneTrainer, and musubi-tuner.
 //!
 //! # Why this exists
 //!
@@ -49,7 +49,7 @@
 //! - **ZImageTrainer**: bare `<prefix>.lora_A` / `.lora_B` with split
 //!   `attention.to_q/to_k/to_v` → fused `attention.qkv.weight` via
 //!   `Slot::RowRange`.
-//! - **AiToolkit**: `diffusion_model.<key>.lora_A.weight`, full overlay.
+//! - **DiffusionModel**: `diffusion_model.<key>.lora_A.weight`, full overlay.
 //!   May ship per-module `.alpha` scalar tensors.
 //! - **KohyaSdxl**: `lora_unet_<path>.lora_down/up.weight`. Always ships
 //!   per-module `.alpha`. SDXL diffusers names are rewritten to LDM via
@@ -121,8 +121,8 @@ pub enum LoraFormat {
     /// Z-Image trainer: `<prefix>.lora_A` / `.lora_B` with split QKV
     /// (`attention.to_q/to_k/to_v`).
     ZImageTrainer,
-    /// ai-toolkit: `diffusion_model.<key>.lora_A.weight`. Full overlay.
-    AiToolkit,
+    /// edv2-reference: `diffusion_model.<key>.lora_A.weight`. Full overlay.
+    DiffusionModel,
     /// kohya / sd-scripts: `lora_unet_<path>.lora_down/up.weight` plus
     /// per-module `<prefix>.alpha` scalar.
     KohyaSdxl,
@@ -176,7 +176,7 @@ impl LoraStack {
 
         let (suffix_a, suffix_b) = match format {
             LoraFormat::KleinTrainer | LoraFormat::ZImageTrainer => (".lora_A", ".lora_B"),
-            LoraFormat::AiToolkit => (".lora_A.weight", ".lora_B.weight"),
+            LoraFormat::DiffusionModel => (".lora_A.weight", ".lora_B.weight"),
             LoraFormat::KohyaSdxl => (".lora_down.weight", ".lora_up.weight"),
         };
 
@@ -213,7 +213,7 @@ impl LoraStack {
             let mapped = match format {
                 LoraFormat::KleinTrainer => map_prefix_klein_trainer(prefix),
                 LoraFormat::ZImageTrainer => map_prefix_zimage_trainer(prefix),
-                LoraFormat::AiToolkit => map_prefix_aitoolkit(prefix),
+                LoraFormat::DiffusionModel => map_prefix_diffusion_model(prefix),
                 LoraFormat::KohyaSdxl => {
                     if prefix.starts_with("lora_te1_") || prefix.starts_with("lora_te2_") {
                         n_skipped_te += 1;
@@ -243,7 +243,7 @@ impl LoraStack {
 
             // Per-module .alpha (read for ALL formats — the merge code only
             // did this for kohya, which silently mis-scaled musubi-trained
-            // and ai-toolkit-trained LoRAs by `rank/saved_alpha` (often
+            // and edv2-reference-trained LoRAs by `rank/saved_alpha` (often
             // 32× or so for rank=96 alpha=3 LoRAs).
             let alpha_key = format!("{prefix}.alpha");
             let module_rank = a.shape().dims()[0];
@@ -272,7 +272,7 @@ impl LoraStack {
             // `(x @ down_t) @ up_t * scale`. Match the trainer's
             // forward_delta layout (a_t = A^T = [in, rank], b_t = B^T = [rank, out]).
             //
-            // Upcast to F32. The reference trainers (ai-toolkit, OneTrainer,
+            // Upcast to F32. The reference trainers (edv2-reference, OneTrainer,
             // musubi) compute the LoRA branch in F32 and cast only the final
             // delta to base dtype before add. Doing the chained matmuls in
             // BF16 across 150 modules × N steps blurs the contribution into
@@ -474,7 +474,7 @@ fn detect_format(lora: &HashMap<String, Tensor>) -> LoraFormat {
         return LoraFormat::KohyaSdxl;
     }
     if lora.keys().any(|k| k.ends_with(".lora_A.weight") || k.ends_with(".lora_B.weight")) {
-        return LoraFormat::AiToolkit;
+        return LoraFormat::DiffusionModel;
     }
     if lora
         .keys()
@@ -554,15 +554,15 @@ fn map_prefix_zimage_trainer(prefix: &str) -> Option<(String, Slot)> {
     None
 }
 
-fn map_prefix_aitoolkit(prefix: &str) -> Option<(String, Slot)> {
+fn map_prefix_diffusion_model(prefix: &str) -> Option<(String, Slot)> {
     let stripped = prefix.strip_prefix("diffusion_model.").unwrap_or(prefix);
     let stripped = stripped.strip_suffix(".default").unwrap_or(stripped);
 
-    // Z-Image-specific: ai-toolkit (and our trainer's new save) writes split
+    // Z-Image-specific: edv2-reference (and our trainer's new save) writes split
     // attention as `<...>.attention.to_q/.to_k/.to_v/.to_out.0`, but the
     // flame Z-Image base model has fused `<...>.attention.qkv.weight` and
     // `<...>.attention.out.weight`. Mirror the slot mapping in
-    // `map_prefix_zimage_trainer` so ai-toolkit-format Z-Image LoRAs route
+    // `map_prefix_zimage_trainer` so edv2-reference-format Z-Image LoRAs route
     // through the same Q/K/V row ranges + `attention.out` as the trainer's
     // legacy split format.
     if let Some(rest) = stripped.strip_suffix(".attention.to_q") {
@@ -616,7 +616,7 @@ fn build_kohya_unet_table(base_keys: &HashSet<String>) -> HashMap<String, String
 
 // ─── kohya naming → LDM (SDXL) ──────────────────────────────────────────────
 //
-// Most kohya/sd-scripts/OneTrainer/ai-toolkit SDXL LoRAs ship with diffusers
+// Most kohya/sd-scripts/OneTrainer/edv2-reference SDXL LoRAs ship with diffusers
 // block names; our SDXL UNet uses LDM names. The rewriter converts the
 // prefix; the build_kohya_unet_table reverse-lookup then matches the LDM key.
 // (This block is identical in spirit to lora_merge.rs's rewriter — it lives

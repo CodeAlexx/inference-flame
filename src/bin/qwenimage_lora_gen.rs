@@ -8,10 +8,10 @@
 //!
 //! ## LoRA application
 //!
-//! Standard ai-toolkit / OneTrainer / musubi-tuner LoRAs trained
+//! Standard edv2-reference / OneTrainer / musubi-tuner LoRAs trained
 //! against the diffusers Qwen-Image checkpoint use
 //! `diffusion_model.transformer_blocks.{i}.<sub>.lora_{A,B}.weight`
-//! naming. The generic ai-toolkit fallback in `inference-flame::lora`
+//! naming. The generic edv2-reference fallback in `inference-flame::lora`
 //! strips `diffusion_model.` and matches against the base weight key —
 //! no qwenimage-specific prefix mapper is needed for the standard
 //! split-Q/K/V 2512 base. (Fused-base "turbo loader" checkpoints with

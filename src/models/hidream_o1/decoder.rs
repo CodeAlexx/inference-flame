@@ -439,7 +439,7 @@ pub fn decoder_forward_with_weights_lora(
     let v = repeat_kv(&v, n_rep)?;
     log_mem("after_repeat_kv");
 
-    // ai-toolkit's HiDream-O1 `use_flash_attn=True` path avoids a 4D mixed
+    // edv2-reference's HiDream-O1 `use_flash_attn=True` path avoids a 4D mixed
     // mask. It runs causal attention on the AR/text prefix, full unmasked
     // attention on all tokens, then replaces the AR rows. That unlocks cuDNN
     // Flash SDPA for the large full pass; the old mixed-mask path falls back

@@ -60,7 +60,7 @@ impl BottleneckPatchEmbed {
         self.proj2.forward(&h)
     }
 
-    /// LoRA-aware forward for ai-toolkit O1's non-decoder target set.
+    /// LoRA-aware forward for edv2-reference O1's non-decoder target set.
     pub fn forward_lora(&self, patches: &Tensor, lora: Option<&LoraRegistry>) -> Result<Tensor> {
         let h = self.proj1.forward(patches)?;
         let h = match lora.and_then(|r| r.get_global("x_embedder.proj1")) {

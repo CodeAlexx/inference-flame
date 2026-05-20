@@ -4,7 +4,7 @@
 //! at runtime via `ErnieImageModel::set_lora`. The base weights are NEVER
 //! mutated — at every per-block linear (Q/K/V/out + gate/up/down) the
 //! model adds `scale * up(down(x))` from any matching LoRA entries to
-//! the base output. This matches how ai-toolkit, OneTrainer, and
+//! the base output. This matches how edv2-reference, OneTrainer, and
 //! musubi-tuner all apply LoRAs at sampling time.
 //!
 //! Usage:
@@ -172,7 +172,7 @@ fn run() -> anyhow::Result<()> {
     // the model (the model's `load` consumes the weights HashMap). The
     // ernie-trainer save format uses bare `<prefix>.lora_A`/`.lora_B` whose
     // prefix appended with `.weight` matches a base key — that's the
-    // AiToolkit-compatible code path inside LoraStack.
+    // DiffusionModel-compatible code path inside LoraStack.
     let base_keys: std::collections::HashSet<String> = all_weights.keys().cloned().collect();
     let lora_stack = LoraStack::load(
         args.lora.to_str().expect("lora path utf8"),

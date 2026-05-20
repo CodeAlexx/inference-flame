@@ -14,7 +14,7 @@
 //!   3. Projects T5 via `caption_projection[-1]`.
 //!   4. The resulting list has length `num_double + num_single + 1`.
 //!
-//! ## ai-toolkit pipeline reference
+//! ## edv2-reference pipeline reference
 //! `pipeline_hidream_image.py:_encode_prompt` (lines 375-438) shows the
 //! exact ordering: `[t5, llama_stack]` (T5 first, Llama stack second)
 //! and `pooled = cat([clip_l, clip_g], -1)`.

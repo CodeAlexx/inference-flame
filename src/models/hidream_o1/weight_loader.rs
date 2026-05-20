@@ -3,7 +3,7 @@
 //! Reads `<model_dir>/model.safetensors.index.json` to discover which shard
 //! file holds each tensor, then per-shard memory-maps the relevant tensors:
 //! - **per-layer** transformer weights stream from pinned host RAM via
-//!   [`flame_diffusion::BlockOffloader`] (one block = one decoder layer);
+//!   [`flame_core::offload::BlockOffloader`] (one block = one decoder layer);
 //! - **resident-shared** weights (embed_tokens, final norm, HiDream heads)
 //!   are copied directly to BF16 GPU tensors via a CPU-side F32→BF16
 //!   conversion to avoid a transient F32-on-GPU peak.
@@ -66,9 +66,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result as AnyResult};
+use flame_core::offload::{BlockFacilitator, BlockOffloader};
 use flame_core::{CudaDevice, DType, Shape, Tensor};
-use flame_diffusion::block_offload::BlockFacilitator;
-use flame_diffusion::BlockOffloader;
 
 use super::HiDreamO1Config;
 use super::model::HiDreamO1Model;
@@ -319,7 +318,13 @@ impl HiDreamO1WeightLoader {
             shard_refs.len(),
             config.num_layers
         );
+        if std::env::var_os("FLAME_LAYER_OFFLOAD_FRACTION").is_none() {
+            unsafe {
+                std::env::set_var("FLAME_LAYER_OFFLOAD_FRACTION", "0.77");
+            }
+        }
         let offloader = BlockOffloader::load(&shard_refs, &facilitator, device.clone())
+            .map(|o| o.with_native_layout(true))
             .map_err(|e| anyhow!("HiDream-O1 BlockOffloader::load: {e}"))?;
 
         // 2) Load resident-shared keys with CPU-side F32→BF16 (no F32-on-GPU

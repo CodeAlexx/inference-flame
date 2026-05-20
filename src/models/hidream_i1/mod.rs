@@ -20,9 +20,9 @@
 //!   list format the DiT expects.
 //!
 //! ## Architecture references
-//! - `ai-toolkit/extensions_built_in/diffusion_models/hidream/src/models/transformers/transformer_hidream_image.py`
-//! - `ai-toolkit/.../hidream/src/models/{embeddings,attention,attention_processor,moe}.py`
-//! - `ai-toolkit/.../hidream/src/pipelines/hidream_image/pipeline_hidream_image.py`
+//! - `edv2-reference/extensions_built_in/diffusion_models/hidream/src/models/transformers/transformer_hidream_image.py`
+//! - `edv2-reference/.../hidream/src/models/{embeddings,attention,attention_processor,moe}.py`
+//! - `edv2-reference/.../hidream/src/pipelines/hidream_image/pipeline_hidream_image.py`
 //!
 //! ## Scheduler
 //! The flow-matching Euler scheduler is shared with hidream_o1 in concept,

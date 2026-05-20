@@ -4,7 +4,7 @@
 //! LoRA at runtime via `SD3MMDiT::set_lora`. Base weights are NEVER mutated —
 //! at every `linear_no_bias` call the model adds `scale * up(down(x))` from
 //! any matching LoRA entries to the base output. This matches how
-//! ai-toolkit, OneTrainer, and musubi-tuner all apply LoRAs at sampling time.
+//! edv2-reference, OneTrainer, and musubi-tuner all apply LoRAs at sampling time.
 //!
 //! Usage:
 //!   sd3_lora_infer --lora /path/to/sd3_lora.safetensors \
@@ -312,7 +312,7 @@ fn main() -> anyhow::Result<()> {
     // `LoraStack::load` reads per-module .alpha for every format. The
     // sd3-trainer save format uses bare `<prefix>.lora_A`/`.lora_B` keys
     // whose prefix appended with `.weight` matches a base weight key —
-    // that's the AiToolkit-compatible path in LoraStack.
+    // that's the DiffusionModel-compatible path in LoraStack.
     let base_keys: std::collections::HashSet<String> = resident.keys().cloned().collect();
     let lora_stack = LoraStack::load(
         args.lora.to_str().expect("lora path utf8"),

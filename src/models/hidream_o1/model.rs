@@ -65,12 +65,12 @@
 //!   (`pipeline.py:279`). We accept the binarized mask directly.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use flame_core::nn::Embedding;
 use flame_core::norm::RMSNorm;
+use flame_core::offload::BlockOffloader;
 use flame_core::{DType, Error, Result, Shape, Tensor};
-use flame_diffusion::BlockOffloader;
 
 use super::bottleneck_patch_embed::BottleneckPatchEmbed;
 use super::decoder::decoder_forward_with_weights_lora;
@@ -91,7 +91,8 @@ use super::HiDreamO1Config;
 /// - `embed_tokens`: 152K × 4096 × 2 B  ≈  1.2 GB resident
 /// - `norm` + bottleneck_patch_embed + timestep_embedder + final_layer
 ///   ≈ a few hundred MB resident
-/// - 2 active block slots from BlockOffloader: ~2 × 220 MB = 440 MB
+/// - BlockOffloader resident window controlled by `FLAME_LAYER_OFFLOAD_FRACTION`
+///   (Klein-style default set by the weight loader)
 /// - All 36 layers' worth of pinned host RAM: ~7.9 GB host (pinned)
 pub struct HiDreamO1Model {
     pub config: HiDreamO1Config,
@@ -117,7 +118,7 @@ pub struct HiDreamO1Model {
     /// facilitator). Pre-transposed by `prepare_weights` to `[Cin, Cout]`;
     /// the loader un-transposes back to PyTorch `[Cout, Cin]` so
     /// `fused_linear3d_native` works directly.
-    pub offloader: BlockOffloader,
+    pub offloader: Arc<Mutex<BlockOffloader>>,
     /// Cached for kernel calls.
     device: Arc<flame_core::CudaDevice>,
 }
@@ -161,7 +162,7 @@ impl HiDreamO1Model {
             bottleneck_patch_embed,
             timestep_embedder,
             final_layer,
-            offloader,
+            offloader: Arc::new(Mutex::new(offloader)),
             device: device.clone(),
         })
     }
@@ -393,21 +394,23 @@ impl HiDreamO1Model {
 
         // 7) decoder loop: 36 layers for 8B, streamed via BlockOffloader.
         //
-        // Pattern mirrors `inference-flame/src/models/sensenova_u1.rs`:586-601:
-        //  - prefetch block 0 outside the loop;
-        //  - per-step: await(i), prefetch(i+1) overlap, un-transpose, forward;
-        //  - drop the per-step weights to release the slot before the next
-        //    await rolls the active slot.
-        //
-        // The split-borrow pattern keeps `offloader` borrowed `&mut` while
-        // `config`, `embed_tokens`, `norm`, and the head modules stay `&`.
+        // In inference, stream blocks directly. In training, boundary
+        // checkpoint each layer and re-fetch block weights inside the
+        // recompute closure so the backward tape stores block I/O only.
         let total = self.config.num_layers;
         let cfg = self.config.clone();
         let mut hidden = inputs_embeds;
-        let offloader = &mut self.offloader;
-        offloader
-            .prefetch_block(0)
-            .map_err(|e| Error::InvalidInput(format!("prefetch block 0: {e}")))?;
+        let offloader = self.offloader.clone();
+        {
+            let mut g = offloader
+                .lock()
+                .map_err(|e| Error::InvalidInput(format!("offloader lock: {e}")))?;
+            g.prefetch_block(0)
+                .map_err(|e| Error::InvalidInput(format!("prefetch block 0: {e}")))?;
+        }
+        let is_training = flame_core::autograd::AutogradContext::is_recording();
+        let mask_owned = mask_ref.cloned();
+        let lora_arc = lora.cloned().map(Arc::new);
 
         // Instrumentation gate: HIDREAM_DUMP_LAYERS=<path.safetensors> writes
         // the post-residual hidden state at the end of every decoder layer to
@@ -430,37 +433,105 @@ impl HiDreamO1Model {
         }
 
         for i in 0..total {
+            if is_training {
+                let mut g = offloader
+                    .lock()
+                    .map_err(|e| Error::InvalidInput(format!("offloader lock: {e}")))?;
+                if g.has_layer_offload_policy() {
+                    g.plan_layer_access(i, true, false).map_err(|e| {
+                        Error::InvalidInput(format!("plan layer {i}: {e}"))
+                    })?;
+                }
+            }
             // Per-layer log only for the first few layers to keep output small;
             // OOM in this port hits within the first layer at 2048².
             if mem_log && (i < 3 || i == total - 1) {
                 log_mem(&format!("layer{:02}.before_await", i));
             }
-            let raw = offloader
-                .await_block_handle(i)
-                .map_err(|e| Error::InvalidInput(format!("await block {i}: {e}")))?;
-            if mem_log && (i < 3 || i == total - 1) {
-                log_mem(&format!("layer{:02}.after_await", i));
+            if is_training {
+                let hidden_c = hidden.clone().requires_grad_(true);
+                let cfg_c = cfg.clone();
+                let cos_sin_c = (cos_sin.0.clone(), cos_sin.1.clone());
+                let mask_c = mask_owned.clone();
+                let lora_c = lora_arc.clone();
+                let off_clone = offloader.clone();
+                hidden = flame_core::autograd::AutogradContext::checkpoint_offload_boundary(
+                    &[hidden_c.clone()],
+                    move |inputs: &[Tensor]| {
+                        let hidden_in = inputs[0].clone();
+                        let is_recompute =
+                            flame_core::autograd::AutogradContext::is_checkpoint_recompute();
+                        let raw = {
+                            let mut g = off_clone.lock().map_err(|e| {
+                                Error::InvalidInput(format!("offloader lock (block {i}): {e}"))
+                            })?;
+                            let has_layer_policy = g.has_layer_offload_policy();
+                            if is_recompute && has_layer_policy {
+                                g.plan_layer_access(i, false, false).map_err(|e| {
+                                    Error::InvalidInput(format!("plan layer {i}: {e}"))
+                                })?;
+                            }
+                            let raw = g.await_block_handle(i).map_err(|e| {
+                                Error::InvalidInput(format!("await block {i}: {e}"))
+                            })?;
+                            if !has_layer_policy {
+                                let next = if is_recompute {
+                                    i.checked_sub(1)
+                                } else if i + 1 < total {
+                                    Some(i + 1)
+                                } else {
+                                    None
+                                };
+                                if let Some(next_idx) = next {
+                                    g.prefetch_block(next_idx).map_err(|e| {
+                                        Error::InvalidInput(format!("prefetch block {next_idx}: {e}"))
+                                    })?;
+                                }
+                            }
+                            raw
+                        };
+                        decoder_forward_with_weights_lora(
+                            &cfg_c,
+                            i,
+                            &hidden_in,
+                            &cos_sin_c,
+                            mask_c.as_ref(),
+                            raw.weights(),
+                            lora_c.as_deref(),
+                            two_pass_ar_len,
+                        )
+                    },
+                )?;
+            } else {
+                let raw = {
+                    let mut g = offloader.lock().map_err(|e| {
+                        Error::InvalidInput(format!("offloader lock (block {i}): {e}"))
+                    })?;
+                    let raw = g
+                        .await_block_handle(i)
+                        .map_err(|e| Error::InvalidInput(format!("await block {i}: {e}")))?;
+                    if i + 1 < total {
+                        g.prefetch_block(i + 1).map_err(|e| {
+                            Error::InvalidInput(format!("prefetch block {}: {e}", i + 1))
+                        })?;
+                    }
+                    raw
+                };
+                if mem_log && (i < 3 || i == total - 1) {
+                    log_mem(&format!("layer{:02}.after_await", i));
+                }
+                hidden = decoder_forward_with_weights_lora(
+                    &cfg,
+                    i,
+                    &hidden,
+                    &cos_sin,
+                    mask_ref,
+                    raw.weights(),
+                    lora,
+                    two_pass_ar_len,
+                )?;
+                drop(raw);
             }
-            if i + 1 < total {
-                offloader
-                    .prefetch_block(i + 1)
-                    .map_err(|e| Error::InvalidInput(format!("prefetch block {}: {e}", i + 1)))?;
-            }
-            let lw = Self::untranspose_block_weights(raw.weights())?;
-            if mem_log && (i < 3 || i == total - 1) {
-                log_mem(&format!("layer{:02}.after_untranspose", i));
-            }
-            hidden = decoder_forward_with_weights_lora(
-                &cfg,
-                i,
-                &hidden,
-                &cos_sin,
-                mask_ref,
-                &lw,
-                lora,
-                two_pass_ar_len,
-            )?;
-            drop(raw);
             if mem_log && (i < 3 || i == total - 1) {
                 log_mem(&format!("layer{:02}.after_forward", i));
             }
@@ -507,25 +578,6 @@ impl HiDreamO1Model {
     // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
-
-    /// `BlockOffloader::prepare_weights` pre-transposes 2D `.weight` tensors
-    /// to `[Cin, Cout]` for its internal matmul fast path.
-    /// `fused_linear3d_native` expects PyTorch `[Cout, Cin]`, so un-transpose
-    /// 2D weights here. Same pattern as
-    /// `inference-flame/src/models/sensenova_u1.rs::untranspose_block_weights`.
-    fn untranspose_block_weights(
-        raw: &HashMap<String, Tensor>,
-    ) -> Result<HashMap<String, Tensor>> {
-        let mut out = HashMap::with_capacity(raw.len());
-        for (k, v) in raw.iter() {
-            if k.ends_with(".weight") && v.shape().dims().len() == 2 {
-                out.insert(k.clone(), v.transpose()?);
-            } else {
-                out.insert(k.clone(), v.clone());
-            }
-        }
-        Ok(out)
-    }
 
     /// Replace every `<|tms_token|>` row in `text_emb` with `t_emb`.
     ///

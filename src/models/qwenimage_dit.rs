@@ -1025,10 +1025,10 @@ impl QwenImageDit {
 
         // LoRA-aware linear: do the base matmul, then add any matching LoRA
         // contribution keyed by the FULL base weight key
-        // (`transformer_blocks.{i}.{w_suffix}`). External ai-toolkit /
+        // (`transformer_blocks.{i}.{w_suffix}`). External edv2-reference /
         // OneTrainer / musubi LoRAs trained against this DiT all use that
         // exact key after the `diffusion_model.` prefix is stripped, which
-        // the generic ai-toolkit fallback in `lora.rs` handles.
+        // the generic edv2-reference fallback in `lora.rs` handles.
         //
         // Caveat: only the SPLIT-Q/K/V base path goes through this helper.
         // The fused-QKV "turbo loader" path leaves LoRA unapplied because

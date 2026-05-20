@@ -11,7 +11,7 @@
 //!   - `transformer/`        (40-layer DiT, F32 → BF16 at load)
 //!   - `text_encoder/`       (UMT5-XXL)
 //!   - `tokenizer/tokenizer.json`
-//! VAE expected at `~/.cache/huggingface/hub/models--ai-toolkit--wan2.1-vae/snapshots/*/diffusion_pytorch_model.safetensors`
+//! VAE expected at `~/.cache/huggingface/hub/models--edv2-reference--wan2.1-vae/snapshots/*/diffusion_pytorch_model.safetensors`
 //! (override with `HELIOS_VAE_PATH`).
 //!
 //! Usage:
@@ -143,7 +143,7 @@ fn parse_args() -> Result<Args> {
     // Wan 2.1 VAE — must be in the ORIGINAL Wan format (top-level conv1/conv2,
     // decoder.middle.0/1/2, decoder.upsamples.{N}, decoder.head.{0,2}).
     // Wan21VaeDecoder::load expects this format. The diffusers-style
-    // ai-toolkit/wan2.1-vae file uses different key names (decoder.conv_in,
+    // edv2-reference/wan2.1-vae file uses different key names (decoder.conv_in,
     // decoder.up_blocks.{i}.resnets.{j}, ...) and would need
     // QwenImageVaeDecoder's remap_qwenimage_to_wan21.
     let vae_path = std::env::var("HELIOS_VAE_PATH")

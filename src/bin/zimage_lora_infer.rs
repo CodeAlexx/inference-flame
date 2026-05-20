@@ -4,7 +4,7 @@
 //! attaches a `LoraStack` via `set_lora`. The base weights are NEVER
 //! mutated — at every `linear_no_bias` call the model adds
 //! `scale * up(down(x))` from any matching LoRA entries to the base output.
-//! This matches how ai-toolkit, OneTrainer, and musubi-tuner all apply
+//! This matches how edv2-reference, OneTrainer, and musubi-tuner all apply
 //! LoRAs at sampling time.
 //!
 //! Mirrors `zimage_infer` plus the merge step. Architecture rule honored:

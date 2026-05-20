@@ -17,7 +17,7 @@
 //! Slot constants (9216, 3072) are 4B-specific. 9B-tuned klein-trainer
 //! LoRAs would need the equivalent (12288, 4096) values; not yet handled.
 //!
-//! ## ai-toolkit format (Klein 4B/9B)
+//! ## edv2-reference format (Klein 4B/9B)
 //!
 //! `diffusion_model.<base_key>.lora_A.weight` / `.lora_B.weight`. The
 //! base key is just the LoRA prefix with `diffusion_model.` stripped and
@@ -25,7 +25,7 @@
 //!
 //! - `double_blocks.<i>.{img,txt}_attn.{qkv,proj}` → direct base name
 //! - `double_blocks.<i>.{img,txt}_mlp.{0,2}` → direct (klein-trainer
-//!   doesn't target mlp; ai-toolkit does)
+//!   doesn't target mlp; edv2-reference does)
 //! - `single_blocks.<j>.{linear1,linear2}` → direct (no slicing — the
 //!   LoRA `lora_B` is sized for the full matrix)
 //!
@@ -73,9 +73,9 @@ pub enum LoraFormat {
     /// Q/K/V (`attention.to_q/to_k/to_v`). Q/K/V deltas merge into the
     /// fused `attention.qkv.weight` row-range. Targets only `layers.<i>.*`.
     ZImageTrainer,
-    /// ai-toolkit (FLUX/Klein convention): `diffusion_model.<key>.lora_A.weight`
+    /// edv2-reference (FLUX/Klein convention): `diffusion_model.<key>.lora_A.weight`
     /// keys, direct base mapping with `.weight` appended, full overlay.
-    AiToolkit,
+    DiffusionModel,
     /// kohya / sd-scripts SDXL: `lora_(unet|te1|te2)_<path_with_underscores>.lora_(down|up).weight`
     /// + per-module `.alpha` scalar. UNet keys map to LDM-format base by
     /// reversing the underscore-encoding back to dotted path; only the
@@ -84,7 +84,7 @@ pub enum LoraFormat {
     KohyaSdxl,
 }
 
-/// Detect format from the LoRA key shape. ai-toolkit always uses
+/// Detect format from the LoRA key shape. edv2-reference always uses
 /// `.lora_A.weight`. Klein-trainer uses `.qkv_proj`/`.out_proj` projection
 /// names. Z-Image trainer uses `attention.to_q/to_k/to_v` and `feed_forward.w*`.
 /// kohya SDXL uses `lora_(unet|te1|te2)_…lora_(down|up).weight`.
@@ -99,7 +99,7 @@ pub fn detect_format(lora: &HashMap<String, Tensor>) -> LoraFormat {
         return LoraFormat::KohyaSdxl;
     }
     if lora.keys().any(|k| k.ends_with(".lora_A.weight") || k.ends_with(".lora_B.weight")) {
-        return LoraFormat::AiToolkit;
+        return LoraFormat::DiffusionModel;
     }
     if lora
         .keys()
@@ -138,11 +138,11 @@ fn map_prefix_klein_trainer(prefix: &str) -> Option<(String, Slot)> {
     None
 }
 
-/// ai-toolkit prefix → base key. Strip leading `diffusion_model.` if
-/// present and append `.weight`. ai-toolkit always uses full overlay.
-fn map_prefix_aitoolkit(prefix: &str) -> Option<(String, Slot)> {
+/// edv2-reference prefix → base key. Strip leading `diffusion_model.` if
+/// present and append `.weight`. edv2-reference always uses full overlay.
+fn map_prefix_diffusion_model(prefix: &str) -> Option<(String, Slot)> {
     let stripped = prefix.strip_prefix("diffusion_model.").unwrap_or(prefix);
-    // Some ai-toolkit LoRAs (PEFT-style) include `.default` as the adapter
+    // Some edv2-reference LoRAs (PEFT-style) include `.default` as the adapter
     // name suffix on the prefix. Strip it.
     let stripped = stripped.strip_suffix(".default").unwrap_or(stripped);
     Some((format!("{stripped}.weight"), Slot::Full))
@@ -169,7 +169,7 @@ fn build_kohya_unet_table(base: &HashMap<String, Tensor>) -> HashMap<String, Str
 
 /// Rewrite a kohya UNet prefix from diffusers naming to LDM naming for SDXL.
 ///
-/// Most SDXL LoRAs in the wild (sd-scripts, OneTrainer, ai-toolkit) ship
+/// Most SDXL LoRAs in the wild (sd-scripts, OneTrainer, edv2-reference) ship
 /// with diffusers-style block names (`down_blocks/up_blocks/mid_block`,
 /// `attentions/resnets/upsamplers`, ResBlock submodules `norm1/conv1/...`).
 /// Our SDXL UNet checkpoint uses LDM naming (`input_blocks/output_blocks/
@@ -426,7 +426,7 @@ pub fn merge_klein_lora(
     // Per-format suffixes for keying lora_A/lora_B pairs.
     let (suffix_a, suffix_b) = match format {
         LoraFormat::KleinTrainer | LoraFormat::ZImageTrainer => (".lora_A", ".lora_B"),
-        LoraFormat::AiToolkit => (".lora_A.weight", ".lora_B.weight"),
+        LoraFormat::DiffusionModel => (".lora_A.weight", ".lora_B.weight"),
         LoraFormat::KohyaSdxl => (".lora_down.weight", ".lora_up.weight"),
     };
 
@@ -464,7 +464,7 @@ pub fn merge_klein_lora(
         let mapped = match format {
             LoraFormat::KleinTrainer => map_prefix_klein_trainer(prefix),
             LoraFormat::ZImageTrainer => map_prefix_zimage_trainer(prefix),
-            LoraFormat::AiToolkit => map_prefix_aitoolkit(prefix),
+            LoraFormat::DiffusionModel => map_prefix_diffusion_model(prefix),
             LoraFormat::KohyaSdxl => {
                 if prefix.starts_with("lora_te1_") || prefix.starts_with("lora_te2_") {
                     // Text-encoder LoRAs aren't merged into the UNet base;
