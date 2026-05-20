@@ -4541,6 +4541,51 @@ impl Lance {
         mrope: &MropeFreqs,
         cache: &mut KvCache,
     ) -> Result<Tensor> {
+        // Backwards-compatible entry: expects scalar timestep `[1]`, broadcasts
+        // to `[L_vae]`, then defers to the inner per-position implementation.
+        let t_dims = timestep.shape().dims();
+        if t_dims.len() != 1 || t_dims[0] != 1 {
+            return Err(Error::InvalidInput(format!(
+                "Lance::gen_step_t2v: expected scalar timestep [1], got {t_dims:?}"
+            )));
+        }
+        let ldims = latent.shape().dims().to_vec();
+        if ldims.len() != 5 {
+            return Err(Error::InvalidInput(format!(
+                "Lance::gen_step_t2v: expected 5D latent [B, C, T, H, W], got {ldims:?}"
+            )));
+        }
+        let l_vae = ldims[2] * ldims[3] * ldims[4];
+        let t_scalar = timestep.to_dtype(DType::F32)?.to_vec()?[0];
+        let t_per_vae = Tensor::from_vec(
+            vec![t_scalar; l_vae],
+            Shape::from_dims(&[l_vae]),
+            self.config.device.clone(),
+        )?;
+        let t_per_vae = if t_per_vae.dtype() != self.config.dtype {
+            t_per_vae.to_dtype(self.config.dtype)?
+        } else {
+            t_per_vae
+        };
+        self.gen_step_t2v_with_per_token_timestep(latent, &t_per_vae, mrope, cache)
+    }
+
+    /// Per-position-timestep variant of `gen_step_t2v`. Accepts a `[L_vae]`
+    /// timestep tensor (one value per VAE latent token) instead of a scalar.
+    ///
+    /// Used by the I2V denoise loop, which sets the first `H_lat * W_lat`
+    /// (frame-0) positions to `0.0` (no noise to remove from the conditioning
+    /// frame) and the remaining positions to the current step's `t`.
+    ///
+    /// `gen_step_t2v` is a thin wrapper around this function that broadcasts a
+    /// scalar `[1]` timestep into a uniform `[L_vae]` tensor.
+    pub fn gen_step_t2v_with_per_token_timestep(
+        &self,
+        latent: &Tensor,
+        timestep_per_vae: &Tensor,
+        mrope: &MropeFreqs,
+        cache: &mut KvCache,
+    ) -> Result<Tensor> {
         // ---- Validate input latent shape: [B=1, C, T, H, W]. ----
         let ldims = latent.shape().dims().to_vec();
         if ldims.len() != 5 {
@@ -4576,21 +4621,17 @@ impl Lance {
         // ---- 2. vae2llm: [1, L_vae, C] → [1, L_vae, hidden]. ----
         let mut h_vae = self.vae2llm.forward(&x_patch_3d)?;
 
-        // ---- 3. Time embedding (vae-only). ----
-        let t_dims = timestep.shape().dims();
-        if t_dims.len() != 1 || t_dims[0] != 1 {
+        // ---- 3. Time embedding (vae-only) — per-position. ----
+        let t_dims = timestep_per_vae.shape().dims();
+        if t_dims.len() != 1 || t_dims[0] != l_vae {
             return Err(Error::InvalidInput(format!(
-                "Lance::gen_step_t2v: expected scalar timestep [1], got {t_dims:?}"
+                "Lance::gen_step_t2v_with_per_token_timestep: expected [L_vae={l_vae}] timestep, got {t_dims:?}"
             )));
         }
-        let t_scalar = timestep.to_dtype(DType::F32)?.to_vec()?[0];
-        let t_vec = vec![t_scalar; l_vae];
-        let t_tensor_f32 =
-            Tensor::from_vec(t_vec, Shape::from_dims(&[l_vae]), self.config.device.clone())?;
-        let t_tensor = if t_tensor_f32.dtype() != self.config.dtype {
-            t_tensor_f32.to_dtype(self.config.dtype)?
+        let t_tensor = if timestep_per_vae.dtype() != self.config.dtype {
+            timestep_per_vae.to_dtype(self.config.dtype)?
         } else {
-            t_tensor_f32
+            timestep_per_vae.clone()
         };
         let time_emb = self.time_embedder.forward(&t_tensor)?; // [L_vae, hidden]
         let time_emb_3d = Self::to_3d(&time_emb)?;
@@ -6242,6 +6283,199 @@ impl Lance {
         self.denoise_loop_t2v(
             &cond_cache,
             &uncond_cache,
+            initial_noise,
+            mrope,
+            self.config.num_inference_steps,
+            self.config.timestep_shift,
+            self.config.cfg_text_scale,
+        )
+    }
+
+    /// I2V denoise loop. Internally mirrors `denoise_loop_t2v` but:
+    ///   1. Splices the encoded reference image latent into the first T_lat=1
+    ///      frame of the working tensor BEFORE the loop starts.
+    ///   2. Builds a per-position timestep vector at every step: zeros for the
+    ///      conditioning-frame positions (= first H_lat*W_lat tokens in the
+    ///      row-major (T,H,W) layout), current-step `t` for the rest.
+    ///   3. Re-splices the conditioning-frame positions back to `ref_latent`
+    ///      after each Euler step, so the model never advances the conditioning
+    ///      frame even though the velocity field is computed over all tokens.
+    ///
+    /// Mirrors Lance Python's internal `vae_condition` / `curr_padded_latent`
+    /// mechanism (see `lance.py:595-596` for the latent splice and
+    /// `lance.py:648` for the per-position timestep mask).
+    pub fn denoise_loop_i2v(
+        &self,
+        cond_cache: &KvCache,
+        uncond_cache: &KvCache,
+        ref_latent: &Tensor,
+        initial_noise: &Tensor,
+        mrope: &MropeFreqs,
+        num_steps: usize,
+        shift: f32,
+        cfg_scale: f32,
+    ) -> Result<Tensor> {
+        if num_steps == 0 {
+            return Err(Error::InvalidInput(
+                "Lance::denoise_loop_i2v: num_steps must be > 0".into(),
+            ));
+        }
+
+        // ---- Validate shapes. ----
+        let ndims = initial_noise.shape().dims().to_vec();
+        if ndims.len() != 5 {
+            return Err(Error::InvalidInput(format!(
+                "Lance::denoise_loop_i2v: initial_noise must be 5D [B,C,T,H,W], got {ndims:?}"
+            )));
+        }
+        let (b, c, t_lat, h_lat, w_lat) =
+            (ndims[0], ndims[1], ndims[2], ndims[3], ndims[4]);
+        if b != 1 {
+            return Err(Error::InvalidInput(format!(
+                "Lance::denoise_loop_i2v: only B=1 supported, got B={b}"
+            )));
+        }
+        let rdims = ref_latent.shape().dims().to_vec();
+        if rdims.len() != 5
+            || rdims[0] != 1
+            || rdims[1] != c
+            || rdims[2] != 1
+            || rdims[3] != h_lat
+            || rdims[4] != w_lat
+        {
+            return Err(Error::InvalidInput(format!(
+                "Lance::denoise_loop_i2v: ref_latent must be [1, {c}, 1, {h_lat}, {w_lat}], got {rdims:?}"
+            )));
+        }
+        if t_lat < 1 {
+            return Err(Error::InvalidInput(
+                "Lance::denoise_loop_i2v: T_lat must be >= 1".into(),
+            ));
+        }
+
+        let timesteps = timestep_schedule(num_steps, shift, &self.config.device)?;
+        let timesteps_host: Vec<f32> = timesteps.to_dtype(DType::F32)?.to_vec()?;
+        if timesteps_host.len() != num_steps + 1 {
+            return Err(Error::InvalidInput(format!(
+                "Lance::denoise_loop_i2v: timestep_schedule returned {} values, expected {}",
+                timesteps_host.len(),
+                num_steps + 1
+            )));
+        }
+        let dts: Vec<f32> = (0..num_steps)
+            .map(|i| timesteps_host[i] - timesteps_host[i + 1])
+            .collect();
+
+        let mut cond_cache_local = cond_cache.clone();
+        let mut uncond_cache_local = uncond_cache.clone();
+
+        // Cast ref_latent to the working dtype once, up-front.
+        let ref_latent_dt = if ref_latent.dtype() != self.config.dtype {
+            ref_latent.to_dtype(self.config.dtype)?
+        } else {
+            ref_latent.clone()
+        };
+
+        // ---- Initial splice: replace frame 0 of initial_noise with ref_latent. ----
+        let init_dt = if initial_noise.dtype() != self.config.dtype {
+            initial_noise.to_dtype(self.config.dtype)?
+        } else {
+            initial_noise.clone()
+        };
+        // x_t[:, :, 0:1, :, :] = ref_latent
+        let mut x_t = if t_lat == 1 {
+            // Pathological case: T_lat = 1 → whole tensor IS the conditioning
+            // frame. Nothing to denoise; return ref_latent verbatim.
+            return Ok(ref_latent_dt);
+        } else {
+            let rest = init_dt.narrow(2, 1, t_lat - 1)?;
+            Tensor::cat(&[&ref_latent_dt, &rest], 2)?
+        };
+
+        // ---- Build the per-position timestep template. ----
+        // L_vae = T_lat * H_lat * W_lat in row-major (T, H, W) order. The
+        // conditioning frame occupies the first H_lat * W_lat positions.
+        let l_vae = t_lat * h_lat * w_lat;
+        let l_cond = h_lat * w_lat;
+
+        for i in 0..num_steps {
+            let t = timesteps_host[i];
+
+            // Per-position timestep: zeros for cond-frame, t for the rest.
+            let mut t_vec = vec![t; l_vae];
+            for slot in t_vec.iter_mut().take(l_cond) {
+                *slot = 0.0;
+            }
+            let t_per_vae = Tensor::from_vec(
+                t_vec,
+                Shape::from_dims(&[l_vae]),
+                self.config.device.clone(),
+            )?;
+            let t_per_vae = if t_per_vae.dtype() != self.config.dtype {
+                t_per_vae.to_dtype(self.config.dtype)?
+            } else {
+                t_per_vae
+            };
+
+            let v_cond = self.gen_step_t2v_with_per_token_timestep(
+                &x_t,
+                &t_per_vae,
+                mrope,
+                &mut cond_cache_local,
+            )?;
+            let v_uncond = self.gen_step_t2v_with_per_token_timestep(
+                &x_t,
+                &t_per_vae,
+                mrope,
+                &mut uncond_cache_local,
+            )?;
+
+            // Same CFG + renorm as t2v.
+            let v_cfg_pre = combine_cfg(&v_uncond, &v_cond, cfg_scale)?;
+            let v = cfg_renorm(&v_cfg_pre, &v_cond, 0.0, 1.0)?;
+
+            // Standard Euler step over the full tensor.
+            let x_next_full = denoise_step(&x_t, &v, dts[i])?;
+
+            // Re-splice: pin the conditioning frame back to ref_latent so it
+            // never drifts. (LTX2 does the same — `ltx2_i2v_gen.rs:399-412`.)
+            let rest_new = x_next_full.narrow(2, 1, t_lat - 1)?;
+            x_t = Tensor::cat(&[&ref_latent_dt, &rest_new], 2)?;
+
+            log::info!(
+                "[Lance denoise_i2v] step {}/{}, t={:.4}, dt={:.4}",
+                i + 1,
+                num_steps,
+                t,
+                dts[i]
+            );
+        }
+        Ok(x_t)
+    }
+
+    /// One-call I2V entry. Mirrors `t2v_with_cfg` but takes an extra
+    /// `ref_latent` argument — a VAE-encoded single reference frame of shape
+    /// `[1, C, 1, H_lat, W_lat]`. The reference frame is spliced into the
+    /// first temporal slot of `initial_noise` and re-pinned after each step.
+    ///
+    /// See `denoise_loop_i2v` for the full splice / per-position timestep
+    /// recipe.
+    pub fn i2v_with_cfg(
+        &self,
+        cond_tokens: &Tensor,
+        uncond_tokens: &Tensor,
+        ref_latent: &Tensor,
+        initial_noise: &Tensor,
+        mrope: &MropeFreqs,
+    ) -> Result<Tensor> {
+        let mut cond_cache = self.new_kv_cache();
+        self.prefill_text_context(cond_tokens, mrope, &mut cond_cache)?;
+        let mut uncond_cache = self.new_kv_cache();
+        self.prefill_text_context(uncond_tokens, mrope, &mut uncond_cache)?;
+        self.denoise_loop_i2v(
+            &cond_cache,
+            &uncond_cache,
+            ref_latent,
             initial_noise,
             mrope,
             self.config.num_inference_steps,

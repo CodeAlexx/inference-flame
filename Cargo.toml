@@ -519,6 +519,10 @@ name = "lance_t2v"
 path = "src/bin/lance_t2v.rs"
 
 [[bin]]
+name = "lance_i2v_gen"
+path = "src/bin/lance_i2v_gen.rs"
+
+[[bin]]
 name = "parity_lance"
 path = "src/bin/parity_lance.rs"
 
