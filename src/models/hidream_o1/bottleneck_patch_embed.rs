@@ -22,7 +22,7 @@ use flame_core::nn::Linear;
 use flame_core::{CudaDevice, DType, Result, Shape, Tensor};
 
 use super::HiDreamO1Config;
-use super::lora::{add_lora_residual, LoraRegistry};
+use super::lora::LoraRegistry;
 
 /// Two-stage patch embedder: `Linear(P*P*C → bottleneck) → Linear(bottleneck → hidden)`.
 ///
@@ -43,8 +43,8 @@ impl BottleneckPatchEmbed {
     /// `Linear::copy_weight_from` / `copy_bias_from` from the safetensors.
     pub fn new(config: &HiDreamO1Config, device: &Arc<CudaDevice>) -> Result<Self> {
         let in_dim = config.patch_size * config.patch_size * config.patch_in_channels;
-        let proj1 = Linear::new(in_dim, config.bottleneck_dim, /*bias=*/ false, device)?;
-        let proj2 = Linear::new(config.bottleneck_dim, config.hidden_size, /*bias=*/ true, device)?;
+        let proj1 = Linear::new_zeroed(in_dim, config.bottleneck_dim, /*bias=*/ false, device)?;
+        let proj2 = Linear::new_zeroed(config.bottleneck_dim, config.hidden_size, /*bias=*/ true, device)?;
         Ok(Self {
             proj1,
             proj2,
@@ -56,21 +56,48 @@ impl BottleneckPatchEmbed {
     /// Forward: `[B, L, P*P*C] → [B, L, hidden_size]`.
     /// Mirrors `qwen3_vl_transformers.py:958-959`.
     pub fn forward(&self, patches: &Tensor) -> Result<Tensor> {
-        let h = self.proj1.forward(patches)?;
-        self.proj2.forward(&h)
+        self.forward_lora(patches, None)
     }
 
     /// LoRA-aware forward for edv2-reference O1's non-decoder target set.
     pub fn forward_lora(&self, patches: &Tensor, lora: Option<&LoraRegistry>) -> Result<Tensor> {
-        let h = self.proj1.forward(patches)?;
         let h = match lora.and_then(|r| r.get_global("x_embedder.proj1")) {
-            Some(adapter) => add_lora_residual(h, patches, adapter)?,
-            None => h,
+            Some(adapter) => {
+                let a = adapter.a_tensor()?;
+                let b = adapter.b_tensor()?;
+                flame_core::ops::fused_inference::fused_linear3d_native_lora(
+                    patches,
+                    &self.proj1.weight,
+                    self.proj1.bias.as_ref(),
+                    Some(&a),
+                    Some(&b),
+                    adapter.scale,
+                )?
+            }
+            None => flame_core::ops::fused_inference::fused_linear3d_native_pytorch_parity(
+                patches,
+                &self.proj1.weight,
+                self.proj1.bias.as_ref(),
+            )?,
         };
-        let out = self.proj2.forward(&h)?;
         match lora.and_then(|r| r.get_global("x_embedder.proj2")) {
-            Some(adapter) => add_lora_residual(out, &h, adapter),
-            None => Ok(out),
+            Some(adapter) => {
+                let a = adapter.a_tensor()?;
+                let b = adapter.b_tensor()?;
+                flame_core::ops::fused_inference::fused_linear3d_native_lora(
+                    &h,
+                    &self.proj2.weight,
+                    self.proj2.bias.as_ref(),
+                    Some(&a),
+                    Some(&b),
+                    adapter.scale,
+                )
+            }
+            None => flame_core::ops::fused_inference::fused_linear3d_native_pytorch_parity(
+                &h,
+                &self.proj2.weight,
+                self.proj2.bias.as_ref(),
+            ),
         }
     }
 

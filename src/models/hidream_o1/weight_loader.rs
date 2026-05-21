@@ -284,6 +284,145 @@ impl HiDreamO1WeightLoader {
         Ok(out)
     }
 
+    /// Load only resident HiDream-O1 tensors. Used by parity tools that need
+    /// to inspect the layer-0 input assembly without paying the full decoder
+    /// offloader startup cost.
+    pub fn load_resident_weights_bf16(
+        &self,
+        config: &HiDreamO1Config,
+        device: &Arc<CudaDevice>,
+    ) -> AnyResult<HashMap<String, Tensor>> {
+        let resident_list = self.resident_keys(config);
+        let resident_set: HashSet<String> = resident_list.iter().cloned().collect();
+        self.load_resident_cpu_bf16(&resident_set, device)
+    }
+
+    /// Load a caller-selected resident subset with the same CPU-side BF16
+    /// conversion as the full resident loader.
+    pub fn load_selected_resident_weights_bf16(
+        &self,
+        keys: &[&str],
+        device: &Arc<CudaDevice>,
+    ) -> AnyResult<HashMap<String, Tensor>> {
+        let wanted: HashSet<String> = keys.iter().map(|k| (*k).to_string()).collect();
+        let mut by_shard: HashMap<String, Vec<String>> = HashMap::new();
+        for key in &wanted {
+            let shard = self
+                .shard_map
+                .get(key)
+                .ok_or_else(|| anyhow!("model index missing selected resident key: {key}"))?;
+            by_shard.entry(shard.clone()).or_default().push(key.clone());
+        }
+
+        let mut out: HashMap<String, Tensor> = HashMap::with_capacity(wanted.len());
+        for (shard_name, shard_keys) in by_shard {
+            let shard_path = self.model_dir.join(&shard_name);
+            let file = std::fs::File::open(&shard_path)
+                .with_context(|| format!("open {}", shard_path.display()))?;
+            let mmap = unsafe { memmap2::Mmap::map(&file) }
+                .with_context(|| format!("mmap {}", shard_path.display()))?;
+            if mmap.len() < 8 {
+                bail!("{}: shard too small for safetensors", shard_path.display());
+            }
+            let header_size = u64::from_le_bytes(mmap[..8].try_into().unwrap()) as usize;
+            let header_end = 8 + header_size;
+            let data_start = header_end;
+            let metadata: serde_json::Value = serde_json::from_slice(&mmap[8..header_end])
+                .with_context(|| format!("parse safetensors header in {}", shard_path.display()))?;
+            let metadata_obj = metadata
+                .as_object()
+                .ok_or_else(|| anyhow!("{}: invalid metadata format", shard_path.display()))?;
+
+            for name in shard_keys {
+                let info = metadata_obj
+                    .get(&name)
+                    .ok_or_else(|| anyhow!("{}: missing tensor {name}", shard_path.display()))?;
+                let shape: Vec<usize> = info["shape"]
+                    .as_array()
+                    .ok_or_else(|| anyhow!("missing shape for {name}"))?
+                    .iter()
+                    .map(|v| v.as_u64().unwrap_or(0) as usize)
+                    .collect();
+                let num_elems: usize = shape.iter().product();
+                let offsets = info["data_offsets"]
+                    .as_array()
+                    .ok_or_else(|| anyhow!("missing data_offsets for {name}"))?;
+                let start = data_start
+                    + offsets.first().and_then(|v| v.as_u64())
+                        .ok_or_else(|| anyhow!("bad start offset for {name}"))? as usize;
+                let end = data_start
+                    + offsets.get(1).and_then(|v| v.as_u64())
+                        .ok_or_else(|| anyhow!("bad end offset for {name}"))? as usize;
+                let dtype_str = info["dtype"].as_str().unwrap_or("F32");
+                let raw = &mmap[start..end];
+
+                let tensor = match dtype_str {
+                    "F32" => {
+                        if raw.len() != num_elems * 4 {
+                            bail!("{name}: F32 byte length mismatch");
+                        }
+                        let mut bf16_u16 = vec![0u16; num_elems];
+                        for (v, chunk) in bf16_u16.iter_mut().zip(raw.chunks_exact(4)) {
+                            let f =
+                                f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                            *v = half::bf16::from_f32(f).to_bits();
+                        }
+                        let mut tensor = Tensor::zeros_dtype(
+                            Shape::from_dims(&shape),
+                            DType::BF16,
+                            device.clone(),
+                        )?;
+                        tensor.copy_from_bf16_slice(&bf16_u16)?;
+                        tensor
+                    }
+                    "BF16" => {
+                        if raw.len() != num_elems * 2 {
+                            bail!("{name}: BF16 byte length mismatch");
+                        }
+                        let mut bits = vec![0u16; num_elems];
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                raw.as_ptr(),
+                                bits.as_mut_ptr() as *mut u8,
+                                raw.len(),
+                            );
+                        }
+                        let mut tensor = Tensor::zeros_dtype(
+                            Shape::from_dims(&shape),
+                            DType::BF16,
+                            device.clone(),
+                        )?;
+                        tensor.copy_from_bf16_slice(&bits)?;
+                        tensor
+                    }
+                    "F16" => {
+                        let mut bf16_u16 = vec![0u16; num_elems];
+                        for (v, chunk) in bf16_u16.iter_mut().zip(raw.chunks_exact(2)) {
+                            let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
+                            *v = half::bf16::from_f32(half::f16::from_bits(bits).to_f32())
+                                .to_bits();
+                        }
+                        let mut tensor = Tensor::zeros_dtype(
+                            Shape::from_dims(&shape),
+                            DType::BF16,
+                            device.clone(),
+                        )?;
+                        tensor.copy_from_bf16_slice(&bf16_u16)?;
+                        tensor
+                    }
+                    other => bail!("{name}: unsupported dtype {other}"),
+                };
+                out.insert(name, tensor);
+            }
+        }
+
+        let missing: Vec<&String> = wanted.iter().filter(|k| !out.contains_key(k.as_str())).collect();
+        if !missing.is_empty() {
+            bail!("selected resident loader missing keys: {:?}", missing);
+        }
+        Ok(out)
+    }
+
     /// Load the entire HiDream-O1 model from sharded safetensors.
     ///
     /// Vision-tower and `lm_head` keys are intentionally skipped — they're

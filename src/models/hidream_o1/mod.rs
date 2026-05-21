@@ -27,6 +27,7 @@ pub mod mrope;
 pub mod pipeline;
 pub mod scheduler;
 pub mod timestep_embedder;
+pub mod trap;
 pub mod weight_loader;
 
 pub use bottleneck_patch_embed::BottleneckPatchEmbed;

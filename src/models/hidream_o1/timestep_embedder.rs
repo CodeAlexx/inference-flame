@@ -41,7 +41,7 @@ use flame_core::nn::Linear;
 use flame_core::{CudaDevice, DType, Error, Result, Shape, Tensor};
 
 use super::HiDreamO1Config;
-use super::lora::{add_lora_residual, LoraRegistry};
+use super::lora::LoraRegistry;
 
 /// 2-layer MLP that turns a scalar timestep into a `[B, hidden_size]` vector,
 /// which is then scattered into the sequence at every `<|tms_token|>` slot
@@ -61,13 +61,13 @@ pub struct TimestepEmbedder {
 
 impl TimestepEmbedder {
     pub fn new(config: &HiDreamO1Config, device: &Arc<CudaDevice>) -> Result<Self> {
-        let mlp_in = Linear::new(
+        let mlp_in = Linear::new_zeroed(
             config.timestep_freq_dim,
             config.hidden_size,
             /*bias=*/ true,
             device,
         )?;
-        let mlp_out = Linear::new(
+        let mlp_out = Linear::new_zeroed(
             config.hidden_size,
             config.hidden_size,
             /*bias=*/ true,
@@ -104,17 +104,50 @@ impl TimestepEmbedder {
             1000.0,
             &self.device,
         )?;
-        let h = self.mlp_in.forward(&t_freq)?;
-        let h = match lora.and_then(|r| r.get_global("t_embedder1.mlp.0")) {
-            Some(adapter) => add_lora_residual(h, &t_freq, adapter)?,
-            None => h,
+        let batch = t_freq.shape().dims()[0];
+        let t_freq_3d = t_freq.reshape(&[batch, 1, self.frequency_embedding_size])?;
+        let h_3d = match lora.and_then(|r| r.get_global("t_embedder1.mlp.0")) {
+            Some(adapter) => {
+                let a = adapter.a_tensor()?;
+                let b = adapter.b_tensor()?;
+                flame_core::ops::fused_inference::fused_linear3d_native_lora(
+                    &t_freq_3d,
+                    &self.mlp_in.weight,
+                    self.mlp_in.bias.as_ref(),
+                    Some(&a),
+                    Some(&b),
+                    adapter.scale,
+                )?
+            }
+            None => flame_core::ops::fused_inference::fused_linear3d_native_pytorch_parity(
+                &t_freq_3d,
+                &self.mlp_in.weight,
+                self.mlp_in.bias.as_ref(),
+            )?,
         };
+        let h = h_3d.reshape(&[batch, self.hidden_size])?;
         let h = h.silu()?;
-        let out = self.mlp_out.forward(&h)?;
-        match lora.and_then(|r| r.get_global("t_embedder1.mlp.2")) {
-            Some(adapter) => add_lora_residual(out, &h, adapter),
-            None => Ok(out),
-        }
+        let h_3d = h.reshape(&[batch, 1, self.hidden_size])?;
+        let out_3d = match lora.and_then(|r| r.get_global("t_embedder1.mlp.2")) {
+            Some(adapter) => {
+                let a = adapter.a_tensor()?;
+                let b = adapter.b_tensor()?;
+                flame_core::ops::fused_inference::fused_linear3d_native_lora(
+                    &h_3d,
+                    &self.mlp_out.weight,
+                    self.mlp_out.bias.as_ref(),
+                    Some(&a),
+                    Some(&b),
+                    adapter.scale,
+                )?
+            }
+            None => flame_core::ops::fused_inference::fused_linear3d_native_pytorch_parity(
+                &h_3d,
+                &self.mlp_out.weight,
+                self.mlp_out.bias.as_ref(),
+            )?,
+        };
+        out_3d.reshape(&[batch, self.hidden_size])
     }
 
     /// Sinusoidal timestep embedding.

@@ -591,17 +591,15 @@ impl HiDreamO1Model {
         };
 
         let tms = self.config.tms_token_id as f32;
-        let mut keep_text_data = vec![1.0f32; b * s_text * h];
-        let mut selector_data = vec![0.0f32; b * s_text * b];
+        let mut tms_mask_data = vec![0.0f32; b * s_text * h];
         let mut any_hit = false;
         for bi in 0..b {
             for si in 0..s_text {
                 if id_host_f32[bi * s_text + si] == tms {
                     let row_off = (bi * s_text + si) * h;
                     for d in 0..h {
-                        keep_text_data[row_off + d] = 0.0;
+                        tms_mask_data[row_off + d] = 1.0;
                     }
-                    selector_data[(bi * s_text + si) * b + bi] = 1.0;
                     any_hit = true;
                 }
             }
@@ -614,15 +612,9 @@ impl HiDreamO1Model {
             return Ok(text_emb.clone());
         }
 
-        let keep_text = Tensor::from_vec_dtype(
-            keep_text_data,
-            Shape::from_dims(&[b * s_text, h]),
-            self.device.clone(),
-            DType::BF16,
-        )?;
-        let selector = Tensor::from_vec_dtype(
-            selector_data,
-            Shape::from_dims(&[b * s_text, b]),
+        let tms_mask = Tensor::from_vec_dtype(
+            tms_mask_data,
+            Shape::from_dims(&[b, s_text, h]),
             self.device.clone(),
             DType::BF16,
         )?;
@@ -635,14 +627,10 @@ impl HiDreamO1Model {
             )));
         }
 
-        // Use matmul, not where/broadcast, so autograd reaches t_emb and the
-        // timestep MLP LoRA adapters. `selector` places each batch row's
-        // t_emb only at its <|tms_token|> row; `keep_text` zeros the original
-        // embedding at that row.
-        let text_flat = text_emb.reshape(&[b * s_text, h])?;
-        let text_kept = text_flat.mul(&keep_text)?;
-        let t_rows = selector.matmul(t_emb)?;
-        text_kept.add(&t_rows)?.reshape(&[b, s_text, h])
+        let t_emb_expanded = t_emb
+            .reshape(&[b, 1, h])?
+            .broadcast_to(&Shape::from_dims(&[b, s_text, h]))?;
+        Tensor::where_mask(&tms_mask, &t_emb_expanded, text_emb)
     }
 
     fn ar_prefix_len(b: usize, s_total: usize, token_types_bin: &Tensor) -> Result<usize> {

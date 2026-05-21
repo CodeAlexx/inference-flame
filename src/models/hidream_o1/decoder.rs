@@ -408,6 +408,25 @@ pub fn decoder_forward_with_weights_lora(
     log_mem("after_k_proj");
     let v = lora_linear(&normed, v_w, v_b, "self_attn.v_proj")?;
     log_mem("after_v_proj");
+    // Soul.md trap (layer 0, V-path): record v_proj's output ID. With
+    // gradient checkpointing, the *first* forward runs no-autograd and the
+    // ID we capture there isn't on any tape. The ID we want is from the
+    // *recompute* forward (autograd enabled). Re-record on every call so
+    // last-writer-wins gives us the recompute ID, and on recompute also push
+    // it into the additive retain set so the sub-tape backward retains its
+    // grad. (Outer-tape retain snapshot has already fired by this point.)
+    // Soul.md trap: probe the LAST decoder layer. Layer 35's o_proj LoRA-B
+    // grad is cos≈0.999 (clean upstream signal) while q/k/v_proj LoRA-B
+    // grads are cos≈0.05 (corrupt downstream output) — so at layer 35 we
+    // see the bug fire locally without 35 layers of cascade noise.
+    if layer_idx == cfg.num_layers - 1 && super::trap::is_armed() {
+        super::trap::record_probe("v_proj_out", v.id());
+        if flame_core::autograd::AutogradContext::is_checkpoint_recompute() {
+            let mut s = std::collections::HashSet::new();
+            s.insert(v.id());
+            flame_core::autograd::AutogradContext::retain_intermediate_grads_add(s);
+        }
+    }
 
     // Reshape to [B, H, S, D] / [B, Hkv, S, D].
     let q = q.reshape(&[b, n, h, d])?.permute(&[0, 2, 1, 3])?;
@@ -437,6 +456,21 @@ pub fn decoder_forward_with_weights_lora(
     let k = repeat_kv(&k, n_rep)?;
     let v = repeat_kv(&v, n_rep)?;
     log_mem("after_repeat_kv");
+    // Soul.md trap (layer 0): probe V after repeat_kv = SDPA's V input.
+    // Splits the search between SDPA bwd (above) and repeat_kv+reshape bwd
+    // (below) for the V LoRA-B grad corruption.
+    // Soul.md trap: probe the LAST decoder layer. Layer 35's o_proj LoRA-B
+    // grad is cos≈0.999 (clean upstream signal) while q/k/v_proj LoRA-B
+    // grads are cos≈0.05 (corrupt downstream output) — so at layer 35 we
+    // see the bug fire locally without 35 layers of cascade noise.
+    if layer_idx == cfg.num_layers - 1 && super::trap::is_armed() {
+        super::trap::record_probe("v_post_repeat_kv", v.id());
+        if flame_core::autograd::AutogradContext::is_checkpoint_recompute() {
+            let mut s = std::collections::HashSet::new();
+            s.insert(v.id());
+            flame_core::autograd::AutogradContext::retain_intermediate_grads_add(s);
+        }
+    }
 
     // edv2-reference's HiDream-O1 `use_flash_attn=True` path avoids a 4D mixed
     // mask. It runs causal attention on the AR/text prefix, full unmasked
@@ -448,6 +482,21 @@ pub fn decoder_forward_with_weights_lora(
         _ => chunked_sdpa(&q, &k, &v, attention_mask)?,
     };
     log_mem("after_sdpa");
+    // Soul.md trap (layer 0): record SDPA-output ID. Same checkpoint dance
+    // as v_proj_out above — register into the additive retain set during
+    // recompute so the sub-tape backward keeps its grad.
+    // Soul.md trap: probe the LAST decoder layer. Layer 35's o_proj LoRA-B
+    // grad is cos≈0.999 (clean upstream signal) while q/k/v_proj LoRA-B
+    // grads are cos≈0.05 (corrupt downstream output) — so at layer 35 we
+    // see the bug fire locally without 35 layers of cascade noise.
+    if layer_idx == cfg.num_layers - 1 && super::trap::is_armed() {
+        super::trap::record_probe("attn_out", attn_out.id());
+        if flame_core::autograd::AutogradContext::is_checkpoint_recompute() {
+            let mut s = std::collections::HashSet::new();
+            s.insert(attn_out.id());
+            flame_core::autograd::AutogradContext::retain_intermediate_grads_add(s);
+        }
+    }
     let attn_out = attn_out
         .permute(&[0, 2, 1, 3])?
         .contiguous()?

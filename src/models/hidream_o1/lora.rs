@@ -14,7 +14,7 @@
 //!
 //! ## Initialization (PEFT convention)
 //!
-//! - `A` (lora_a): `[rank, Cin]`, small Gaussian (std 1e-4).
+//! - `A` (lora_a): `[rank, Cin]`, Kaiming uniform like ai-toolkit/PEFT.
 //! - `B` (lora_b): `[Cout, rank]`, zeros.
 //! - `scale = alpha / rank` (set per-adapter).
 //!
@@ -24,9 +24,8 @@
 //!
 //! ## Target modules
 //!
-//! The transformer-only parity target is the 7 decoder linears in each
-//! language layer. EDV2 enables the O1 pixel/timestep heads by default because
-//! known-good public O1 LoRAs include them:
+//! The ai-toolkit/public O1 target is the 7 decoder linears in each language
+//! layer plus the O1 pixel/timestep heads:
 //! `x_embedder.{proj1,proj2}`, `t_embedder1.mlp.{0,2}`, `final_layer2.linear`.
 //!
 //! Defaults: `rank = 32`, `alpha = 32` — matches
@@ -47,6 +46,7 @@
 //! `head_dim=128`). Use `default_target_suffixes()` to enumerate them.
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -456,10 +456,9 @@ impl LoraRegistry {
     ///   - Short:
     ///     `layers.{i}.{suffix}.lora_A.weight` (or `.lora_A.default.weight`)
     ///
-    /// `rank`/`alpha` are inferred from the first matching shard's `A` tensor
-    /// (`A: [rank, Cin]`) and used to set the per-adapter `scale = alpha/rank`.
-    /// `alpha` defaults to `rank as f32` if the saver did not stamp it (we don't
-    /// have a header convention yet — this matches PEFT's default).
+    /// `rank` is inferred from the first matching shard's `A` tensor
+    /// (`A: [rank, Cin]`). `alpha` is read from safetensors metadata
+    /// (`ss_network_alpha`) and falls back to `rank` for header-less files.
     pub fn from_safetensors(
         path: &Path,
         cfg: &HiDreamO1Config,
@@ -482,6 +481,7 @@ impl LoraRegistry {
                 )));
             }
         }
+        let metadata = read_safetensors_metadata(path)?;
         let raw = flame_core::serialization::load_file(path, device)?;
         // Accept edv2-reference O1 (`diffusion_model.*.lora_A.weight`), our older
         // PEFT-canonical wrapper (`base_model.model.model.language_model.*`),
@@ -552,7 +552,12 @@ impl LoraRegistry {
                 path.display()
             ))
         })?;
-        let alpha = rank as f32; // header-less default; same as PEFT
+        let alpha = metadata
+            .get("ss_network_alpha")
+            .or_else(|| metadata.get("network_alpha"))
+            .and_then(|v| v.parse::<f32>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or(rank as f32);
         let scale = alpha / (rank as f32);
         for v in adapters.values_mut() {
             v.scale = scale;
@@ -662,6 +667,47 @@ fn normalize_loaded_key(prefix_key: &str, old_prefix: &str) -> Option<String> {
         || key == "t_embedder1.mlp.2"
         || key == "final_layer2.linear";
     supported.then(|| key.to_string())
+}
+
+fn read_safetensors_metadata(path: &Path) -> Result<HashMap<String, String>> {
+    let mut file = std::fs::File::open(path).map_err(|e| {
+        Error::InvalidInput(format!(
+            "read_safetensors_metadata: open {}: {e}",
+            path.display()
+        ))
+    })?;
+    let mut header_len_bytes = [0u8; 8];
+    file.read_exact(&mut header_len_bytes).map_err(|e| {
+        Error::InvalidInput(format!(
+            "read_safetensors_metadata: read header len {}: {e}",
+            path.display()
+        ))
+    })?;
+    let header_len = u64::from_le_bytes(header_len_bytes) as usize;
+    let mut header = vec![0u8; header_len];
+    file.read_exact(&mut header).map_err(|e| {
+        Error::InvalidInput(format!(
+            "read_safetensors_metadata: read header {}: {e}",
+            path.display()
+        ))
+    })?;
+    let json: serde_json::Value = serde_json::from_slice(&header).map_err(|e| {
+        Error::InvalidInput(format!(
+            "read_safetensors_metadata: parse header {}: {e}",
+            path.display()
+        ))
+    })?;
+    let mut out = HashMap::new();
+    if let Some(meta) = json.get("__metadata__").and_then(|v| v.as_object()) {
+        for (k, v) in meta {
+            if let Some(s) = v.as_str() {
+                out.insert(k.clone(), s.to_string());
+            } else {
+                out.insert(k.clone(), v.to_string());
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn save_key_for_registry_key(key: &str) -> String {
