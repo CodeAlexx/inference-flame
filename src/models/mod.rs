@@ -46,3 +46,5 @@ pub mod hidream_o1;
 pub mod hidream_i1;
 pub mod asymflux2;
 pub mod lance;
+pub mod cosmos_predict25_dit;
+pub mod cosmos_reason1;

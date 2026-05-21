@@ -402,6 +402,18 @@ name = "wan_infer"
 path = "src/bin/wan_infer.rs"
 
 [[bin]]
+name = "cosmos_predict25_t2v_infer"
+path = "src/bin/cosmos_predict25_t2v_infer.rs"
+
+[[bin]]
+name = "cosmos_predict25_i2v_infer"
+path = "src/bin/cosmos_predict25_i2v_infer.rs"
+
+[[bin]]
+name = "cosmos_predict25_v2v_infer"
+path = "src/bin/cosmos_predict25_v2v_infer.rs"
+
+[[bin]]
 name = "wan_smoke"
 path = "src/bin/wan_smoke.rs"
 
