@@ -25,13 +25,14 @@ pub mod lora;
 pub mod model;
 pub mod mrope;
 pub mod pipeline;
+pub mod prompt_agent;
 pub mod scheduler;
 pub mod timestep_embedder;
 pub mod trap;
 pub mod weight_loader;
 
 pub use bottleneck_patch_embed::BottleneckPatchEmbed;
-pub use decoder::HiDreamDecoderLayer;
+pub use decoder::{hidream_o1_two_pass_attention, HiDreamDecoderLayer};
 pub use lora::{default_target_suffixes, shape_for_suffix, LoraAdapter, LoraRegistry};
 pub use final_layer::FinalLayer;
 pub use model::HiDreamO1Model;
@@ -44,7 +45,8 @@ pub use pipeline::{
     find_closest_resolution, HiDreamO1Pipeline, MRopePositionsOwned, PREDEFINED_RESOLUTIONS,
 };
 pub use scheduler::{
-    FlashFlowMatchEulerDiscreteScheduler, SchedulerMode, DEFAULT_TIMESTEPS_DEV,
+    FlashFlowMatchEulerDiscreteScheduler, HiDreamScheduler, HiDreamSchedulerKind, SchedulerMode,
+    DEFAULT_TIMESTEPS_DEV,
 };
 pub use timestep_embedder::TimestepEmbedder;
 
@@ -130,9 +132,9 @@ impl HiDreamO1Config {
             intermediate_size: 12288,
             rope_theta: 5_000_000.0,
             mrope_section: [24, 20, 20],
-            // 151_936 per HiDream-O1-Image-Dev-weights/config.json:34
+            // 151_936 per local HiDream-O1 Full/Dev config.json
             // (`text_config.vocab_size`); the same value the Qwen3-VL
-            // tokenizer rounds-up. Phase 2a originally guessed 152_064.
+            // tokenizer rounds up. Phase 2a originally guessed 152_064.
             vocab_size: 151_936,
             rms_norm_eps: 1e-6,
             attention_bias: false,

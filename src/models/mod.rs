@@ -8,6 +8,7 @@ pub mod ltx2_model;
 pub mod ltx2_conditioning;
 pub mod qwen3_encoder;
 pub mod gemma3_encoder;
+pub mod gemma4;
 pub mod feature_extractor;
 pub mod fp8_resident;
 pub mod fp8_quant;

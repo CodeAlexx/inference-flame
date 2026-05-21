@@ -43,6 +43,8 @@ use std::sync::Arc;
 
 use flame_core::{CudaDevice, DType, Error, Result, Shape, Tensor};
 
+use crate::sampling::cosmos_unipc::CosmosUniPcMultistepScheduler;
+
 /// Hardcoded 28-step Dev timestep list.
 ///
 /// Source: `/home/alex/HiDream-O1-Image/models/pipeline.py:25-28`.
@@ -311,4 +313,182 @@ impl FlashFlowMatchEulerDiscreteScheduler {
 #[allow(dead_code)]
 fn _shape_passthrough() -> Shape {
     Shape::from_dims(&[0])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HiDreamScheduler — enum dispatch over the available samplers.
+// Added 2026-05-21 (Alex's call) to plug `CosmosUniPcMultistepScheduler`
+// into HiDream-O1 alongside the reference FlashFlowMatchEulerDiscrete.
+//
+// **Deviation from upstream:** the HiDream-O1 HF model card does NOT recommend
+// UniPC — it specifies `FlowMatchEulerDiscreteScheduler` (Full 50-step) and
+// `FlashFlowMatchEulerDiscreteScheduler` (Dev 28-step). Routing through UniPC
+// is a deliberate, user-chosen swap. Parity vs reference Python output is NOT
+// guaranteed with this path — different multistep math, no stochastic noise
+// injection, no `noise_clip_std`. Use when the UniPC convergence rate is
+// actually wanted at lower step counts; use the Flash/Default modes for
+// reference fidelity.
+//
+// **Velocity convention:** verified equivalent.
+// - Flash:    `denoised = sample - model_output * sigma`         (`model_output = -v_guided`)
+// - UniPC:    `x0_pred  = sample - sigma_t * model_output`        (`predict_x0=true`)
+// Both produce identical x0 given the same `model_output = -v_guided`,
+// so the pipeline's existing sign flip works for both paths unchanged.
+// (See `models/hidream_o1/pipeline.rs:540` and
+// `sampling/cosmos_unipc.rs:182-192`.)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Which sampler family the unified scheduler is using.
+///
+/// `Flash` / `Default` come from the Flash scheduler's own internal mode
+/// (`SchedulerMode`); `UniPc` is the new UniPC option.
+///
+/// The pipeline reads this to decide whether to draw per-step noise:
+/// only `Flash` injects stochastic noise. `Default` and `UniPc` are
+/// deterministic — calling code MUST NOT pass `noise_for_step` for those.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HiDreamSchedulerKind {
+    /// `FlashFlowMatchEulerDiscreteScheduler` in `Flash` mode (28-step Dev).
+    /// Stochastic — re-injects scaled noise every step.
+    FlashStochastic,
+    /// `FlashFlowMatchEulerDiscreteScheduler` in `Default` mode (50-step Full).
+    /// Deterministic Euler — no noise injection.
+    FlowMatchEuler,
+    /// `CosmosUniPcMultistepScheduler` (bh2 multistep, predict_x0=true).
+    /// Deterministic — no noise injection.
+    UniPc,
+}
+
+impl HiDreamSchedulerKind {
+    /// Whether this scheduler kind needs `noise_for_step` from the caller.
+    /// Only `FlashStochastic` does; the others are deterministic.
+    pub fn needs_step_noise(self) -> bool {
+        matches!(self, HiDreamSchedulerKind::FlashStochastic)
+    }
+}
+
+/// Unified scheduler enum. Owns one of the underlying scheduler structs;
+/// dispatches `step`, `timesteps`, `num_inference_steps` to the active arm.
+pub enum HiDreamScheduler {
+    /// Flash (stochastic) or Default (deterministic Euler) — same struct,
+    /// disambiguated by its internal `mode` field.
+    FlashFlowMatch(FlashFlowMatchEulerDiscreteScheduler),
+    /// UniPC bh2 multistep. Stateful: `step()` advances internally.
+    UniPc(CosmosUniPcMultistepScheduler),
+}
+
+impl HiDreamScheduler {
+    /// Dev 28-step Flash. Reference parity path.
+    pub fn flash_dev_28step() -> Self {
+        Self::FlashFlowMatch(FlashFlowMatchEulerDiscreteScheduler::dev_28step())
+    }
+
+    /// Full 50-step deterministic Euler. Reference parity path.
+    pub fn full_50step() -> Self {
+        Self::FlashFlowMatch(FlashFlowMatchEulerDiscreteScheduler::full_50step())
+    }
+
+    /// Full N-step deterministic Euler with arbitrary shift. Reference parity.
+    pub fn full_n_step(n: usize, shift: f32) -> Self {
+        Self::FlashFlowMatch(FlashFlowMatchEulerDiscreteScheduler::full_n_step(n, shift))
+    }
+
+    /// **UniPC variant** (deliberate deviation from reference).
+    ///
+    /// Wires `CosmosUniPcMultistepScheduler` with HiDream-O1's defaults:
+    /// `num_train_timesteps = 1000`, `solver_order = 2`, `predict_x0 = true`,
+    /// `final_sigmas_type = "zero"`. Caller provides `n_inference_steps` and
+    /// `shift` (typically 3.0 for Full / 1.0 for Dev parity, but pick what
+    /// converges best at low step counts).
+    pub fn unipc(n_inference_steps: usize, shift: f32) -> Self {
+        Self::UniPc(CosmosUniPcMultistepScheduler::new(
+            /*num_train_timesteps=*/ 1000,
+            n_inference_steps,
+            shift,
+            /*solver_order=*/ 2,
+        ))
+    }
+
+    /// Which sampler family this is. Pipeline branches on this for
+    /// noise-injection decisions and noise_scale_start defaults.
+    pub fn kind(&self) -> HiDreamSchedulerKind {
+        match self {
+            HiDreamScheduler::FlashFlowMatch(s) => match s.mode {
+                SchedulerMode::Flash => HiDreamSchedulerKind::FlashStochastic,
+                SchedulerMode::Default => HiDreamSchedulerKind::FlowMatchEuler,
+            },
+            HiDreamScheduler::UniPc(_) => HiDreamSchedulerKind::UniPc,
+        }
+    }
+
+    /// Total number of inference steps. Pipeline loops `0..num_inference_steps()`.
+    pub fn num_inference_steps(&self) -> usize {
+        match self {
+            HiDreamScheduler::FlashFlowMatch(s) => s.num_inference_steps(),
+            HiDreamScheduler::UniPc(s) => s.num_inference_steps,
+        }
+    }
+
+    /// Timesteps array (descending). Pipeline reads `timesteps[step_idx]`
+    /// to compute the `t` value fed to the DiT.
+    pub fn timesteps(&self) -> &[f32] {
+        match self {
+            HiDreamScheduler::FlashFlowMatch(s) => &s.timesteps,
+            HiDreamScheduler::UniPc(s) => s.timesteps(),
+        }
+    }
+
+    /// Sigmas array (length = num_inference_steps + 1; last is 0.0).
+    pub fn sigmas(&self) -> &[f32] {
+        match self {
+            HiDreamScheduler::FlashFlowMatch(s) => &s.sigmas,
+            HiDreamScheduler::UniPc(s) => s.sigmas(),
+        }
+    }
+
+    /// Unified single-step. The `noise_for_step`, `s_noise`, `noise_clip_std`
+    /// args are IGNORED for `UniPc` and `FlowMatchEuler` (deterministic).
+    /// `step_index` is used by the Flash arm but the UniPC arm tracks its
+    /// own `step_index` internally and ignores the caller's value (it must
+    /// still be called in monotonic order). If the caller's `step_index`
+    /// disagrees with the UniPC internal counter we return an error rather
+    /// than silently mis-step.
+    pub fn step(
+        &mut self,
+        model_output: &Tensor,
+        step_index: usize,
+        sample: &Tensor,
+        noise_for_step: Option<&Tensor>,
+        s_noise: f32,
+        noise_clip_std: f32,
+        device: &Arc<CudaDevice>,
+    ) -> Result<Tensor> {
+        match self {
+            HiDreamScheduler::FlashFlowMatch(s) => s.step(
+                model_output,
+                step_index,
+                sample,
+                noise_for_step,
+                s_noise,
+                noise_clip_std,
+                device,
+            ),
+            HiDreamScheduler::UniPc(s) => {
+                if s.step_index() != step_index {
+                    return Err(Error::InvalidOperation(format!(
+                        "HiDreamScheduler::UniPc: caller step_index {} ≠ scheduler internal {} \
+                         — UniPC is stateful, callers must invoke step() once per step in order",
+                        step_index,
+                        s.step_index()
+                    )));
+                }
+                // s_noise / noise_clip_std / noise_for_step are silently
+                // ignored — UniPC is deterministic. We don't warn at every
+                // step (would be 50 log lines per generation); pipeline
+                // should branch on `kind()` and skip drawing noise instead.
+                let _ = (noise_for_step, s_noise, noise_clip_std);
+                s.step(model_output, sample)
+            }
+        }
+    }
 }

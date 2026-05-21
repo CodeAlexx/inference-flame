@@ -196,6 +196,18 @@ QWEN_TURBO_SAFETENSORS=/path/to/qwen_image_edit_2511.safetensors \
 
 Default builds (turbo off) are unchanged.
 
+## Per-model port notes
+
+- **HiDream-O1 weight selection** ⚠ READ BEFORE TRAINING ⚠ — inference uses
+  the **Dev** checkpoint (`HiDream-O1-Image-Dev-weights`, ~33 GB; what `hidream_o1_infer`
+  loads by default). Training **MUST use the Full** checkpoint
+  (`HiDream-O1-Image-Full-weights` from `HiDream-ai/HiDream-O1-Image` on HF).
+  Dev is step/CFG-distilled and produces LoRAs that overdrive the inference
+  sampler at full strength — confirmed across both ai-toolkit and this trainer
+  on 2026-05-21. See [`docs/HIDREAM_O1_WEIGHTS.md`](docs/HIDREAM_O1_WEIGHTS.md).
+- HiDream-O1 Kijai port (two-pass attention + survey of `conditioning.py`,
+  `utils.py`): see [`docs/HIDREAM_O1_KIJAI_PORT.md`](docs/HIDREAM_O1_KIJAI_PORT.md).
+
 ## Adapters & samplers
 
 | Crate | Path | What it adds |

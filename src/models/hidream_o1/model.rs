@@ -73,7 +73,7 @@ use flame_core::offload::BlockOffloader;
 use flame_core::{DType, Error, Result, Shape, Tensor};
 
 use super::bottleneck_patch_embed::BottleneckPatchEmbed;
-use super::decoder::decoder_forward_with_weights_lora;
+use super::decoder::{decoder_forward_probe_with_weights_lora, decoder_forward_with_weights_lora};
 use super::final_layer::FinalLayer;
 use super::lora::LoraRegistry;
 use super::mrope::{interleaved_mrope_cos_sin, MRopePositions};
@@ -349,8 +349,9 @@ impl HiDreamO1Model {
 
         // 6) attention policy. Production O1 uses the structured
         // prefix-causal/full SDPA primitive instead of materializing the old
-        // mixed binary mask. That keeps the hot full pass on cuDNN and avoids
-        // a second route that can silently diverge from the fast path.
+        // mixed binary mask. Flame owns the exact mixed-mask semantics and, in
+        // training, records one custom backward op so shared K/V gradients
+        // match the single-mask oracle.
         //
         //    Python (`qwen3_vl_transformers.py:1495-1504`):
         //      causal = full(min, [S, S]); causal = triu(causal, diag=1)  # 0 below+diag, -inf above
@@ -493,6 +494,21 @@ impl HiDreamO1Model {
                 };
                 if mem_log && (i < 3 || i == total - 1) {
                     log_mem(&format!("layer{:02}.after_await", i));
+                }
+                if i == 0 {
+                    if let Some(ref mut d) = layer_dump {
+                        let probes = decoder_forward_probe_with_weights_lora(
+                            &cfg,
+                            i,
+                            &hidden,
+                            &cos_sin,
+                            mask_ref,
+                            raw.weights(),
+                            lora,
+                            two_pass_ar_len,
+                        )?;
+                        d.extend(probes);
+                    }
                 }
                 hidden = decoder_forward_with_weights_lora(
                     &cfg,

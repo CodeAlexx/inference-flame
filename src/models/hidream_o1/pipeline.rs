@@ -39,13 +39,13 @@ use super::bottleneck_patch_embed::BottleneckPatchEmbed;
 use super::lora::LoraRegistry;
 use super::model::HiDreamO1Model;
 use super::mrope::{build_mrope_positions, MRopePositions};
-use super::scheduler::{FlashFlowMatchEulerDiscreteScheduler, SchedulerMode};
+use super::scheduler::{HiDreamScheduler, HiDreamSchedulerKind};
 use super::HiDreamO1Config;
 
 /// HiDream-O1 generation pipeline (T2I, no ref-images, Phase 2c).
 pub struct HiDreamO1Pipeline {
     pub model: HiDreamO1Model,
-    pub scheduler: FlashFlowMatchEulerDiscreteScheduler,
+    pub scheduler: HiDreamScheduler,
     pub tokenizer: tokenizers::Tokenizer,
     pub config: HiDreamO1Config,
     pub device: Arc<CudaDevice>,
@@ -105,7 +105,7 @@ impl HiDreamO1Pipeline {
     /// would silently miss the timestep injection otherwise.
     pub fn new(
         model: HiDreamO1Model,
-        scheduler: FlashFlowMatchEulerDiscreteScheduler,
+        scheduler: HiDreamScheduler,
         tokenizer: tokenizers::Tokenizer,
         config: HiDreamO1Config,
         device: Arc<CudaDevice>,
@@ -179,7 +179,7 @@ impl HiDreamO1Pipeline {
     /// Apply the HiDream chat template for a text-only T2I prompt.
     ///
     /// Produces (verbatim, mirroring the Jinja template in
-    /// `/home/alex/HiDream-O1-Image-Dev-weights/chat_template.json`):
+    /// `/home/alex/HiDream-O1-Image-Full-weights/chat_template.json`):
     ///
     /// ```text
     /// <|im_start|>user
@@ -434,9 +434,13 @@ impl HiDreamO1Pipeline {
         // 3) Initial noise — `noise_scale_start * randn(B,3,H,W)` (edge case C7).
         //    For Dev defaults (`inference.py:33-34`) noise_scale_start = 7.5.
         //    For Full (`pipeline.py:117-118`) NOISE_SCALE = 8.0.
-        let noise_scale_start = match self.scheduler.mode {
-            SchedulerMode::Flash => 7.5_f32,   // Dev default (inference.py:33)
-            SchedulerMode::Default => 8.0_f32, // Full default (pipeline.py:14, 117)
+        let noise_scale_start = match self.scheduler.kind() {
+            HiDreamSchedulerKind::FlashStochastic => 7.5_f32, // Dev default (inference.py:33)
+            HiDreamSchedulerKind::FlowMatchEuler => 8.0_f32,  // Full default (pipeline.py:14, 117)
+            // UniPC: deterministic; the initial-noise std doesn't feed back into
+            // a per-step injection. Use the 50-step Full default for the initial
+            // latent magnitude. This is an AGENT-DEFAULT choice.
+            HiDreamSchedulerKind::UniPc => 8.0_f32,
         };
         let noise_scale_end = noise_scale_start; // both endpoints equal in default cfg
 
@@ -469,15 +473,17 @@ impl HiDreamO1Pipeline {
         let mut step_rng = rand::rngs::StdRng::seed_from_u64(seed + 1);
 
         // For Dev: noise_clip_std default 2.5 (inference.py:35).
-        let noise_clip_std = match self.scheduler.mode {
-            SchedulerMode::Flash => 2.5_f32,
-            SchedulerMode::Default => 0.0_f32,
+        // FlowMatch / UniPC: no per-step noise injection → noise_clip_std unused.
+        let noise_clip_std = match self.scheduler.kind() {
+            HiDreamSchedulerKind::FlashStochastic => 2.5_f32,
+            HiDreamSchedulerKind::FlowMatchEuler => 0.0_f32,
+            HiDreamSchedulerKind::UniPc => 0.0_f32,
         };
 
         // 6) Denoise loop. Mirror `pipeline.py:343-388`.
         for step_idx in 0..num_steps {
             let step_start = std::time::Instant::now();
-            let step_t = self.scheduler.timesteps[step_idx];
+            let step_t = self.scheduler.timesteps()[step_idx];
             let t_pixeldit = 1.0_f32 - step_t / 1000.0_f32;
             let sigma_clamped = (step_t / 1000.0_f32).max(0.001_f32);
 
@@ -540,7 +546,10 @@ impl HiDreamO1Pipeline {
             let model_output = v_guided.mul_scalar(-1.0)?;
 
             // Draw per-step noise (matches model_output shape).
-            let noise_for_step = if matches!(self.scheduler.mode, SchedulerMode::Flash) {
+            // Only stochastic schedulers need per-step noise. FlowMatchEuler
+            // and UniPC are deterministic — draw nothing and pass None to the
+            // unified step().
+            let noise_for_step = if self.scheduler.kind().needs_step_noise() {
                 Some(self.draw_step_noise(model_output.shape(), &mut step_rng)?)
             } else {
                 None

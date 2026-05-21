@@ -10,12 +10,12 @@
 //!
 //! ## Why the offloader is required
 //!
-//! HiDream-O1-Image-Dev ships **FP32** weights (per `config.json`'s implicit
-//! `torch_dtype=torch.float32`). The previous loader path went through
-//! `Tensor::from_vec` (F32 on GPU) → `to_dtype(BF16)` which doubles GPU
-//! memory mid-load. With 8 B parameters and a 24 GB GPU that's a guaranteed
-//! OOM in the very first key (`model.language_model.embed_tokens.weight` at
-//! 152 K × 4096 × 4 B = 2.5 GB FP32 alone).
+//! HiDream-O1 Full/Dev weights are too large to stage as full GPU tensors
+//! during load. The previous loader path went through `Tensor::from_vec`
+//! (F32 on GPU) → `to_dtype(BF16)` which doubles GPU memory mid-load. With
+//! 8 B parameters and a 24 GB GPU that's a guaranteed OOM in the very first
+//! key (`model.language_model.embed_tokens.weight` at 152 K × 4096 × 4 B =
+//! 2.5 GB FP32 alone).
 //!
 //! The offloader handles per-layer weights entirely on the CPU side
 //! (`block_offload.rs` lines 465-471: F32 → BF16 in a host buffer, then
@@ -26,8 +26,8 @@
 //!
 //! ## Key naming map (HF safetensors → Rust struct fields)
 //!
-//! Verified against `model.safetensors.index.json` for
-//! `HiDream-O1-Image-Dev-weights`:
+//! Verified against `model.safetensors.index.json` for the local
+//! HiDream-O1-Image-Full weights:
 //!
 //! ```text
 //! HF Key                                                            → Rust slot

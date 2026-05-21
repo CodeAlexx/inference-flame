@@ -39,8 +39,7 @@
 //! can support LoRA / per-layer overrides cleanly later). The math is
 //! identical; the dispatch is by struct field instead of by string key.
 //!
-//! All weights stored / computed in BF16 (matches
-//! `HiDream-O1-Image-Dev-weights/config.json`'s `dtype: "bfloat16"`).
+//! All weights are stored / computed in BF16 after loader-side conversion.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -48,7 +47,7 @@ use std::sync::Arc;
 use flame_core::attention::{sdpa as flame_sdpa, sdpa_prefix_causal_full};
 use flame_core::nn::Linear;
 use flame_core::norm::RMSNorm;
-use flame_core::{bf16_ops, cuda_ops_bf16, CudaDevice, Error, Result, Tensor};
+use flame_core::{bf16_ops, cuda_ops_bf16, CudaDevice, DType, Error, Result, Tensor};
 
 use super::HiDreamO1Config;
 
@@ -150,7 +149,7 @@ impl HiDreamDecoderLayer {
     ///            BF16, produced by `mrope::interleaved_mrope_cos_sin`.
     /// `attention_mask`: legacy explicit mask override. Production O1 passes
     ///   `None` and uses `two_pass_ar_len` with structured prefix-causal/full
-    ///   attention so the hot full pass stays on cuDNN.
+    ///   attention through Flame's exact mixed-mask primitive.
     ///
     /// Returns `[B, S, hidden]` BF16.
     pub fn forward(
@@ -222,8 +221,8 @@ impl HiDreamDecoderLayer {
         // positions); the rotate is the standard HF half-split rotate.
         // (`qwen3_vl_transformers.py:378-402` — `apply_rotary_pos_emb`.)
         let (pe_cos, pe_sin) = cos_sin;
-        let q = bf16_ops::rope_halfsplit_bf16(&q, pe_cos, pe_sin)?;
-        let k = bf16_ops::rope_halfsplit_bf16(&k, pe_cos, pe_sin)?;
+        let q = bf16_ops::rope_halfsplit_bf16_pytorch(&q, pe_cos, pe_sin)?;
+        let k = bf16_ops::rope_halfsplit_bf16_pytorch(&k, pe_cos, pe_sin)?;
 
         // GQA: replicate KV heads to match Q head count.
         let k = repeat_kv(&k, n_rep)?;
@@ -441,16 +440,16 @@ pub fn decoder_forward_with_weights_lora(
     let q_norm_w = wget("self_attn.q_norm.weight")?;
     let k_norm_w = wget("self_attn.k_norm.weight")?;
     let q_flat = q.reshape(&[b * h * n, d])?;
-    let q_normed = cuda_ops_bf16::rms_norm_bf16(&q_flat, Some(q_norm_w), cfg.rms_norm_eps)?;
+    let q_normed = rms_norm_apply(&q_flat, q_norm_w, cfg.rms_norm_eps)?;
     let q = q_normed.reshape(&[b, h, n, d])?;
     let k_flat = k.reshape(&[b * h_kv * n, d])?;
-    let k_normed = cuda_ops_bf16::rms_norm_bf16(&k_flat, Some(k_norm_w), cfg.rms_norm_eps)?;
+    let k_normed = rms_norm_apply(&k_flat, k_norm_w, cfg.rms_norm_eps)?;
     let k = k_normed.reshape(&[b, h_kv, n, d])?;
     log_mem("after_qk_norm");
 
     let (pe_cos, pe_sin) = cos_sin;
-    let q = bf16_ops::rope_halfsplit_bf16(&q, pe_cos, pe_sin)?;
-    let k = bf16_ops::rope_halfsplit_bf16(&k, pe_cos, pe_sin)?;
+    let q = bf16_ops::rope_halfsplit_bf16_pytorch(&q, pe_cos, pe_sin)?;
+    let k = bf16_ops::rope_halfsplit_bf16_pytorch(&k, pe_cos, pe_sin)?;
     log_mem("after_rope");
 
     let k = repeat_kv(&k, n_rep)?;
@@ -473,12 +472,13 @@ pub fn decoder_forward_with_weights_lora(
     }
 
     // edv2-reference's HiDream-O1 `use_flash_attn=True` path avoids a 4D mixed
-    // mask. It runs causal attention on the AR/text prefix, full unmasked
-    // attention on all tokens, then replaces the AR rows. That unlocks cuDNN
-    // Flash SDPA for the large full pass; the old mixed-mask path falls back
-    // to slow streaming/chunked kernels at 2048².
+    // mask. Flame owns that structured prefix-causal/full policy in
+    // `sdpa_prefix_causal_full`; the training path records it as one custom
+    // backward op instead of two independent SDPA nodes over shared K/V.
     let attn_out = match two_pass_ar_len {
-        Some(ar_len) if attention_mask.is_none() => sdpa_prefix_causal_full(&q, &k, &v, ar_len)?,
+        Some(ar_len) if attention_mask.is_none() => {
+            hidream_o1_two_pass_attention(&q, &k, &v, ar_len)?
+        }
         _ => chunked_sdpa(&q, &k, &v, attention_mask)?,
     };
     log_mem("after_sdpa");
@@ -533,6 +533,188 @@ pub fn decoder_forward_with_weights_lora(
     hidden_states.add(&mlp_out)
 }
 
+/// Diagnostic mirror of `decoder_forward_with_weights_lora` for one decoder
+/// layer. Used only by parity dumps; production forward does not call this
+/// unless `HIDREAM_DUMP_LAYERS` is set.
+pub fn decoder_forward_probe_with_weights_lora(
+    cfg: &HiDreamO1Config,
+    layer_idx: usize,
+    hidden_states: &Tensor,
+    cos_sin: &(Tensor, Tensor),
+    attention_mask: Option<&Tensor>,
+    weights: &HashMap<String, Tensor>,
+    lora: Option<&super::lora::LoraRegistry>,
+    two_pass_ar_len: Option<usize>,
+) -> Result<HashMap<String, Tensor>> {
+    let p = format!("model.language_model.layers.{layer_idx}");
+    let h = cfg.num_attention_heads;
+    let h_kv = cfg.num_kv_heads;
+    let d = cfg.head_dim;
+    let n_rep = h / h_kv;
+
+    let dims = hidden_states.shape().dims().to_vec();
+    if dims.len() != 3 {
+        return Err(Error::InvalidOperation(format!(
+            "decoder_forward_probe_with_weights_lora[layer={layer_idx}]: hidden_states must be [B,S,H], got {:?}",
+            dims
+        )));
+    }
+    let b = dims[0];
+    let n = dims[1];
+
+    let wget = |suffix: &str| -> Result<&Tensor> {
+        let k = format!("{p}.{suffix}");
+        weights.get(&k).ok_or_else(|| {
+            Error::InvalidInput(format!(
+                "decoder_forward_probe_with_weights_lora[layer={layer_idx}]: missing weight {k}"
+            ))
+        })
+    };
+    let lora_linear = |x: &Tensor,
+                       w: &Tensor,
+                       b: Option<&Tensor>,
+                       suffix: &str|
+     -> Result<Tensor> {
+        match lora.and_then(|r| r.get(layer_idx, suffix)) {
+            Some(adapter) => {
+                let a_t = adapter.a_tensor()?;
+                let b_t = adapter.b_tensor()?;
+                flame_core::ops::fused_inference::fused_linear3d_native_lora(
+                    x,
+                    w,
+                    b,
+                    Some(&a_t),
+                    Some(&b_t),
+                    adapter.scale,
+                )
+            }
+            None => flame_core::ops::fused_inference::fused_linear3d_native(x, w, b),
+        }
+    };
+
+    let mut out = HashMap::new();
+    let mut put = |key: &str, tensor: &Tensor| -> Result<()> {
+        out.insert(format!("layer{layer_idx:02}.{key}"), tensor.to_dtype(DType::F32)?);
+        Ok(())
+    };
+
+    let normed = rms_norm_apply(hidden_states, wget("input_layernorm.weight")?, cfg.rms_norm_eps)?;
+    put("normed", &normed)?;
+
+    let q_w = wget("self_attn.q_proj.weight")?;
+    let k_w = wget("self_attn.k_proj.weight")?;
+    let v_w = wget("self_attn.v_proj.weight")?;
+    let (q_b, k_b, v_b): (Option<&Tensor>, Option<&Tensor>, Option<&Tensor>) =
+        if cfg.attention_bias {
+            (
+                Some(wget("self_attn.q_proj.bias")?),
+                Some(wget("self_attn.k_proj.bias")?),
+                Some(wget("self_attn.v_proj.bias")?),
+            )
+        } else {
+            (None, None, None)
+        };
+
+    let q_proj = lora_linear(&normed, q_w, q_b, "self_attn.q_proj")?;
+    let k_proj = lora_linear(&normed, k_w, k_b, "self_attn.k_proj")?;
+    let v_proj = lora_linear(&normed, v_w, v_b, "self_attn.v_proj")?;
+    put("q_proj", &q_proj)?;
+    put("k_proj", &k_proj)?;
+    put("v_proj", &v_proj)?;
+
+    let q_heads = q_proj.reshape(&[b, n, h, d])?.permute(&[0, 2, 1, 3])?.contiguous()?;
+    let k_heads = k_proj.reshape(&[b, n, h_kv, d])?.permute(&[0, 2, 1, 3])?.contiguous()?;
+    let v_heads = v_proj.reshape(&[b, n, h_kv, d])?.permute(&[0, 2, 1, 3])?.contiguous()?;
+    put("q_heads", &q_heads)?;
+    put("k_heads", &k_heads)?;
+    put("v_heads", &v_heads)?;
+
+    let q_norm_w = wget("self_attn.q_norm.weight")?;
+    let k_norm_w = wget("self_attn.k_norm.weight")?;
+    let q_flat = q_heads.reshape(&[b * h * n, d])?;
+    let q_mean_sq = cuda_ops_bf16::rms_norm_bf16_mean_sq_head128(&q_flat)?
+        .reshape(&[b, h, n])?;
+    let q_inv = cuda_ops_bf16::rms_norm_bf16_inv_rms(&q_flat, cfg.rms_norm_eps)?
+        .reshape(&[b, h, n])?;
+    let q_unit_flat = cuda_ops_bf16::rms_norm_bf16(&q_flat, None, cfg.rms_norm_eps)?;
+    let q_unit = q_unit_flat.reshape(&[b, h, n, d])?;
+    let q_normed = q_unit_flat.mul(q_norm_w)?.reshape(&[b, h, n, d])?;
+    let k_flat = k_heads.reshape(&[b * h_kv * n, d])?;
+    let k_mean_sq = cuda_ops_bf16::rms_norm_bf16_mean_sq_head128(&k_flat)?
+        .reshape(&[b, h_kv, n])?;
+    let k_inv = cuda_ops_bf16::rms_norm_bf16_inv_rms(&k_flat, cfg.rms_norm_eps)?
+        .reshape(&[b, h_kv, n])?;
+    let k_unit_flat = cuda_ops_bf16::rms_norm_bf16(&k_flat, None, cfg.rms_norm_eps)?;
+    let k_unit = k_unit_flat.reshape(&[b, h_kv, n, d])?;
+    let k_normed = k_unit_flat.mul(k_norm_w)?.reshape(&[b, h_kv, n, d])?;
+    put("q_mean_sq", &q_mean_sq)?;
+    put("k_mean_sq", &k_mean_sq)?;
+    put("q_inv", &q_inv)?;
+    put("k_inv", &k_inv)?;
+    put("q_unit", &q_unit)?;
+    put("k_unit", &k_unit)?;
+    put("q_normed", &q_normed)?;
+    put("k_normed", &k_normed)?;
+
+    let (pe_cos, pe_sin) = cos_sin;
+    put("cos_half", pe_cos)?;
+    put("sin_half", pe_sin)?;
+    let q_rope = bf16_ops::rope_halfsplit_bf16_pytorch(&q_normed, pe_cos, pe_sin)?;
+    let k_rope = bf16_ops::rope_halfsplit_bf16_pytorch(&k_normed, pe_cos, pe_sin)?;
+    put("q_rope", &q_rope)?;
+    put("k_rope", &k_rope)?;
+
+    let k_repeat = repeat_kv(&k_rope, n_rep)?;
+    let v_repeat = repeat_kv(&v_heads, n_rep)?;
+    put("k_repeat", &k_repeat)?;
+    put("v_repeat", &v_repeat)?;
+
+    let sdpa_out = match two_pass_ar_len {
+        Some(ar_len) if attention_mask.is_none() => {
+            hidream_o1_two_pass_attention(&q_rope, &k_repeat, &v_repeat, ar_len)?
+        }
+        _ => chunked_sdpa(&q_rope, &k_repeat, &v_repeat, attention_mask)?,
+    };
+    put("sdpa_out", &sdpa_out)?;
+
+    let o_proj_in = sdpa_out
+        .permute(&[0, 2, 1, 3])?
+        .contiguous()?
+        .reshape(&[b, n, h * d])?;
+    put("o_proj_in", &o_proj_in)?;
+
+    let o_w = wget("self_attn.o_proj.weight")?;
+    let o_b = if cfg.attention_bias {
+        Some(wget("self_attn.o_proj.bias")?)
+    } else {
+        None
+    };
+    let attn_out = lora_linear(&o_proj_in, o_w, o_b, "self_attn.o_proj")?;
+    put("attn_out", &attn_out)?;
+    let after_attn = hidden_states.add(&attn_out)?;
+    put("after_attn", &after_attn)?;
+
+    let normed2 = rms_norm_apply(
+        &after_attn,
+        wget("post_attention_layernorm.weight")?,
+        cfg.rms_norm_eps,
+    )?;
+    put("normed2", &normed2)?;
+
+    let gate = lora_linear(&normed2, wget("mlp.gate_proj.weight")?, None, "mlp.gate_proj")?;
+    let up = lora_linear(&normed2, wget("mlp.up_proj.weight")?, None, "mlp.up_proj")?;
+    put("gate", &gate)?;
+    put("up", &up)?;
+    let mlp_inner = gate.swiglu(&up)?;
+    put("mlp_inner", &mlp_inner)?;
+    let mlp_out = lora_linear(&mlp_inner, wget("mlp.down_proj.weight")?, None, "mlp.down_proj")?;
+    put("mlp_out", &mlp_out)?;
+    let hidden_out = after_attn.add(&mlp_out)?;
+    put("hidden_out", &hidden_out)?;
+
+    Ok(out)
+}
+
 /// Apply RMSNorm with weight: reshape to [batch, hidden], norm, reshape back.
 ///
 /// `rms_norm_bf16` expects a 2D `[batch, hidden]` input; this helper preserves
@@ -542,7 +724,7 @@ fn rms_norm_apply(x: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
     let hidden = *dims.last().unwrap();
     let batch: usize = dims[..dims.len() - 1].iter().product();
     let x_2d = x.reshape(&[batch, hidden])?;
-    let out = cuda_ops_bf16::rms_norm_bf16(&x_2d, Some(weight), eps)?;
+    let out = cuda_ops_bf16::rms_norm_bf16(&x_2d, None, eps)?.mul(weight)?;
     out.reshape(&dims)
 }
 
@@ -670,4 +852,77 @@ fn chunked_sdpa(
 
     let chunk_refs: Vec<&Tensor> = out_chunks.iter().collect();
     Tensor::cat(&chunk_refs, 2)
+}
+
+/// HiDream-O1 two-pass attention dispatcher.
+///
+/// Ported from Kijai's ComfyUI `hidream_o1` branch
+/// (`comfy/ldm/hidream_o1/attention.py::make_two_pass_attention`,
+/// commit `974aab796d`, also present at
+/// `https://raw.githubusercontent.com/comfyanonymous/ComfyUI/master/comfy/ldm/hidream_o1/attention.py`).
+///
+/// Tokens `[0, ar_len)` are the AR / text prefix (causal); tokens
+/// `[ar_len, T)` are the image-generation tail (full bidirectional over the
+/// whole sequence). Splitting Q at the boundary lets us avoid the
+/// `(B, 1, T, T)` additive mask the materialized-mask path would build
+/// (~500 MiB at `T ≈ 16384`). Flame's public mixed primitive owns the
+/// backend choice and, for training, records one exact mixed-attention
+/// backward op.
+///
+/// Four dispatch cases (matches Kijai's Python verbatim):
+///
+/// 1. **KV-cache hot path** — `q_len < kv_len`: Q is shorter than K/V, so all
+///    fresh Q positions live in the gen region; single non-causal SDPA call.
+///    (Currently unreachable from `inference-flame`'s HiDream-O1 pipeline,
+///    which recomputes per step, but the surface is ported.)
+/// 2. **All-causal** — `ar_len >= q_len`: every Q row is in the AR prefix;
+///    single `flame_sdpa_causal` call.
+/// 3. **All-gen** — `ar_len == 0`: every Q row is in the gen region; single
+///    non-causal SDPA call.
+/// 4. **Mixed** — `0 < ar_len < q_len`: AR-causal head + full-attention tail,
+///    concatenated along sequence. Delegates to
+///    `flame_core::attention::sdpa_prefix_causal_full`, which owns the exact
+///    mixed-mask policy in Flame. In training, Flame records this as one
+///    custom backward op so shared K/V gradients match the single-mask oracle;
+///    inference uses the same public API surface.
+///
+/// `q`: `[B, H, T_q, D]`. `k`/`v`: `[B, H, T_kv, D]` (already GQA-replicated).
+/// `ar_len`: number of AR / text prefix rows in the **Q** sequence.
+///
+/// Returns `[B, H, T_q, D]`.
+pub fn hidream_o1_two_pass_attention(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    ar_len: usize,
+) -> Result<Tensor> {
+    let q_dims = q.shape().dims();
+    let k_dims = k.shape().dims();
+    if q_dims.len() != 4 || k_dims.len() != 4 {
+        return Err(Error::InvalidOperation(format!(
+            "hidream_o1_two_pass_attention: expected [B,H,T,D] tensors, got q={:?} k={:?}",
+            q_dims, k_dims
+        )));
+    }
+    let t_q = q_dims[2];
+    let t_kv = k_dims[2];
+
+    // Case 1: KV-cache hot path. Q is shorter than K/V — every Q row is in
+    // the gen region (the cached AR prefix is in K/V only). Single full call.
+    if t_q < t_kv {
+        return flame_sdpa(q, k, v, None);
+    }
+
+    // From here on this is self-attention (t_q == t_kv). The other branches
+    // require this for `sdpa_prefix_causal_full`.
+    if ar_len >= t_q {
+        // Case 2: all-causal. Every Q row is in the AR prefix.
+        return flame_core::attention::sdpa_causal(q, k, v);
+    }
+    if ar_len == 0 {
+        // Case 3: all-gen. Every Q row is in the gen region.
+        return flame_sdpa(q, k, v, None);
+    }
+    // Case 4: mixed. Structured AR-causal + gen-full.
+    sdpa_prefix_causal_full(q, k, v, ar_len)
 }

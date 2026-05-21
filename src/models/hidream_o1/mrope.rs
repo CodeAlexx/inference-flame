@@ -56,8 +56,9 @@
 //! HuggingFace **half-split** convention:
 //! `q_embed = q*cos + rotate_half(q)*sin` where `rotate_half(x) =
 //! cat(-x[..., D/2:], x[..., :D/2], dim=-1)`. flame-core ships this exact
-//! kernel as `flame_core::bf16_ops::rope_halfsplit_bf16` — same one used by
-//! Qwen3-only encoders. We re-use it directly.
+//! kernel as `flame_core::bf16_ops::rope_halfsplit_bf16_pytorch`. We use the
+//! PyTorch-expression variant so BF16 multiply/add round points match
+//! training references.
 
 use std::sync::Arc;
 
@@ -340,11 +341,12 @@ pub fn interleaved_mrope_cos_sin(
     }
 
     // 1) inv_freq[d] = 1 / theta^(2d/head_dim) for d in 0..half.
-    //    Stored as f64 to keep the long-period frequencies (d→0) precise.
-    let inv_freq: Vec<f64> = (0..half)
+    //    Match Qwen3-VL exactly: PyTorch builds this as float32 and later
+    //    forces the MRoPE matmul/trig block to float32 under autocast off.
+    let inv_freq: Vec<f32> = (0..half)
         .map(|d| {
-            let exponent = (2.0 * d as f64) / (head_dim as f64);
-            (rope_theta as f64).powf(-exponent)
+            let exponent = (2.0f32 * d as f32) / head_dim as f32;
+            1.0f32 / rope_theta.powf(exponent)
         })
         .collect();
 
@@ -376,10 +378,10 @@ pub fn interleaved_mrope_cos_sin(
                 1 => h_pos[si],
                 2 => w_pos[si],
                 _ => unreachable!(),
-            } as f64;
+            } as f32;
             let arg = pos * inv_freq[d];
-            let c = arg.cos() as f32;
-            let s_ = arg.sin() as f32;
+            let c = arg.cos();
+            let s_ = arg.sin();
             // First half slot d, second half slot d+half (the duplicate).
             cos_data[si * head_dim + d] = c;
             sin_data[si * head_dim + d] = s_;
@@ -447,11 +449,11 @@ pub fn interleaved_mrope_cos_sin(
 ///
 /// Returns rotated `x` of the same shape.
 ///
-/// Internally calls `flame_core::bf16_ops::rope_halfsplit_bf16` which
+/// Internally calls `flame_core::bf16_ops::rope_halfsplit_bf16_pytorch` which
 /// performs `q*cos + rotate_half(q)*sin` using the HuggingFace half-split
 /// convention (`qwen3_vl_transformers.py:378-402`).
 pub fn apply_mrope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
-    bf16_ops::rope_halfsplit_bf16(x, cos, sin)
+    bf16_ops::rope_halfsplit_bf16_pytorch(x, cos, sin)
 }
 
 /// CPU-side helper: apply the interleave fold to a `[3, S, head_dim/2]`
