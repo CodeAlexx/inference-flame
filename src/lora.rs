@@ -81,9 +81,10 @@
 //!   the same merge-in-place architectural problem; migrating it will
 //!   require porting the existing fuse semantics.
 
+use flame_core::parameter::Parameter;
 use flame_core::{trim_cuda_mempool, DType, Error, Result, Tensor};
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use cudarc::driver::CudaDevice;
 
@@ -139,9 +140,33 @@ struct LoraEntry {
     scale: f32,
 }
 
+/// A trainable LoRA branch — holds live `Parameter` handles so autograd
+/// ops recorded against their underlying tensors produce gradients in the
+/// backward pass.
+///
+/// Tensors are pre-shaped to match `LoraEntry::down_t / up_t` orientation
+/// for matmul: `down` is `[in, rank]`, `up` is `[rank, out]`. No
+/// transpose is applied in `apply` — the trainer constructs them
+/// in the correct shape up front.
+///
+/// `Parameter::tensor()?` is called per-apply to fetch the live tensor
+/// after each optimizer step (the data tensor changes but the param id
+/// stays pinned across `set_data`).
+pub struct TrainEntry {
+    pub slot: Slot,
+    pub down: Parameter,
+    pub up: Parameter,
+    /// `alpha / rank` — applied as a scalar after the up matmul.
+    pub scale: f32,
+}
+
 /// All LoRA branches for one inference run, indexed by base weight key.
 pub struct LoraStack {
     entries: HashMap<String, Vec<LoraEntry>>,
+    /// Training-mode entries. Populated by [`LoraStack::new_training`].
+    /// Apply path checks these first; if present, the inference `entries`
+    /// path is skipped for that key.
+    train_entries: Mutex<HashMap<String, Vec<TrainEntry>>>,
     format: LoraFormat,
 }
 
@@ -313,16 +338,45 @@ impl LoraStack {
             );
         }
 
-        Ok(LoraStack { entries, format })
+        Ok(LoraStack {
+            entries,
+            train_entries: Mutex::new(HashMap::new()),
+            format,
+        })
     }
 
     /// Number of distinct base weight keys that have at least one LoRA branch.
     pub fn target_count(&self) -> usize {
-        self.entries.len()
+        self.entries.len() + self.train_entries.lock().map(|m| m.len()).unwrap_or(0)
     }
 
     pub fn format(&self) -> LoraFormat {
         self.format
+    }
+
+    /// Construct a training-mode LoRA stack from a per-weight-key map of
+    /// `Parameter`-backed `TrainEntry` branches.
+    ///
+    /// Tensors live inside the `Parameter` objects; each forward call
+    /// re-fetches them via `Parameter::tensor()` so that autograd records
+    /// matmul ops against the live, requires-grad tensor. Optimizer-side
+    /// `set_data` after each step pins the Parameter id, so backward grads
+    /// keep landing at the same id across steps.
+    ///
+    /// The `format` field is set to `DiffusionModel` for diagnostic logs;
+    /// it has no behavioural effect — training-mode entries override the
+    /// inference path inside `apply`.
+    pub fn new_training(targets: HashMap<String, Vec<TrainEntry>>) -> Self {
+        LoraStack {
+            entries: HashMap::new(),
+            train_entries: Mutex::new(targets),
+            format: LoraFormat::DiffusionModel,
+        }
+    }
+
+    /// Read-only access to the train entries for diagnostic counting.
+    pub fn training_target_count(&self) -> usize {
+        self.train_entries.lock().map(|m| m.len()).unwrap_or(0)
     }
 
     /// Apply LoRA contributions for `weight_key` to `base_out`.
@@ -336,6 +390,18 @@ impl LoraStack {
     /// `[..., out_features]`. Higher-rank tensors are flattened to 2D
     /// internally and reshaped back.
     pub fn apply(&self, weight_key: &str, x: &Tensor, base_out: Tensor) -> Result<Tensor> {
+        // Training-mode path: live `Parameter`-backed entries refreshed per
+        // apply. Apply additively to base_out, autograd records ops against
+        // the Parameter's underlying tensor (requires_grad=true).
+        let has_train = self
+            .train_entries
+            .lock()
+            .map(|m| m.contains_key(weight_key))
+            .unwrap_or(false);
+        if has_train {
+            return self.apply_training(weight_key, x, base_out);
+        }
+
         let Some(entries) = self.entries.get(weight_key) else {
             return Ok(base_out);
         };
@@ -414,6 +480,102 @@ impl LoraStack {
         }
 
         // Restore original output shape.
+        if out_dims.len() == 2 {
+            Ok(acc)
+        } else {
+            acc.reshape(&out_dims)
+        }
+    }
+
+    /// Training-mode apply: refreshes each entry's Parameter handles, runs
+    /// the matmul chain on the live tensors, and adds the scaled delta to
+    /// `base_out`. Autograd records ops against the Parameter tensors so
+    /// the backward pass populates `GradientMap` at the Parameter ids.
+    ///
+    /// Dtype contract: down/up are constructed BF16 (matching the base
+    /// path). LoRA delta math is BF16 end-to-end — F32 accumulation would
+    /// require flame-core dtype-cast ops which are autograd-tracked; the
+    /// trainer keeps everything in BF16 for memory + autograd simplicity.
+    /// LoRA-B init zero means delta=0 at step 0 (no precision drift).
+    fn apply_training(&self, weight_key: &str, x: &Tensor, base_out: Tensor) -> Result<Tensor> {
+        let map = self
+            .train_entries
+            .lock()
+            .map_err(|_| Error::InvalidOperation("train_entries mutex poisoned".into()))?;
+        let Some(entries) = map.get(weight_key) else {
+            return Ok(base_out);
+        };
+        // Optional trace gate, on with `L2P_TRAIN_LORA_TRACE=1`. Used during
+        // bring-up to verify that the LoRA branch fires AND that the input
+        // `x` arriving from the model carries requires_grad through to here
+        // (any inference-only fused kernel upstream that strips
+        // requires_grad — e.g. `fused_rms_norm`, `swiglu_fused_bf16` — will
+        // surface here as `x.requires_grad=false` and the LoRA chain will
+        // never connect to the loss tape).
+        if std::env::var("L2P_TRAIN_LORA_TRACE").as_deref() == Ok("1") {
+            eprintln!(
+                "[lora_train] applying {} ({} entries) x.requires_grad={} x.dtype={:?}",
+                weight_key,
+                entries.len(),
+                x.requires_grad(),
+                x.dtype()
+            );
+        }
+
+        let base_dtype = base_out.dtype();
+
+        // Flatten x to [B*..., in].
+        let x_dims = x.shape().dims().to_vec();
+        let in_dim = *x_dims.last().expect("x has rank ≥ 1");
+        let flat_rows: usize = x_dims[..x_dims.len() - 1].iter().product();
+        let x_2d = if x_dims.len() == 2 {
+            x.contiguous()?
+        } else {
+            x.reshape(&[flat_rows, in_dim])?
+        };
+
+        // Flatten base_out to [B*..., out].
+        let out_dims = base_out.shape().dims().to_vec();
+        let out_features = *out_dims.last().expect("base_out has rank ≥ 1");
+        let mut acc = if out_dims.len() == 2 {
+            base_out
+        } else {
+            base_out.reshape(&[flat_rows, out_features])?
+        };
+
+        for entry in entries {
+            let down = entry.down.tensor()?; // [in, rank], requires_grad=true
+            let up = entry.up.tensor()?; // [rank, out], requires_grad=true
+
+            // Cast x to LoRA dtype if needed. For DiT body BF16 this is a
+            // no-op (both BF16). Done via to_dtype for autograd safety.
+            let x_cast = if x_2d.dtype() == down.dtype() {
+                x_2d.clone()
+            } else {
+                x_2d.to_dtype(down.dtype())?
+            };
+
+            // (x @ down) @ up * scale. No contiguous() between matmuls — in
+            // training, contiguous() inserts an autograd op that records a
+            // graph dependency; the inference-side contiguous was needed for
+            // mul_scalar's contig-read assumption but matmul outputs are
+            // already row-major from cuBLAS in BF16.
+            let xd = x_cast.matmul(&down)?;
+            let xdu = xd.matmul(&up)?;
+            let delta = xdu.mul_scalar(entry.scale)?;
+            let delta = if delta.dtype() == base_dtype {
+                delta
+            } else {
+                delta.to_dtype(base_dtype)?
+            };
+
+            acc = match entry.slot {
+                Slot::Full | Slot::Cols(_) => acc.add(&delta)?,
+                Slot::Rows(n) => add_at_col_range(&acc, &delta, 0, n)?,
+                Slot::RowRange { start, len } => add_at_col_range(&acc, &delta, start, len)?,
+            };
+        }
+
         if out_dims.len() == 2 {
             Ok(acc)
         } else {
