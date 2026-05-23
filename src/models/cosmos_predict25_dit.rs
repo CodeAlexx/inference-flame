@@ -970,7 +970,7 @@ impl CosmosPredict25Dit {
     ///
     /// Input: `[..., crossattn_proj_in_channels]` BF16.
     /// Output: `[..., crossattn_emb_channels]` BF16.
-    fn apply_crossattn_proj(&self, x: &Tensor) -> Result<Tensor> {
+    pub fn apply_crossattn_proj(&self, x: &Tensor) -> Result<Tensor> {
         let in_dims = x.shape().dims().to_vec();
         if in_dims.len() < 2 {
             return Err(Error::InvalidInput(format!(
@@ -1338,7 +1338,7 @@ impl CosmosPredict25Dit {
     /// `sub_name`: one of "self_attn", "cross_attn", "mlp".
     ///
     /// Returns `(shift, scale, gate)` each `[B, T, model_channels]` BF16.
-    fn adaln_modulation_chunk(
+    pub fn adaln_modulation_chunk(
         &self,
         emb_b_t_d: &Tensor,
         adaln_lora_b_t_3d: &Tensor,
@@ -1374,7 +1374,7 @@ impl CosmosPredict25Dit {
     /// reshaping the LN'd x to `[B*T, H*W, D]` and the modulators to
     /// `[B*T, D]`, then calling `flame_core::bf16_ops::modulate_pre_fused_bf16`
     /// which fuses the (no-affine) LayerNorm with the modulate step.
-    fn apply_layer_norm_modulate(
+    pub fn apply_layer_norm_modulate(
         &self,
         x_b_t_h_w_d: &Tensor,
         shift_b_t_d: &Tensor,
@@ -1399,7 +1399,7 @@ impl CosmosPredict25Dit {
 
     /// Multiply a `[B, T, H, W, D]` tensor by a `[B, T, D]` gate, broadcasting
     /// across (H, W). Returns a freshly materialized tensor.
-    fn apply_gate(
+    pub fn apply_gate(
         &self,
         x_b_t_h_w_d: &Tensor,
         gate_b_t_d: &Tensor,
