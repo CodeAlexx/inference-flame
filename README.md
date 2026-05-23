@@ -34,7 +34,7 @@ Pure Rust diffusion model inference using [flame-core](https://github.com/CodeAl
 | L2P (T2I-L2P, pixel-space) |
 |---|
 | ![L2P](assets/l2p_zidius_eco_fantasy.png) |
-| *Tencent T2I-L2P — Z-Image-Turbo DiT body + 16×16 pixel-space patchify + MicroDiffusionModel U-Net head replacing FinalLayer+unpatchify. Direct 1024² pixel-space generation, **no VAE**. 30 steps, CFG 2.0, shift 3.0, seed 42 — 84s on a 24 GB 3090 Ti. Pure-Rust port; trainer (`train_l2p`) supports LoRA finetuning with Qwen3 caption encoder and `--resume`.* |
+| *Tencent T2I-L2P — Z-Image-Turbo DiT body + 16×16 pixel-space patchify + MicroDiffusionModel U-Net head replacing FinalLayer+unpatchify. Direct 1024² pixel-space generation, **no VAE**. 30 steps, CFG 2.0, shift 3.0, seed 42 — 84s on a 24 GB 3090 Ti.* |
 
 ### Image editing — "change her dress to blue"
 
