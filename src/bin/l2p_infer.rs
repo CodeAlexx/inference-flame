@@ -22,11 +22,13 @@ use flame_core::serialization::load_file;
 use flame_core::{DType, Error, Result};
 use std::time::Instant;
 
+use inference_flame::lora::LoraStack;
 use inference_flame::models::l2p::weight_loader::load_l2p_safetensors;
 use inference_flame::models::l2p::L2pDiT;
 use inference_flame::sampling::l2p_sampling::{
     build_l2p_sigma_schedule, init_l2p_noise, l2p_euler_step,
 };
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // CLI parsing
@@ -42,6 +44,8 @@ struct Args {
     cfg_scale: f32,
     shift: f32,
     seed: u64,
+    lora_path: Option<String>,
+    lora_multiplier: f32,
 }
 
 fn parse_args() -> Args {
@@ -56,6 +60,8 @@ fn parse_args() -> Args {
     let mut cfg_scale: f32 = 2.0;
     let mut shift: f32 = 3.0;
     let mut seed: u64 = 42;
+    let mut lora_path: Option<String> = None;
+    let mut lora_multiplier: f32 = 1.0;
 
     let mut i = 1;
     while i < args.len() {
@@ -96,6 +102,14 @@ fn parse_args() -> Args {
                 i += 1;
                 seed = args[i].parse().expect("Invalid seed");
             }
+            "--lora" => {
+                i += 1;
+                lora_path = Some(args[i].clone());
+            }
+            "--lora-multiplier" => {
+                i += 1;
+                lora_multiplier = args[i].parse().expect("Invalid lora-multiplier");
+            }
             other => {
                 eprintln!("Unknown argument: {other}");
                 std::process::exit(1);
@@ -117,6 +131,8 @@ fn parse_args() -> Args {
         eprintln!("  --cfg         CFG scale (default: 2.0; per L2P README)");
         eprintln!("  --shift       Sigma schedule shift (default: 3.0)");
         eprintln!("  --seed        Random seed (default: 42)");
+        eprintln!("  --lora        Optional LoRA safetensors to attach via set_lora");
+        eprintln!("  --lora-multiplier  LoRA strength multiplier (default: 1.0)");
         std::process::exit(1);
     }
 
@@ -130,6 +146,8 @@ fn parse_args() -> Args {
         cfg_scale,
         shift,
         seed,
+        lora_path,
+        lora_multiplier,
     }
 }
 
@@ -215,7 +233,29 @@ fn main() -> Result<()> {
         t_load.elapsed().as_secs_f32(),
     );
 
+    // Optional LoRA — capture base keys BEFORE moving `translated` into the
+    // model so we can match LoRA targets against the resident weight set.
+    let base_keys: std::collections::HashSet<String> =
+        translated.keys().cloned().collect();
+
     let mut model = L2pDiT::new_resident(translated, device.clone());
+
+    if let Some(ref lora_path) = args.lora_path {
+        println!("\n--- LoRA: {} (mult={:.2}) ---", lora_path, args.lora_multiplier);
+        let t_lora = Instant::now();
+        let lora_stack = LoraStack::load(
+            lora_path,
+            &base_keys,
+            args.lora_multiplier,
+            &device,
+        )?;
+        println!(
+            "    {} target weight(s), loaded in {:.1}s",
+            lora_stack.target_count(),
+            t_lora.elapsed().as_secs_f32(),
+        );
+        model.set_lora(Arc::new(lora_stack));
+    }
 
     // ==================================================================
     // Stage 3: Initial noise (F32 per L2P convention → cast to BF16)

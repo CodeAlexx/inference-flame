@@ -127,6 +127,12 @@ pub struct L2pDiT {
     /// loader is responsible for placing `local_decoder.*` keys in the
     /// map. If they're missing the constructor errors loudly.
     pub local_decoder: MicroDiffusionModel,
+    /// Gradient checkpointing — wrap each transformer_block call inside
+    /// `AutogradContext::checkpoint` so activations are recomputed on
+    /// backward instead of saved. Trades ~30% compute for ~3-4× activation
+    /// memory savings. Required for training at 512²+ on 24 GB.
+    /// Inference (autograd off) routes around this no-op.
+    pub use_grad_checkpoint: bool,
 }
 
 impl L2pDiT {
@@ -153,6 +159,7 @@ impl L2pDiT {
             device,
             lora: None,
             local_decoder,
+            use_grad_checkpoint: false,
         }
     }
 
@@ -215,6 +222,58 @@ impl L2pDiT {
             device,
             lora: None,
             local_decoder,
+            use_grad_checkpoint: false,
+        }
+    }
+
+    /// Enable gradient checkpointing on the 34 transformer_block calls.
+    /// Cuts peak activation memory ~3-4× during training, at ~30% compute
+    /// overhead from recomputation in backward. Required to fit 512²+
+    /// training on 24 GB. Inference (autograd off) is a no-op pass.
+    pub fn set_grad_checkpoint(&mut self, on: bool) {
+        self.use_grad_checkpoint = on;
+    }
+
+    /// Run one transformer_block, optionally inside an autograd checkpoint.
+    ///
+    /// Mirrors the SD3.5 checkpoint pattern: capture `&self` via a raw
+    /// pointer because `AutogradContext::checkpoint`'s closure must be
+    /// `Fn() + Send + Sync + 'static`. The pointer is only ever read,
+    /// never written, and the closure is consumed during the same step
+    /// before `self` can move or drop (the trainer drives the forward
+    /// then immediately calls `loss.backward()` on the result).
+    fn block_forward_maybe_checkpoint(
+        &self,
+        x: &Tensor,
+        rope_cos: &Tensor,
+        rope_sin: &Tensor,
+        t_cond: Option<&Tensor>,
+        prefix: &str,
+    ) -> Result<Tensor> {
+        if self.use_grad_checkpoint
+            && flame_core::autograd::AutogradContext::is_recording()
+        {
+            let self_ptr = self as *const Self as usize;
+            let prefix_owned = prefix.to_string();
+            let rope_cos_c = rope_cos.clone();
+            let rope_sin_c = rope_sin.clone();
+            let t_cond_c = t_cond.cloned();
+            let x_c = x.clone();
+            flame_core::autograd::AutogradContext::checkpoint(
+                &[x_c.clone()],
+                move || {
+                    let model = unsafe { &*(self_ptr as *const Self) };
+                    model.transformer_block(
+                        &x_c,
+                        &rope_cos_c,
+                        &rope_sin_c,
+                        t_cond_c.as_ref(),
+                        &prefix_owned,
+                    )
+                },
+            )
+        } else {
+            self.transformer_block(x, rope_cos, rope_sin, t_cond, prefix)
         }
     }
 
@@ -775,7 +834,7 @@ impl L2pDiT {
         for i in 0..self.config.num_context_refiner {
             let prefix = format!("context_refiner.{i}");
             self.load_block(&prefix)?;
-            c = self.transformer_block(&c, &rope_cos_cap, &rope_sin_cap, None, &prefix)?;
+            c = self.block_forward_maybe_checkpoint(&c, &rope_cos_cap, &rope_sin_cap, None, &prefix)?;
             self.unload_block();
             cap!(format!("context_refiner_{i}_out", i = i), &c);
         }
@@ -786,7 +845,7 @@ impl L2pDiT {
             let prefix = format!("noise_refiner.{i}");
             self.load_block(&prefix)?;
             x_emb =
-                self.transformer_block(&x_emb, &rope_cos_img, &rope_sin_img, Some(&t_cond), &prefix)?;
+                self.block_forward_maybe_checkpoint(&x_emb, &rope_cos_img, &rope_sin_img, Some(&t_cond), &prefix)?;
             self.unload_block();
             cap!(format!("noise_refiner_{i}_out", i = i), &x_emb);
         }
@@ -800,7 +859,7 @@ impl L2pDiT {
         for i in 0..self.config.num_layers {
             let prefix = format!("layers.{i}");
             self.load_block(&prefix)?;
-            xc = self.transformer_block(&xc, &rope_cos_full, &rope_sin_full, Some(&t_cond), &prefix)?;
+            xc = self.block_forward_maybe_checkpoint(&xc, &rope_cos_full, &rope_sin_full, Some(&t_cond), &prefix)?;
             self.unload_block();
             cap!(format!("unified_after_layer_{:02}", i), &xc);
         }

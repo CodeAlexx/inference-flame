@@ -751,7 +751,21 @@ fn map_prefix_diffusion_model(prefix: &str) -> Option<(String, Slot)> {
 
     // Generic fallback for everything else (FFN, adaLN, non-Z-Image
     // architectures whose attention path doesn't match the patterns above).
-    Some((format!("{stripped}.weight"), Slot::Full))
+    //
+    // PEFT-format trainer saves embed `.weight` in the prefix
+    // (`<...>.qkv.weight.lora_A.weight`), so `stripped` already ends in
+    // `.weight` — appending another would produce `.weight.weight` and the
+    // model's `lora.apply("<...>.qkv.weight", ...)` lookup misses, silently
+    // no-op'ing the LoRA. SimpleTuner/Kohya saves DON'T include the
+    // intermediate `.weight`, so we still append in that case. Fix
+    // 2026-05-22 after a 1000-step L2P LoRA produced bit-identical renders
+    // with --lora vs no --lora.
+    let target_key = if stripped.ends_with(".weight") {
+        stripped.to_string()
+    } else {
+        format!("{stripped}.weight")
+    };
+    Some((target_key, Slot::Full))
 }
 
 fn build_kohya_unet_table(base_keys: &HashSet<String>) -> HashMap<String, String> {

@@ -31,6 +31,11 @@ Pure Rust diffusion model inference using [flame-core](https://github.com/CodeAl
 | ![Stable Cascade](docs/cascade_sample.png) | ![SenseNova-U1](docs/sensenova_u1_sample.png) | ![Nucleus-Image](docs/nucleus_sample.png) |
 | *Stage C 30 + Stage B 20 steps, CFG 5.0/1.1, 1024², 93s — two-stage Würstchen v3 (Stage C prior + Stage B decoder + Paella VQ-GAN)* | *50 steps, CFG 4.0, shift 3.0, 1024², ~3.5 min on 3090 Ti via BlockOffloader* | *30 steps, CFG 4.0 (CFG-Zero* norm rescale), 1024², ~6 min on 3090 Ti — sparse MoE: 3 dense + 29 MoE blocks × 64 experts, BlockOffloader streams the ~15 GB expert weights* |
 
+| L2P (T2I-L2P, pixel-space) |
+|---|
+| ![L2P](assets/l2p_zidius_eco_fantasy.png) |
+| *Tencent T2I-L2P — Z-Image-Turbo DiT body + 16×16 pixel-space patchify + MicroDiffusionModel U-Net head replacing FinalLayer+unpatchify. Direct 1024² pixel-space generation, **no VAE**. 30 steps, CFG 2.0, shift 3.0, seed 42 — 84s on a 24 GB 3090 Ti. Pure-Rust port; trainer (`train_l2p`) supports LoRA finetuning with Qwen3 caption encoder, ai-toolkit's uniform sigma recipe, and `--resume`.* |
+
 ### Image editing — "change her dress to blue"
 
 | Source | Klein 4B edit | Klein 9B edit | Qwen-Image-Edit-2511 |

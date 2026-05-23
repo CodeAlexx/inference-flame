@@ -590,6 +590,14 @@ path = "src/bin/sensenova_u1_interleaved.rs"
 name = "l2p_infer"
 path = "src/bin/l2p_infer.rs"
 
+[[bin]]
+name = "l2p_parity_capture"
+path = "src/bin/l2p_parity_capture.rs"
+
+[[bin]]
+name = "l2p_loss_parity"
+path = "src/bin/l2p_loss_parity.rs"
+
 # ---------------------------------------------------------------------------
 # Integration tests (tests/*.rs) — enumerated manually because autotests=false.
 # ---------------------------------------------------------------------------
