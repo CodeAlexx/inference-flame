@@ -18,6 +18,10 @@ flame-core = { path = "../flame-core", default-features = false, features = ["cu
 flame-diffusion = { path = "../flame-diffusion" }
 lanpaint-flame = { path = "../lanpaint-flame" }
 lycoris-rs = { path = "../eri-lycoris/lycoris-rs" }
+# Pure-Rust mmap'd safetensors reader. Used by lens_infer for the streaming
+# per-tensor BF16 conversion path that keeps GPU load peak ≈ one tensor F32
+# instead of one full shard F32 (~9.5 GB). See lens/FLAMECORE_GAPS.md gap 3.
+eri-safetensors = { path = "../EriDiffusion-v2/eri-safetensors" }
 cudarc = { version = "0.11.9", default-features = false, features = ["driver", "cublas", "cublaslt", "nvrtc", "cuda-12050", "f16"] }
 half = { version = "2.3", features = ["num-traits"] }
 serde_json = "1.0"
@@ -223,6 +227,14 @@ name = "klein_lora_infer"
 path = "src/bin/klein_lora_infer.rs"
 
 [[bin]]
+name = "lens_infer"
+path = "src/bin/lens_infer.rs"
+
+[[bin]]
+name = "gpt_oss_parity"
+path = "src/bin/gpt_oss_parity.rs"
+
+[[bin]]
 name = "klein_edit_infer"
 path = "src/bin/klein_edit_infer.rs"
 
@@ -412,6 +424,10 @@ path = "src/bin/cosmos_predict25_i2v_infer.rs"
 [[bin]]
 name = "cosmos_predict25_v2v_infer"
 path = "src/bin/cosmos_predict25_v2v_infer.rs"
+
+[[bin]]
+name = "cosmos_predict25_parity"
+path = "src/bin/cosmos_predict25_parity.rs"
 
 [[bin]]
 name = "wan_smoke"

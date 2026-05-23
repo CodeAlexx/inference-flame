@@ -4,6 +4,7 @@ pub mod ltx2_sampling;
 pub mod ltx2_guidance;
 pub mod ltx2_multiscale;
 pub mod klein_sampling;
+pub mod lens_flowmatch;
 pub mod flux1_sampling;
 pub mod kandinsky5_sampling;
 pub mod ernie_sampling;

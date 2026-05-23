@@ -391,9 +391,13 @@ impl KleinVaeDecoder {
 
         // BatchNorm inverse normalization: z * sqrt(var + eps) + mean
         // BFL stores bn.running_mean [128] and bn.running_var [128] as F32.
-        // eps matches diffusers ErnieImagePipeline.decode path
-        // (pipeline_ernie_image.py:367 — `running_var + 1e-5`).
-        let bn_eps = 1e-5f32;
+        // eps matches the FLUX.2 VAE config (`batch_norm_eps: 0.0001`), which is
+        // also what `lens/pipeline.py` reads from `vae.config.batch_norm_eps`.
+        // The diffusers ErnieImagePipeline hardcodes `1e-5` (pipeline_ernie_image.py:367),
+        // but that is a Python upstream bug — the same VAE file (md5-identical) carries
+        // `1e-4` in its config. The encoder side below (load() in KleinVaeEncoder) also
+        // uses `1e-4`; this keeps both sides of the same file consistent.
+        let bn_eps = 1e-4f32;
         let bn_scale = if let Some(var) = weights.get("bn.running_var") {
             let var_f32 = var.to_dtype(DType::F32)?;
             let scale_f32 = var_f32.add_scalar(bn_eps)?.sqrt()?;

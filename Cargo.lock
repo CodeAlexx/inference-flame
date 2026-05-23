@@ -687,6 +687,7 @@ dependencies = [
  "anyhow",
  "cudarc",
  "env_logger 0.10.2",
+ "eri-safetensors",
  "flame-core",
  "flame-diffusion",
  "half",

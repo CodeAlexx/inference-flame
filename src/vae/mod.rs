@@ -8,6 +8,8 @@ pub mod ltx2_encoder;
 pub use ltx2_encoder::LTX2VaeEncoder;
 pub mod klein_vae;
 pub use klein_vae::KleinVaeDecoder;
+pub mod lens_vae_wrapper;
+pub use lens_vae_wrapper::LensVaeWrapper;
 pub mod wan21_vae;
 pub use wan21_vae::Wan21VaeDecoder;
 pub mod wan21_encoder;
