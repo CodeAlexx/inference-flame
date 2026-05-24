@@ -191,6 +191,34 @@ impl MicroDiffusionModel {
     /// H/16-resolution output. At 1024² inference (H/W multiples of 16)
     /// this branch does NOT fire.
     pub fn forward(&self, noisy_input: &Tensor, feat_map: &Tensor) -> Result<Tensor> {
+        self.forward_inner(noisy_input, feat_map, None)
+    }
+
+    /// Forward with per-stage capture for backward-parity diff. Inserts the
+    /// output of each U-Net stage into `capture` under the key `unet.<name>`
+    /// so the grad-dump harness can retain their grads.
+    pub fn forward_with_capture(
+        &self,
+        noisy_input: &Tensor,
+        feat_map: &Tensor,
+        capture: &mut std::collections::HashMap<String, Tensor>,
+    ) -> Result<Tensor> {
+        self.forward_inner(noisy_input, feat_map, Some(capture))
+    }
+
+    fn forward_inner(
+        &self,
+        noisy_input: &Tensor,
+        feat_map: &Tensor,
+        mut capture: Option<&mut std::collections::HashMap<String, Tensor>>,
+    ) -> Result<Tensor> {
+        macro_rules! cap {
+            ($name:expr, $tensor:expr) => {
+                if let Some(c) = capture.as_deref_mut() {
+                    c.insert(format!("unet.{}", $name), $tensor.clone());
+                }
+            };
+        }
         // Dtype contract: chunk-4 pipeline must pre-cast F32 noise to BF16.
         // Conv2d::forward errors on non-BF16; surface the contract here.
         debug_assert_eq!(
@@ -208,19 +236,27 @@ impl MicroDiffusionModel {
 
         // Stage 1: enc1 + pool1 → [B, 64, H/2, W/2]
         let enc1_out = self.enc1.forward(noisy_input)?.silu()?;
+        cap!("enc1_out", &enc1_out);
         let p1_out = self.pool_nchw(&enc1_out)?;
+        cap!("p1_out", &p1_out);
 
         // Stage 2: enc2 + pool2 → [B, 128, H/4, W/4]
         let enc2_out = self.enc2.forward(&p1_out)?.silu()?;
+        cap!("enc2_out", &enc2_out);
         let p2_out = self.pool_nchw(&enc2_out)?;
+        cap!("p2_out", &p2_out);
 
         // Stage 3: enc3 + pool3 → [B, 256, H/8, W/8]
         let enc3_out = self.enc3.forward(&p2_out)?.silu()?;
+        cap!("enc3_out", &enc3_out);
         let p3_out = self.pool_nchw(&enc3_out)?;
+        cap!("p3_out", &p3_out);
 
         // Stage 4: enc4 + pool4 → [B, 512, H/16, W/16]
         let enc4_out = self.enc4.forward(&p3_out)?.silu()?;
+        cap!("enc4_out", &enc4_out);
         let p4_out = self.pool_nchw(&enc4_out)?;
+        cap!("p4_out", &p4_out);
 
         // -- Bottleneck ---------------------------------------------------
         // Align feat_map to p4_out spatial shape if they differ. At 1024²
@@ -239,40 +275,61 @@ impl MicroDiffusionModel {
         } else {
             feat_map.clone()
         };
+        cap!("feat_aligned", &feat_aligned);
         // Cat #1: bottleneck input. Conv1×1 reads it — must be contig.
         let cat = Tensor::cat(&[&p4_out, &feat_aligned], 1)?.contiguous()?;
+        cap!("cat_bot", &cat);
         let bottleneck_out = self.bottleneck.forward(&cat)?.silu()?;
+        cap!("bottleneck_out", &bottleneck_out);
 
         // -- Decoder stage 4: up4 + cat enc4 + dec4 → [B, 256, H/8, W/8] --
-        let up4_out = self.upsample2x.forward(&bottleneck_out)?;
-        let up4_out = self.up4_conv.forward(&up4_out)?;
+        let up4_pre = self.upsample2x.forward(&bottleneck_out)?;
+        cap!("up4_pre_conv", &up4_pre);
+        let up4_out = self.up4_conv.forward(&up4_pre)?;
+        cap!("up4_out", &up4_out);
         // Cat #2: skip connection. Conv3×3 reads it — must be contig.
         let cat4 = Tensor::cat(&[&up4_out, &enc4_out], 1)?.contiguous()?;
+        cap!("cat4", &cat4);
         let dec4_out = self.dec4.forward(&cat4)?.silu()?;
+        cap!("dec4_out", &dec4_out);
 
         // -- Decoder stage 3: up3 + cat enc3 + dec3 → [B, 128, H/4, W/4] --
-        let up3_out = self.upsample2x.forward(&dec4_out)?;
-        let up3_out = self.up3_conv.forward(&up3_out)?;
+        let up3_pre = self.upsample2x.forward(&dec4_out)?;
+        cap!("up3_pre_conv", &up3_pre);
+        let up3_out = self.up3_conv.forward(&up3_pre)?;
+        cap!("up3_out", &up3_out);
         // Cat #3: skip connection.
         let cat3 = Tensor::cat(&[&up3_out, &enc3_out], 1)?.contiguous()?;
+        cap!("cat3", &cat3);
         let dec3_out = self.dec3.forward(&cat3)?.silu()?;
+        cap!("dec3_out", &dec3_out);
 
         // -- Decoder stage 2: up2 + cat enc2 + dec2 → [B, 64, H/2, W/2] --
-        let up2_out = self.upsample2x.forward(&dec3_out)?;
-        let up2_out = self.up2_conv.forward(&up2_out)?;
+        let up2_pre = self.upsample2x.forward(&dec3_out)?;
+        cap!("up2_pre_conv", &up2_pre);
+        let up2_out = self.up2_conv.forward(&up2_pre)?;
+        cap!("up2_out", &up2_out);
         // Cat #4: skip connection.
         let cat2 = Tensor::cat(&[&up2_out, &enc2_out], 1)?.contiguous()?;
+        cap!("cat2", &cat2);
         let dec2_out = self.dec2.forward(&cat2)?.silu()?;
+        cap!("dec2_out", &dec2_out);
 
         // -- Decoder stage 1: up1 + cat enc1 + dec1 → [B, 64, H, W] ------
-        let up1_out = self.upsample2x.forward(&dec2_out)?;
-        let up1_out = self.up1_conv.forward(&up1_out)?;
+        let up1_pre = self.upsample2x.forward(&dec2_out)?;
+        cap!("up1_pre_conv", &up1_pre);
+        let up1_out = self.up1_conv.forward(&up1_pre)?;
+        cap!("up1_out", &up1_out);
         // Cat #5: skip connection.
         let cat1 = Tensor::cat(&[&up1_out, &enc1_out], 1)?.contiguous()?;
+        cap!("cat1", &cat1);
         let dec1_out = self.dec1.forward(&cat1)?.silu()?;
+        cap!("dec1_out", &dec1_out);
 
         // -- Output projection: out_conv (1×1) → [B, 3, H, W] ------------
-        self.out_conv.forward(&dec1_out)
+        let out = self.out_conv.forward(&dec1_out)?;
+        cap!("out_conv_out", &out);
+        Ok(out)
     }
 
     /// NCHW MaxPool2d helper. flame-core's `MaxPool2d::forward` requires

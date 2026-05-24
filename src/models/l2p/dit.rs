@@ -439,15 +439,22 @@ impl L2pDiT {
         let dims = x.shape().dims().to_vec();
         let (b, seq, num_heads, head_dim) = (dims[0], dims[1], self.config.num_heads, self.config.head_dim);
 
+        // Intra-attention probes for cascade bisect.
+        let probe_this_layer = crate::models::l2p::block_trap::is_target_layer(prefix);
+        macro_rules! aprobe { ($name:expr, $tensor:expr) => {
+            if probe_this_layer { crate::models::l2p::block_trap::record($name, $tensor.id()); }
+        }; }
+
         let t = std::time::Instant::now();
-        // Fused QKV weight key. The chunk-4 weight loader pre-fuses
-        // the L2P safetensors' separate `attention.to_q/to_k/to_v`
-        // into this single `attention.qkv.weight`.
         let qkv = self.linear_no_bias(x, &format!("{prefix}.attention.qkv.weight"))?;
+        aprobe!("a0.qkv", &qkv);
         let chunks = qkv.chunk(3, 2)?;
         let q = chunks[0].reshape(&[b, seq, num_heads, head_dim])?;
         let k = chunks[1].reshape(&[b, seq, num_heads, head_dim])?;
         let v = chunks[2].reshape(&[b, seq, num_heads, head_dim])?;
+        aprobe!("a1.q_post_split", &q);
+        aprobe!("a2.k_post_split", &k);
+        aprobe!("a3.v_post_split", &v);
         mark("a.qkv_proj+chunk", t);
 
         let t = std::time::Instant::now();
@@ -457,12 +464,17 @@ impl L2pDiT {
         let k_flat = k.reshape(&[b * seq * num_heads, head_dim])?;
         let q = self.rms_norm_dispatch(&q_flat, q_w, self.config.norm_eps)?.reshape(&[b, seq, num_heads, head_dim])?;
         let k = self.rms_norm_dispatch(&k_flat, k_w, self.config.norm_eps)?.reshape(&[b, seq, num_heads, head_dim])?;
+        aprobe!("b1.q_post_qknorm", &q);
+        aprobe!("b2.k_post_qknorm", &k);
         mark("b.qk_rmsnorm", t);
 
         let t = std::time::Instant::now();
         let q = q.permute(&[0, 2, 1, 3])?;
         let k = k.permute(&[0, 2, 1, 3])?;
         let v = v.permute(&[0, 2, 1, 3])?;
+        aprobe!("c1.q_post_permute", &q);
+        aprobe!("c2.k_post_permute", &k);
+        aprobe!("c3.v_post_permute", &v);
         mark("c.permute_qkv", t);
 
         let t = std::time::Instant::now();
@@ -471,15 +483,20 @@ impl L2pDiT {
         let sin = rope_sin.reshape(&[1, 1, seq, half_d])?;
         let q = rope_fused_bf16(&q, &cos, &sin)?;
         let k = rope_fused_bf16(&k, &cos, &sin)?;
+        aprobe!("d1.q_post_rope", &q);
+        aprobe!("d2.k_post_rope", &k);
         mark("d.rope", t);
 
         let t = std::time::Instant::now();
         let out = sdpa(&q, &k, &v, None)?;
+        aprobe!("e0.sdpa_out", &out);
         mark("e.sdpa", t);
 
         let t = std::time::Instant::now();
         let out = out.permute(&[0, 2, 1, 3])?;
+        aprobe!("f1.out_post_permute", &out);
         let out = out.reshape(&[b, seq, num_heads * head_dim])?;
+        aprobe!("f2.out_post_reshape", &out);
         mark("f.permute_out", t);
 
         let t = std::time::Instant::now();
@@ -530,9 +547,18 @@ impl L2pDiT {
         mark("1.adaln_mod", t);
 
         // --- Attention branch ---
+        let probe_this_layer = crate::models::l2p::block_trap::is_target_layer(prefix);
+        macro_rules! probe { ($name:expr, $tensor:expr) => {
+            if probe_this_layer {
+                crate::models::l2p::block_trap::record($name, $tensor.id());
+            }
+        }; }
+        probe!("00.x_in", x);
+
         let t = std::time::Instant::now();
         let norm1_w = self.w(&format!("{prefix}.attention_norm1.weight"))?;
         let x_norm = self.rms_norm_dispatch(x, norm1_w, self.config.norm_eps)?;
+        probe!("01.x_norm1", &x_norm);
         let x_norm = if let Some(ref scale) = scale_msa {
             let scale_unsq = scale.unsqueeze(1)?;
             let factor = scale_unsq.add_scalar(1.0)?;
@@ -540,27 +566,32 @@ impl L2pDiT {
         } else {
             x_norm
         };
+        probe!("02.x_norm1_scaled", &x_norm);
         mark("2.rms1+scale_msa", t);
 
         let t = std::time::Instant::now();
         let attn_out = self.joint_attention(&x_norm, rope_cos, rope_sin, prefix)?;
+        probe!("03.attn_out", &attn_out);
         mark("3.joint_attention", t);
 
         let t = std::time::Instant::now();
         let norm2_w = self.w(&format!("{prefix}.attention_norm2.weight"))?;
         let attn_out = self.rms_norm_dispatch(&attn_out, norm2_w, self.config.norm_eps)?;
+        probe!("04.attn_norm2", &attn_out);
         let x_out = if let Some(ref gate) = gate_msa {
             let g = gate.tanh()?;
             gate_residual_fused_bf16(x, &g, &attn_out)?
         } else {
             x.add(&attn_out)?
         };
+        probe!("05.x_after_attn_res", &x_out);
         mark("4.rms2+gate1", t);
 
         // --- FFN branch ---
         let t = std::time::Instant::now();
         let ffn_norm1_w = self.w(&format!("{prefix}.ffn_norm1.weight"))?;
         let ff_norm = self.rms_norm_dispatch(&x_out, ffn_norm1_w, self.config.norm_eps)?;
+        probe!("06.ff_norm1", &ff_norm);
         let ff_norm = if let Some(ref scale) = scale_mlp {
             let scale_unsq = scale.unsqueeze(1)?;
             let factor = scale_unsq.add_scalar(1.0)?;
@@ -568,21 +599,25 @@ impl L2pDiT {
         } else {
             ff_norm
         };
+        probe!("07.ff_norm1_scaled", &ff_norm);
         mark("5.rms3+scale_mlp", t);
 
         let t = std::time::Instant::now();
         let ff_out = self.swiglu(&ff_norm, prefix)?;
+        probe!("08.ff_out", &ff_out);
         mark("6.swiglu", t);
 
         let t = std::time::Instant::now();
         let ffn_norm2_w = self.w(&format!("{prefix}.ffn_norm2.weight"))?;
         let ff_out = self.rms_norm_dispatch(&ff_out, ffn_norm2_w, self.config.norm_eps)?;
+        probe!("09.ff_norm2", &ff_out);
         let x_out = if let Some(ref gate) = gate_mlp {
             let g = gate.tanh()?;
             gate_residual_fused_bf16(&x_out, &g, &ff_out)?
         } else {
             x_out.add(&ff_out)?
         };
+        probe!("10.x_out", &x_out);
         mark("7.rms4+gate2", t);
 
         if prof {
@@ -888,8 +923,14 @@ impl L2pDiT {
             .contiguous()?;
         cap!("feat_map", &feat_map);
 
-        // U-Net head: pixel-space prediction
-        let local_out = self.local_decoder.forward(&noisy_pixel, &feat_map)?;
+        // U-Net head: pixel-space prediction. When parity capture is on,
+        // route through forward_with_capture so per-stage U-Net activations
+        // are stashed alongside the outer DiT captures.
+        let local_out = if let Some(c) = capture.as_deref_mut() {
+            self.local_decoder.forward_with_capture(&noisy_pixel, &feat_map, c)?
+        } else {
+            self.local_decoder.forward(&noisy_pixel, &feat_map)?
+        };
         cap!("local_decoder_out", &local_out);
 
         // Sign-flip (matches both NextDiT's `mul_scalar(-1.0)` and

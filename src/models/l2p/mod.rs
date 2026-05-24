@@ -13,6 +13,7 @@
 //! No forward pass, no weight loader, no pipeline yet — those land in
 //! later chunks per `BUILD_PLAN.md`.
 
+pub mod block_trap;
 pub mod dit;
 pub mod local_decoder;
 pub mod rope;
