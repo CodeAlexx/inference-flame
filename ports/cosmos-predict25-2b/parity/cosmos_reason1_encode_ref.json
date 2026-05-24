@@ -1,0 +1,11 @@
+{
+  "snapshot": "/home/alex/.cosmos-predict25/Cosmos-Reason1-7B",
+  "prompt": "a cat in a sunlit garden, photorealistic",
+  "system_prompt": "You are a helpful assistant who will provide prompts to an image generator.",
+  "num_layers": 28,
+  "hidden_size": 3584,
+  "pad_id": 151643,
+  "pad_tokens": 512,
+  "full_concat_dim": 100352,
+  "mean_pooling_dim": 3584
+}

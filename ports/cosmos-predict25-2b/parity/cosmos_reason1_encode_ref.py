@@ -32,7 +32,12 @@ import torch
 
 try:
     from safetensors.torch import save_file
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoTokenizer
+    try:
+        from transformers import Qwen2_5_VLForConditionalGeneration as _Qwen25VL
+    except ImportError:
+        _Qwen25VL = None
+    from transformers import AutoModelForCausalLM
 except ImportError as e:
     print(f"ERROR: {e}. `pip install transformers safetensors`")
     sys.exit(1)
@@ -44,10 +49,7 @@ QWEN25VL_PAD_ID = 151643
 COSMOS_SYSTEM_PROMPT = (
     "You are a helpful assistant who will provide prompts to an image generator."
 )
-TEST_PROMPT = (
-    "A robot picks up a red cup from the table and places it on the shelf. "
-    "Realistic, physical motion, soft daylight."
-)
+TEST_PROMPT = "a cat in a sunlit garden, photorealistic"
 
 
 def find_snapshot() -> Path:
@@ -122,7 +124,10 @@ def main() -> int:
     # (text_encoder.py iterates `outputs.hidden_states[1:]` — skips the
     # input-embedding entry, then mean-normalizes each).
     print("Loading model in BF16 on CUDA (~14 GB)...")
-    model = AutoModelForCausalLM.from_pretrained(
+    if _Qwen25VL is None:
+        print("ERROR: transformers lacks Qwen2_5_VLForConditionalGeneration. Upgrade `transformers`.")
+        return 1
+    model = _Qwen25VL.from_pretrained(
         snap,
         torch_dtype=torch.bfloat16,
         device_map="cuda",
@@ -131,7 +136,11 @@ def main() -> int:
     model.eval()
 
     with torch.no_grad():
-        out = model(
+        # Qwen2.5-VL ForConditionalGeneration exposes a text-only LM through
+        # `model.model` (or `model.language_model`). Run that path so we
+        # don't need vision inputs.
+        lm = getattr(model, "language_model", None) or getattr(model, "model", None) or model
+        out = lm(
             input_ids=ids_tensor,
             attention_mask=None,
             output_hidden_states=True,
@@ -166,6 +175,8 @@ def main() -> int:
         ),
         "full_concat_bf16": full_concat,
         "mean_pooling_bf16": mean_pool,
+        # Alias for downstream parity scripts (per-layer DiT capture).
+        "prompt_emb_bf16": full_concat.clone(),
     }
     for i, t in enumerate(normalized):
         fixture[f"normalized_layer_{i:02d}_bf16"] = t.to(torch.bfloat16).contiguous()

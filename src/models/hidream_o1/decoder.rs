@@ -50,6 +50,19 @@ use flame_core::norm::RMSNorm;
 use flame_core::{bf16_ops, cuda_ops_bf16, CudaDevice, DType, Error, Result, Tensor};
 
 use super::HiDreamO1Config;
+use super::lora::add_lora_residual;
+
+fn backward_probe_layer_idx(num_layers: usize) -> usize {
+    std::env::var("HIDREAM_BWD_PROBE_LAYER")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|&idx| idx < num_layers)
+        .unwrap_or(num_layers.saturating_sub(1))
+}
+
+fn should_record_backward_probe(layer_idx: usize, cfg: &HiDreamO1Config) -> bool {
+    super::trap::is_armed() && layer_idx == backward_probe_layer_idx(cfg.num_layers)
+}
 
 /// One Qwen3-VL text decoder block, configured for HiDream-O1.
 ///
@@ -376,28 +389,25 @@ pub fn decoder_forward_with_weights_lora(
             (None, None, None)
         };
 
-    // Dispatch helper: when a matching LoRA adapter exists for this layer +
-    // suffix, route through `fused_linear3d_native_lora`; otherwise fall back
-    // to the plain `fused_linear3d_native` (byte-identical no-LoRA path).
+    // Dispatch helper: base GEMM goes through `fused_linear3d_native_pytorch_parity`
+    // (bit-exact PyTorch `nn.Linear` semantics via cuBLASLt). The other HiDream-O1
+    // heads (`timestep_embedder`, `final_layer`, `bottleneck_patch_embed`) already
+    // use this variant; the 252 LoRA-fied decoder linears were the last stragglers
+    // on the non-parity `fused_linear3d_native` path. Across 252 linears × 36
+    // layers × per-step the 1-ULP-per-linear drift compounds into a measurable
+    // shift in trained-LoRA weights vs the ai-toolkit reference. The LoRA
+    // residual is delegated to `add_lora_residual` (lora.rs) which keeps F32
+    // adapter params in F32 — preserving the F32 parameter-gradient surface
+    // ai-toolkit's autocast LoRA modules expect.
     let lora_linear = |x: &Tensor,
                        w: &Tensor,
                        b: Option<&Tensor>,
                        suffix: &str|
      -> Result<Tensor> {
+        let base = flame_core::ops::fused_inference::fused_linear3d_native_pytorch_parity(x, w, b)?;
         match lora.and_then(|r| r.get(layer_idx, suffix)) {
-            Some(adapter) => {
-                let a_t = adapter.a_tensor()?;
-                let b_t = adapter.b_tensor()?;
-                flame_core::ops::fused_inference::fused_linear3d_native_lora(
-                    x,
-                    w,
-                    b,
-                    Some(&a_t),
-                    Some(&b_t),
-                    adapter.scale,
-                )
-            }
-            None => flame_core::ops::fused_inference::fused_linear3d_native(x, w, b),
+            Some(adapter) => add_lora_residual(base, x, adapter),
+            None => Ok(base),
         }
     };
 
@@ -407,7 +417,7 @@ pub fn decoder_forward_with_weights_lora(
     log_mem("after_k_proj");
     let v = lora_linear(&normed, v_w, v_b, "self_attn.v_proj")?;
     log_mem("after_v_proj");
-    // Soul.md trap (layer 0, V-path): record v_proj's output ID. With
+    // Soul.md trap: record Q/K/V projection output IDs. With
     // gradient checkpointing, the *first* forward runs no-autograd and the
     // ID we capture there isn't on any tape. The ID we want is from the
     // *recompute* forward (autograd enabled). Re-record on every call so
@@ -418,10 +428,14 @@ pub fn decoder_forward_with_weights_lora(
     // grad is cos≈0.999 (clean upstream signal) while q/k/v_proj LoRA-B
     // grads are cos≈0.05 (corrupt downstream output) — so at layer 35 we
     // see the bug fire locally without 35 layers of cascade noise.
-    if layer_idx == cfg.num_layers - 1 && super::trap::is_armed() {
+    if should_record_backward_probe(layer_idx, cfg) {
+        super::trap::record_probe("q_proj_out", q.id());
+        super::trap::record_probe("k_proj_out", k.id());
         super::trap::record_probe("v_proj_out", v.id());
         if flame_core::autograd::AutogradContext::is_checkpoint_recompute() {
             let mut s = std::collections::HashSet::new();
+            s.insert(q.id());
+            s.insert(k.id());
             s.insert(v.id());
             flame_core::autograd::AutogradContext::retain_intermediate_grads_add(s);
         }
@@ -452,8 +466,22 @@ pub fn decoder_forward_with_weights_lora(
     let k = bf16_ops::rope_halfsplit_bf16_pytorch(&k, pe_cos, pe_sin)?;
     log_mem("after_rope");
 
-    let k = repeat_kv(&k, n_rep)?;
-    let v = repeat_kv(&v, n_rep)?;
+    let k_gqa = k;
+    let v_gqa = v;
+    if should_record_backward_probe(layer_idx, cfg) {
+        super::trap::record_probe("q_sdpa_in", q.id());
+        super::trap::record_probe("k_sdpa_in", k_gqa.id());
+        super::trap::record_probe("v_sdpa_in", v_gqa.id());
+        if flame_core::autograd::AutogradContext::is_checkpoint_recompute() {
+            let mut s = std::collections::HashSet::new();
+            s.insert(q.id());
+            s.insert(k_gqa.id());
+            s.insert(v_gqa.id());
+            flame_core::autograd::AutogradContext::retain_intermediate_grads_add(s);
+        }
+    }
+    let k = repeat_kv(&k_gqa, n_rep)?;
+    let v = repeat_kv(&v_gqa, n_rep)?;
     log_mem("after_repeat_kv");
     // Soul.md trap (layer 0): probe V after repeat_kv = SDPA's V input.
     // Splits the search between SDPA bwd (above) and repeat_kv+reshape bwd
@@ -462,7 +490,7 @@ pub fn decoder_forward_with_weights_lora(
     // grad is cos≈0.999 (clean upstream signal) while q/k/v_proj LoRA-B
     // grads are cos≈0.05 (corrupt downstream output) — so at layer 35 we
     // see the bug fire locally without 35 layers of cascade noise.
-    if layer_idx == cfg.num_layers - 1 && super::trap::is_armed() {
+    if should_record_backward_probe(layer_idx, cfg) {
         super::trap::record_probe("v_post_repeat_kv", v.id());
         if flame_core::autograd::AutogradContext::is_checkpoint_recompute() {
             let mut s = std::collections::HashSet::new();
@@ -477,7 +505,7 @@ pub fn decoder_forward_with_weights_lora(
     // backward op instead of two independent SDPA nodes over shared K/V.
     let attn_out = match two_pass_ar_len {
         Some(ar_len) if attention_mask.is_none() => {
-            hidream_o1_two_pass_attention(&q, &k, &v, ar_len)?
+            hidream_o1_two_pass_attention(&q, &k_gqa, &v_gqa, ar_len)?
         }
         _ => chunked_sdpa(&q, &k, &v, attention_mask)?,
     };
@@ -489,7 +517,7 @@ pub fn decoder_forward_with_weights_lora(
     // grad is cos≈0.999 (clean upstream signal) while q/k/v_proj LoRA-B
     // grads are cos≈0.05 (corrupt downstream output) — so at layer 35 we
     // see the bug fire locally without 35 layers of cascade noise.
-    if layer_idx == cfg.num_layers - 1 && super::trap::is_armed() {
+    if should_record_backward_probe(layer_idx, cfg) {
         super::trap::record_probe("attn_out", attn_out.id());
         if flame_core::autograd::AutogradContext::is_checkpoint_recompute() {
             let mut s = std::collections::HashSet::new();
@@ -509,8 +537,24 @@ pub fn decoder_forward_with_weights_lora(
         None
     };
     let attn_out = lora_linear(&attn_out, o_w, o_b, "self_attn.o_proj")?;
+    if should_record_backward_probe(layer_idx, cfg) {
+        super::trap::record_probe("o_proj_out", attn_out.id());
+        if flame_core::autograd::AutogradContext::is_checkpoint_recompute() {
+            let mut s = std::collections::HashSet::new();
+            s.insert(attn_out.id());
+            flame_core::autograd::AutogradContext::retain_intermediate_grads_add(s);
+        }
+    }
 
     let hidden_states = hidden_states.add(&attn_out)?;
+    if should_record_backward_probe(layer_idx, cfg) {
+        super::trap::record_probe("after_attn", hidden_states.id());
+        if flame_core::autograd::AutogradContext::is_checkpoint_recompute() {
+            let mut s = std::collections::HashSet::new();
+            s.insert(hidden_states.id());
+            flame_core::autograd::AutogradContext::retain_intermediate_grads_add(s);
+        }
+    }
 
     // ─── 3) post_attention_layernorm + SwiGLU MLP ────────────────────
     let post_ln_w = wget("post_attention_layernorm.weight")?;
@@ -522,15 +566,50 @@ pub fn decoder_forward_with_weights_lora(
 
     let gate = lora_linear(&normed2, gate_w, None, "mlp.gate_proj")?;
     let up = lora_linear(&normed2, up_w, None, "mlp.up_proj")?;
+    if should_record_backward_probe(layer_idx, cfg) {
+        super::trap::record_probe("mlp_gate_out", gate.id());
+        super::trap::record_probe("mlp_up_out", up.id());
+        if flame_core::autograd::AutogradContext::is_checkpoint_recompute() {
+            let mut s = std::collections::HashSet::new();
+            s.insert(gate.id());
+            s.insert(up.id());
+            flame_core::autograd::AutogradContext::retain_intermediate_grads_add(s);
+        }
+    }
     // SwiGLU = silu(gate) * up. Use Tensor::swiglu (autograd-registered fused
     // BF16 kernel) so the `mlp.gate_proj` LoRA branch sees gradient. The old
     // `bf16_ops::silu_bf16` is an inference-only primitive (returns
     // requires_grad=false, records no op) — using it here detached gate's
     // autograd path and produced 72 dead LoRA params in G2.
     let mlp_inner = gate.swiglu(&up)?;
+    if should_record_backward_probe(layer_idx, cfg) {
+        super::trap::record_probe("mlp_inner", mlp_inner.id());
+        if flame_core::autograd::AutogradContext::is_checkpoint_recompute() {
+            let mut s = std::collections::HashSet::new();
+            s.insert(mlp_inner.id());
+            flame_core::autograd::AutogradContext::retain_intermediate_grads_add(s);
+        }
+    }
     let mlp_out = lora_linear(&mlp_inner, down_w, None, "mlp.down_proj")?;
+    if should_record_backward_probe(layer_idx, cfg) {
+        super::trap::record_probe("mlp_out", mlp_out.id());
+        if flame_core::autograd::AutogradContext::is_checkpoint_recompute() {
+            let mut s = std::collections::HashSet::new();
+            s.insert(mlp_out.id());
+            flame_core::autograd::AutogradContext::retain_intermediate_grads_add(s);
+        }
+    }
 
-    hidden_states.add(&mlp_out)
+    let hidden_out = hidden_states.add(&mlp_out)?;
+    if should_record_backward_probe(layer_idx, cfg) {
+        super::trap::record_probe("hidden_out", hidden_out.id());
+        if flame_core::autograd::AutogradContext::is_checkpoint_recompute() {
+            let mut s = std::collections::HashSet::new();
+            s.insert(hidden_out.id());
+            flame_core::autograd::AutogradContext::retain_intermediate_grads_add(s);
+        }
+    }
+    Ok(hidden_out)
 }
 
 /// Diagnostic mirror of `decoder_forward_with_weights_lora` for one decoder
@@ -570,25 +649,17 @@ pub fn decoder_forward_probe_with_weights_lora(
             ))
         })
     };
+    // Probe-path mirror of the hot-path `lora_linear` (this file ~L388).
+    // Identical semantics: parity base GEMM + shared `add_lora_residual`.
     let lora_linear = |x: &Tensor,
                        w: &Tensor,
                        b: Option<&Tensor>,
                        suffix: &str|
      -> Result<Tensor> {
+        let base = flame_core::ops::fused_inference::fused_linear3d_native_pytorch_parity(x, w, b)?;
         match lora.and_then(|r| r.get(layer_idx, suffix)) {
-            Some(adapter) => {
-                let a_t = adapter.a_tensor()?;
-                let b_t = adapter.b_tensor()?;
-                flame_core::ops::fused_inference::fused_linear3d_native_lora(
-                    x,
-                    w,
-                    b,
-                    Some(&a_t),
-                    Some(&b_t),
-                    adapter.scale,
-                )
-            }
-            None => flame_core::ops::fused_inference::fused_linear3d_native(x, w, b),
+            Some(adapter) => add_lora_residual(base, x, adapter),
+            None => Ok(base),
         }
     };
 
@@ -671,7 +742,7 @@ pub fn decoder_forward_probe_with_weights_lora(
 
     let sdpa_out = match two_pass_ar_len {
         Some(ar_len) if attention_mask.is_none() => {
-            hidream_o1_two_pass_attention(&q_rope, &k_repeat, &v_repeat, ar_len)?
+            hidream_o1_two_pass_attention(&q_rope, &k_rope, &v_heads, ar_len)?
         }
         _ => chunked_sdpa(&q_rope, &k_repeat, &v_repeat, attention_mask)?,
     };

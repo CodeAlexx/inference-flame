@@ -41,7 +41,7 @@ use flame_core::nn::Linear;
 use flame_core::{CudaDevice, DType, Error, Result, Shape, Tensor};
 
 use super::HiDreamO1Config;
-use super::lora::LoraRegistry;
+use super::lora::{add_lora_residual, LoraRegistry};
 
 /// 2-layer MLP that turns a scalar timestep into a `[B, hidden_size]` vector,
 /// which is then scattered into the sequence at every `<|tms_token|>` slot
@@ -108,16 +108,12 @@ impl TimestepEmbedder {
         let t_freq_3d = t_freq.reshape(&[batch, 1, self.frequency_embedding_size])?;
         let h_3d = match lora.and_then(|r| r.get_global("t_embedder1.mlp.0")) {
             Some(adapter) => {
-                let a = adapter.a_tensor()?;
-                let b = adapter.b_tensor()?;
-                flame_core::ops::fused_inference::fused_linear3d_native_lora(
+                let base = flame_core::ops::fused_inference::fused_linear3d_native_pytorch_parity(
                     &t_freq_3d,
                     &self.mlp_in.weight,
                     self.mlp_in.bias.as_ref(),
-                    Some(&a),
-                    Some(&b),
-                    adapter.scale,
-                )?
+                )?;
+                add_lora_residual(base, &t_freq_3d, adapter)?
             }
             None => flame_core::ops::fused_inference::fused_linear3d_native_pytorch_parity(
                 &t_freq_3d,
@@ -130,16 +126,12 @@ impl TimestepEmbedder {
         let h_3d = h.reshape(&[batch, 1, self.hidden_size])?;
         let out_3d = match lora.and_then(|r| r.get_global("t_embedder1.mlp.2")) {
             Some(adapter) => {
-                let a = adapter.a_tensor()?;
-                let b = adapter.b_tensor()?;
-                flame_core::ops::fused_inference::fused_linear3d_native_lora(
+                let base = flame_core::ops::fused_inference::fused_linear3d_native_pytorch_parity(
                     &h_3d,
                     &self.mlp_out.weight,
                     self.mlp_out.bias.as_ref(),
-                    Some(&a),
-                    Some(&b),
-                    adapter.scale,
-                )?
+                )?;
+                add_lora_residual(base, &h_3d, adapter)?
             }
             None => flame_core::ops::fused_inference::fused_linear3d_native_pytorch_parity(
                 &h_3d,

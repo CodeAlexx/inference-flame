@@ -61,7 +61,7 @@ impl FinalLayer {
     /// Phase 2b's pipeline; revisit only if a future HiDream variant
     /// actually wires modulation here.
     pub fn forward(&self, hidden_states: &Tensor, _cond: Option<&Tensor>) -> Result<Tensor> {
-        self.linear.forward(hidden_states)
+        self.linear_forward_pytorch_parity(hidden_states)
     }
 
     pub fn forward_lora(
@@ -70,10 +70,18 @@ impl FinalLayer {
         _cond: Option<&Tensor>,
         lora: Option<&LoraRegistry>,
     ) -> Result<Tensor> {
-        let out = self.linear.forward(hidden_states)?;
+        let out = self.linear_forward_pytorch_parity(hidden_states)?;
         match lora.and_then(|r| r.get_global("final_layer2.linear")) {
             Some(adapter) => add_lora_residual(out, hidden_states, adapter),
             None => Ok(out),
         }
+    }
+
+    fn linear_forward_pytorch_parity(&self, hidden_states: &Tensor) -> Result<Tensor> {
+        flame_core::ops::fused_inference::fused_linear3d_native_pytorch_parity(
+            hidden_states,
+            &self.linear.weight,
+            self.linear.bias.as_ref(),
+        )
     }
 }

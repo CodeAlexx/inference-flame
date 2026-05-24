@@ -33,7 +33,10 @@ pub mod weight_loader;
 
 pub use bottleneck_patch_embed::BottleneckPatchEmbed;
 pub use decoder::{hidream_o1_two_pass_attention, HiDreamDecoderLayer};
-pub use lora::{default_target_suffixes, shape_for_suffix, LoraAdapter, LoraRegistry};
+pub use lora::{
+    default_resident_target_keys, default_target_suffixes, shape_for_suffix, LoraAdapter,
+    LoraRegistry,
+};
 pub use final_layer::FinalLayer;
 pub use model::HiDreamO1Model;
 pub use weight_loader::HiDreamO1WeightLoader;

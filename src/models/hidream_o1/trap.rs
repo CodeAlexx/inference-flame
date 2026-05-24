@@ -17,11 +17,16 @@
 //!   4) post-backward: caller calls `take_retained_intermediate_grads()` and
 //!      matches the grads back to probe names by ID.
 //!
-//! Probes recorded for layer 0 (V-path only as of 2026-05-20):
+//! Probes recorded for the selected decoder layer:
+//! - `"q_proj_out"`  — Q tensor immediately after `q_proj` forward (pre-reshape).
+//! - `"k_proj_out"`  — K tensor immediately after `k_proj` forward (pre-reshape).
 //! - `"v_proj_out"`  — V tensor immediately after `v_proj` forward (pre-reshape).
 //!   Gradient here is the last point upstream of `v_proj.lora_B.grad`.
 //! - `"attn_out"`    — SDPA output before reshape into `o_proj` input.
 //!   Gradient here is what enters SDPA's backward from the o_proj side.
+//! - `"mlp_gate_out"` / `"mlp_up_out"` — SwiGLU inputs after gate/up projection.
+//! - `"mlp_inner"`   — SwiGLU output before down projection.
+//! - `"mlp_out"`     — MLP output before residual add.
 
 use std::collections::HashMap;
 use std::sync::Mutex;

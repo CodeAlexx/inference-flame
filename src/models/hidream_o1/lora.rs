@@ -179,8 +179,10 @@ pub fn add_lora_residual(base: Tensor, input: &Tensor, adapter: &LoraAdapter) ->
     let b = adapter.b_tensor()?;
     validate_lora_compute_dtype("add_lora_residual", &a, &b)?;
     let residual = if a.dtype() == DType::F32 {
-        // The reference LoRA path keeps adapter weights in F32, casts the
-        // activation into the LoRA branch dtype, then casts the residual back.
+        // ai-toolkit keeps adapter params as F32 leaves and casts the LoRA
+        // branch output back to the wrapped module output dtype before adding.
+        // Keeping the branch in F32 preserves the F32 parameter-gradient
+        // surface while the residual still enters the model as BF16 below.
         let input_f32 = input.to_dtype(DType::F32)?;
         let a_t = a.transpose()?.contiguous()?;
         let b_t = b.transpose()?.contiguous()?;
@@ -437,6 +439,14 @@ impl LoraRegistry {
     /// Number of adapters in this registry.
     pub fn len(&self) -> usize {
         self.adapters.len()
+    }
+
+    /// Sorted adapter keys. Used by trainers to fail fast when a resumed LoRA
+    /// is missing part of the expected trainable surface.
+    pub fn adapter_keys(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self.adapters.keys().cloned().collect();
+        keys.sort();
+        keys
     }
 
     pub fn is_empty(&self) -> bool {

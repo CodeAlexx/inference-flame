@@ -22,7 +22,7 @@ use flame_core::nn::Linear;
 use flame_core::{CudaDevice, DType, Result, Shape, Tensor};
 
 use super::HiDreamO1Config;
-use super::lora::LoraRegistry;
+use super::lora::{add_lora_residual, LoraRegistry};
 
 /// Two-stage patch embedder: `Linear(P*P*C → bottleneck) → Linear(bottleneck → hidden)`.
 ///
@@ -63,16 +63,12 @@ impl BottleneckPatchEmbed {
     pub fn forward_lora(&self, patches: &Tensor, lora: Option<&LoraRegistry>) -> Result<Tensor> {
         let h = match lora.and_then(|r| r.get_global("x_embedder.proj1")) {
             Some(adapter) => {
-                let a = adapter.a_tensor()?;
-                let b = adapter.b_tensor()?;
-                flame_core::ops::fused_inference::fused_linear3d_native_lora(
+                let base = flame_core::ops::fused_inference::fused_linear3d_native_pytorch_parity(
                     patches,
                     &self.proj1.weight,
                     self.proj1.bias.as_ref(),
-                    Some(&a),
-                    Some(&b),
-                    adapter.scale,
-                )?
+                )?;
+                add_lora_residual(base, patches, adapter)?
             }
             None => flame_core::ops::fused_inference::fused_linear3d_native_pytorch_parity(
                 patches,
@@ -82,16 +78,12 @@ impl BottleneckPatchEmbed {
         };
         match lora.and_then(|r| r.get_global("x_embedder.proj2")) {
             Some(adapter) => {
-                let a = adapter.a_tensor()?;
-                let b = adapter.b_tensor()?;
-                flame_core::ops::fused_inference::fused_linear3d_native_lora(
+                let base = flame_core::ops::fused_inference::fused_linear3d_native_pytorch_parity(
                     &h,
                     &self.proj2.weight,
                     self.proj2.bias.as_ref(),
-                    Some(&a),
-                    Some(&b),
-                    adapter.scale,
-                )
+                )?;
+                add_lora_residual(base, &h, adapter)
             }
             None => flame_core::ops::fused_inference::fused_linear3d_native_pytorch_parity(
                 &h,

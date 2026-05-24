@@ -384,6 +384,11 @@ impl HiDreamO1Model {
                 .map_err(|e| Error::InvalidInput(format!("prefetch block 0: {e}")))?;
         }
         let is_training = flame_core::autograd::AutogradContext::is_recording();
+        let use_train_checkpoint = is_training
+            && std::env::var("HIDREAM_O1_DISABLE_TRAIN_CHECKPOINT")
+                .ok()
+                .as_deref()
+                != Some("1");
         let mask_owned = mask_ref.cloned();
         let lora_arc = lora.cloned().map(Arc::new);
 
@@ -396,6 +401,14 @@ impl HiDreamO1Model {
         // Off when env var is absent — zero overhead in production.
         let dump_layers_path: Option<String> =
             std::env::var("HIDREAM_DUMP_LAYERS").ok().filter(|s| !s.is_empty());
+        let dump_probe_layers: Vec<usize> = std::env::var("HIDREAM_DUMP_PROBE_LAYERS")
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .filter_map(|part| part.trim().parse::<usize>().ok())
+                    .collect()
+            })
+            .unwrap_or_else(|| vec![0]);
         let mut layer_dump: Option<HashMap<String, Tensor>> =
             dump_layers_path.as_ref().map(|_| HashMap::with_capacity(total + 2));
         if let Some(ref mut d) = layer_dump {
@@ -423,7 +436,7 @@ impl HiDreamO1Model {
             if mem_log && (i < 3 || i == total - 1) {
                 log_mem(&format!("layer{:02}.before_await", i));
             }
-            if is_training {
+            if use_train_checkpoint {
                 let hidden_c = hidden.clone().requires_grad_(true);
                 let cfg_c = cfg.clone();
                 let cos_sin_c = (cos_sin.0.clone(), cos_sin.1.clone());
@@ -495,7 +508,7 @@ impl HiDreamO1Model {
                 if mem_log && (i < 3 || i == total - 1) {
                     log_mem(&format!("layer{:02}.after_await", i));
                 }
-                if i == 0 {
+                if dump_probe_layers.contains(&i) {
                     if let Some(ref mut d) = layer_dump {
                         let probes = decoder_forward_probe_with_weights_lora(
                             &cfg,
@@ -534,8 +547,14 @@ impl HiDreamO1Model {
         }
         log_mem("after.layer_loop");
 
-        // 8) final RMSNorm.
-        let hidden = self.norm.forward(&hidden)?;
+        // 8) final RMSNorm. Qwen3VLTextRMSNorm normalizes, casts the unit
+        // result back to BF16, then applies the BF16 affine weight.
+        let norm_weight = self
+            .norm
+            .weight
+            .as_ref()
+            .ok_or_else(|| Error::InvalidOperation("HiDreamO1 final norm weight missing".into()))?;
+        let hidden = rms_norm_apply(&hidden, norm_weight, self.config.rms_norm_eps)?;
         if let Some(ref mut d) = layer_dump {
             d.insert(
                 "hidden_final_norm".to_string(),
@@ -678,4 +697,17 @@ impl HiDreamO1Model {
         }
         Ok(ar_len)
     }
+}
+
+/// Apply Qwen3-VL RMSNorm semantics: normalize without affine, cast/store BF16,
+/// then multiply the BF16 weight as a separate op.
+fn rms_norm_apply(x: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
+    let dims = x.shape().dims().to_vec();
+    let hidden = *dims.last().ok_or_else(|| {
+        Error::InvalidOperation("HiDreamO1 rms_norm_apply: empty input shape".into())
+    })?;
+    let batch: usize = dims[..dims.len() - 1].iter().product();
+    let x_2d = x.reshape(&[batch, hidden])?;
+    let out = flame_core::cuda_ops_bf16::rms_norm_bf16(&x_2d, None, eps)?.mul(weight)?;
+    out.reshape(&dims)
 }
