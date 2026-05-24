@@ -618,6 +618,10 @@ path = "src/bin/l2p_loss_parity.rs"
 name = "l2p_grad_chain_parity"
 path = "src/bin/l2p_grad_chain_parity.rs"
 
+[[bin]]
+name = "hidream_o1_grad_chain_parity"
+path = "src/bin/hidream_o1_grad_chain_parity.rs"
+
 # ---------------------------------------------------------------------------
 # Integration tests (tests/*.rs) — enumerated manually because autotests=false.
 # ---------------------------------------------------------------------------

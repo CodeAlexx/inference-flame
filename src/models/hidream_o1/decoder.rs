@@ -64,6 +64,32 @@ fn should_record_backward_probe(layer_idx: usize, cfg: &HiDreamO1Config) -> bool
     super::trap::is_armed() && layer_idx == backward_probe_layer_idx(cfg.num_layers)
 }
 
+/// L2P-style block trap (2026-05-23): mirrors the existing soul.md trap above
+/// but is driven by `HIDREAM_BLOCK_PROBE_LAYER` and writes into a separate
+/// store consumed by `hidream_o1_grad_chain_parity`. Both traps coexist so
+/// the older `parity_hidream_o1_train_step` consumer keeps working unchanged.
+fn block_probe_active(layer_idx: usize) -> bool {
+    super::trap::block_is_armed() && super::trap::is_target_layer(layer_idx)
+}
+
+/// Record a tensor for the L2P-style block trap with a numbered name to
+/// preserve ordering when sorted alphabetically (matches the L2P probe
+/// naming convention `XX.<name>` in dit.rs).
+fn record_block(layer_idx: usize, name: &str, t: &Tensor) {
+    if !block_probe_active(layer_idx) {
+        return;
+    }
+    super::trap::record_block(name, t.id());
+    // During gradient checkpointing the FIRST forward runs without autograd
+    // recording; the RECOMPUTE pass is where the tape is actually built. Push
+    // into the additive retain set so the sub-tape backward keeps the grad.
+    if flame_core::autograd::AutogradContext::is_checkpoint_recompute() {
+        let mut s = std::collections::HashSet::new();
+        s.insert(t.id());
+        flame_core::autograd::AutogradContext::retain_intermediate_grads_add(s);
+    }
+}
+
 /// One Qwen3-VL text decoder block, configured for HiDream-O1.
 ///
 /// Field naming matches the Python parameter names (`q_proj`, `k_proj`,
@@ -365,10 +391,14 @@ pub fn decoder_forward_with_weights_lora(
         })
     };
 
+    // L2P-style block trap (2026-05-23): record block input.
+    record_block(layer_idx, "00.x_in", hidden_states);
+
     // ─── 1) input_layernorm ──────────────────────────────────────────
     let in_ln_w = wget("input_layernorm.weight")?;
     let normed = rms_norm_apply(hidden_states, in_ln_w, cfg.rms_norm_eps)?;
     log_mem("after_input_rms");
+    record_block(layer_idx, "01.normed", &normed);
 
     // ─── 2) self-attention QKV projections ───────────────────────────
     let q_w = wget("self_attn.q_proj.weight")?;
@@ -440,6 +470,11 @@ pub fn decoder_forward_with_weights_lora(
             flame_core::autograd::AutogradContext::retain_intermediate_grads_add(s);
         }
     }
+    // L2P-style probes for post-projection Q/K/V (before reshape/permute).
+    // These match the Python ref's `q_proj/k_proj/v_proj` hook captures.
+    record_block(layer_idx, "a1.q_proj_out", &q);
+    record_block(layer_idx, "a2.k_proj_out", &k);
+    record_block(layer_idx, "a3.v_proj_out", &v);
 
     // Reshape to [B, H, S, D] / [B, Hkv, S, D].
     let q = q.reshape(&[b, n, h, d])?.permute(&[0, 2, 1, 3])?;
@@ -460,11 +495,22 @@ pub fn decoder_forward_with_weights_lora(
     let k_normed = rms_norm_apply(&k_flat, k_norm_w, cfg.rms_norm_eps)?;
     let k = k_normed.reshape(&[b, h_kv, n, d])?;
     log_mem("after_qk_norm");
+    // L2P-style probes for post-q/k-RMSNorm (before RoPE). Mirrors Python ref's
+    // `q_normed`/`k_normed` hooks. Layout is [B, H, S, D] / [B, Hkv, S, D].
+    record_block(layer_idx, "b1.q_normed", &q);
+    record_block(layer_idx, "b2.k_normed", &k);
 
     let (pe_cos, pe_sin) = cos_sin;
     let q = bf16_ops::rope_halfsplit_bf16_pytorch(&q, pe_cos, pe_sin)?;
     let k = bf16_ops::rope_halfsplit_bf16_pytorch(&k, pe_cos, pe_sin)?;
     log_mem("after_rope");
+    // L2P-style probes for post-RoPE Q/K (still pre-GQA-replicate). This is
+    // the decisive probe site for the RoPE shape-sniff fix:
+    // `project_hidream_o1_qkv_lora_grad_collapse_2026-05-20` predicted V cos
+    // ≈ 1.0 once the RoPE layout tag fired correctly.
+    record_block(layer_idx, "d1.q_rope", &q);
+    record_block(layer_idx, "d2.k_rope", &k);
+    record_block(layer_idx, "d3.v_pre_repeat", &v);
 
     let k_gqa = k;
     let v_gqa = v;
@@ -510,6 +556,10 @@ pub fn decoder_forward_with_weights_lora(
         _ => chunked_sdpa(&q, &k, &v, attention_mask)?,
     };
     log_mem("after_sdpa");
+    // L2P-style probe for SDPA output (= what enters SDPA backward from the
+    // o_proj side). When grad here is clean (cos≈0.999) but `d1.q_rope`/
+    // `d2.k_rope`/`d3.v_pre_repeat` grads collapse, the bug is inside SDPA bwd.
+    record_block(layer_idx, "e0.sdpa_out", &attn_out);
     // Soul.md trap (layer 0): record SDPA-output ID. Same checkpoint dance
     // as v_proj_out above — register into the additive retain set during
     // recompute so the sub-tape backward keeps its grad.
@@ -529,6 +579,7 @@ pub fn decoder_forward_with_weights_lora(
         .permute(&[0, 2, 1, 3])?
         .contiguous()?
         .reshape(&[b, n, h * d])?;
+    record_block(layer_idx, "f2.o_proj_in", &attn_out);
 
     let o_w = wget("self_attn.o_proj.weight")?;
     let o_b = if cfg.attention_bias {
@@ -545,6 +596,7 @@ pub fn decoder_forward_with_weights_lora(
             flame_core::autograd::AutogradContext::retain_intermediate_grads_add(s);
         }
     }
+    record_block(layer_idx, "03.attn_out", &attn_out);
 
     let hidden_states = hidden_states.add(&attn_out)?;
     if should_record_backward_probe(layer_idx, cfg) {
@@ -555,10 +607,12 @@ pub fn decoder_forward_with_weights_lora(
             flame_core::autograd::AutogradContext::retain_intermediate_grads_add(s);
         }
     }
+    record_block(layer_idx, "05.after_attn", &hidden_states);
 
     // ─── 3) post_attention_layernorm + SwiGLU MLP ────────────────────
     let post_ln_w = wget("post_attention_layernorm.weight")?;
     let normed2 = rms_norm_apply(&hidden_states, post_ln_w, cfg.rms_norm_eps)?;
+    record_block(layer_idx, "06.normed2", &normed2);
 
     let gate_w = wget("mlp.gate_proj.weight")?;
     let up_w = wget("mlp.up_proj.weight")?;
@@ -590,6 +644,7 @@ pub fn decoder_forward_with_weights_lora(
             flame_core::autograd::AutogradContext::retain_intermediate_grads_add(s);
         }
     }
+    record_block(layer_idx, "08.mlp_inner", &mlp_inner);
     let mlp_out = lora_linear(&mlp_inner, down_w, None, "mlp.down_proj")?;
     if should_record_backward_probe(layer_idx, cfg) {
         super::trap::record_probe("mlp_out", mlp_out.id());
@@ -599,6 +654,7 @@ pub fn decoder_forward_with_weights_lora(
             flame_core::autograd::AutogradContext::retain_intermediate_grads_add(s);
         }
     }
+    record_block(layer_idx, "09.mlp_out", &mlp_out);
 
     let hidden_out = hidden_states.add(&mlp_out)?;
     if should_record_backward_probe(layer_idx, cfg) {
@@ -609,6 +665,7 @@ pub fn decoder_forward_with_weights_lora(
             flame_core::autograd::AutogradContext::retain_intermediate_grads_add(s);
         }
     }
+    record_block(layer_idx, "10.x_out", &hidden_out);
     Ok(hidden_out)
 }
 
