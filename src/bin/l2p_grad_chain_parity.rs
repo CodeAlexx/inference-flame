@@ -519,6 +519,62 @@ fn main() -> Result<()> {
     println!("[grad-rust] retaining grads for {} intermediate tensor IDs", retain_ids.len());
     AutogradContext::retain_intermediate_grads(retain_ids);
 
+    // Optional: dump SDPA saved Q/K/V + fwd output for the target layer's
+    // attention call. Captured BEFORE backward so the snapshot reflects the
+    // exact tensors the backward dispatch will read. Replay-test for the
+    // L2P body cascade hunt: load this dump into
+    // `flame-core/tests/sdpa_l2p_replay.rs`, run the kernel in isolation,
+    // and decide kernel-bug vs autograd-context contamination.
+    //
+    // Trigger:   L2P_DUMP_SDPA_INPUTS=1
+    // Layer:     L2P_BLOCK_PROBE_LAYER (reuses existing probe gate)
+    // Probe key: "e0.sdpa_out" (output of `sdpa(&q, &k, &v, None)` in
+    //             joint_attention)
+    let dump_sdpa_inputs = std::env::var("L2P_DUMP_SDPA_INPUTS").as_deref() == Ok("1");
+    let mut sdpa_snapshot: Option<(flame_core::autograd::FlashAttentionSavedSnapshot, TensorId)> = None;
+    let mut sdpa_out_fwd_clone: Option<Tensor> = None;
+    if dump_sdpa_inputs {
+        if let Some(&e0_id) = block_probes.get("e0.sdpa_out") {
+            match AutogradContext::lookup_flash_attention_saved(e0_id) {
+                Some(snap) => {
+                    eprintln!(
+                        "[grad-rust] SDPA snapshot for e0.sdpa_out (id={:?}): q={:?} k={:?} v={:?} pad={:?} scale={:.6} causal={}",
+                        e0_id,
+                        snap.query.shape().dims(),
+                        snap.key.shape().dims(),
+                        snap.value.shape().dims(),
+                        snap.padding_lens,
+                        snap.scale,
+                        snap.causal,
+                    );
+                    sdpa_snapshot = Some((snap, e0_id));
+                    // Also stash the forward output of e0.sdpa_out from the
+                    // capture map (when present — note that block_probes is
+                    // populated by `aprobe!` in dit.rs, but it's just the id;
+                    // we don't have the tensor handle here unless someone
+                    // also added to `capture`). Best-effort: scan capture.
+                    for (name, t) in &capture {
+                        if t.id() == e0_id {
+                            sdpa_out_fwd_clone = Some(t.clone());
+                            eprintln!("[grad-rust]   also captured fwd output via capture[{name}]");
+                            break;
+                        }
+                    }
+                }
+                None => {
+                    eprintln!(
+                        "[grad-rust] WARNING: L2P_DUMP_SDPA_INPUTS=1 set but no Op::FlashAttention entry found for e0.sdpa_out id={:?}",
+                        e0_id,
+                    );
+                }
+            }
+        } else {
+            eprintln!(
+                "[grad-rust] WARNING: L2P_DUMP_SDPA_INPUTS=1 set but no 'e0.sdpa_out' in block_probes. Is L2P_BLOCK_PROBE_LAYER set?"
+            );
+        }
+    }
+
     // ── Phase 5: loss + backward ─────────────────────────────────────
     let pred_f32 = pred.to_dtype(DType::F32)?;
     let target_f32 = target.to_dtype(DType::F32)?;
@@ -642,6 +698,77 @@ fn main() -> Result<()> {
         );
         if !block_probe_missing.is_empty() {
             eprintln!("[grad-rust] block probes missing grads: {:?}", block_probe_missing);
+        }
+    }
+
+    // Dump the SDPA backward inputs as a sibling safetensors file. Written
+    // to a fixed path so the flame-core replay test knows where to find it:
+    //   /tmp/l2p_thorough_parity/sdpa_inputs_layer<N>.safetensors
+    if let Some((snap, e0_id)) = sdpa_snapshot {
+        let layer_str = std::env::var("L2P_BLOCK_PROBE_LAYER").unwrap_or_else(|_| "X".into());
+        let dump_path = format!(
+            "/tmp/l2p_thorough_parity/sdpa_inputs_layer{}.safetensors",
+            layer_str,
+        );
+        let mut map: HashMap<String, Tensor> = HashMap::new();
+        // All tensors saved as F32 for portability + numerical-comparison
+        // ground truth in the replay test. Caller can re-cast to BF16 to
+        // match the production path.
+        let to_f32 = |t: &Tensor| -> Result<Tensor> {
+            if t.dtype() == DType::F32 { Ok(t.clone()) } else { t.to_dtype(DType::F32) }
+        };
+        map.insert("saved_q".into(), to_f32(&snap.query)?);
+        map.insert("saved_k".into(), to_f32(&snap.key)?);
+        map.insert("saved_v".into(), to_f32(&snap.value)?);
+        if let Some(o) = snap.output.as_ref() {
+            map.insert("saved_output".into(), to_f32(o)?);
+        }
+        if let Some(s) = snap.stats.as_ref() {
+            map.insert("saved_stats".into(), to_f32(s)?);
+        }
+        // Also dump the captured fwd output tensor handle if available.
+        if let Some(fwd) = sdpa_out_fwd_clone.as_ref() {
+            map.insert("output_fwd_from_capture".into(), to_f32(fwd)?);
+        }
+        // The output_grad flowing INTO SDPA backward is the intermediate
+        // grad of e0.sdpa_out, captured by retain_intermediate_grads.
+        if let Some(g) = intermediate_grads.get(&e0_id) {
+            map.insert("output_grad".into(), to_f32(g)?);
+        } else {
+            eprintln!("[grad-rust] WARNING: no intermediate grad captured for e0.sdpa_out id={:?}", e0_id);
+        }
+        // Metadata (scale, causal, padding_lens) as singleton tensors.
+        let device_m = snap.query.device().clone();
+        map.insert(
+            "_meta_scale".into(),
+            Tensor::from_vec(vec![snap.scale], Shape::from_dims(&[1]), device_m.clone())?,
+        );
+        map.insert(
+            "_meta_causal".into(),
+            Tensor::from_vec(vec![if snap.causal { 1.0 } else { 0.0 }], Shape::from_dims(&[1]), device_m.clone())?,
+        );
+        if let Some((rq, rk)) = snap.padding_lens {
+            map.insert(
+                "_meta_padding_lens".into(),
+                Tensor::from_vec(vec![rq as f32, rk as f32], Shape::from_dims(&[2]), device_m.clone())?,
+            );
+        }
+        if let Some(parent) = Path::new(&dump_path).parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        save_tensors(&map, Path::new(&dump_path), SerializationFormat::SafeTensors)?;
+        println!("[grad-rust] wrote SDPA replay dump ({} tensors) → {}", map.len(), dump_path);
+        // Echo the shapes so the test author can sanity-check.
+        let mut keys: Vec<&String> = map.keys().collect();
+        keys.sort();
+        for k in keys {
+            let t = &map[k];
+            println!(
+                "  {:<35}  shape={:?}  dtype={:?}",
+                k,
+                t.shape().dims(),
+                t.dtype()
+            );
         }
     }
 
