@@ -27,6 +27,9 @@ pub mod magihuman_dit;
 pub mod magihuman_sr_dit;
 pub mod lora_loader;
 pub mod wan22_dit;
+pub mod nava_av;
+pub mod nava_blocks;
+pub mod nava_loader;
 pub mod wan_vace_dit;
 pub mod wan;
 pub mod hunyuan15_dit;
@@ -56,5 +59,9 @@ pub mod gpt_oss_encoder;
 pub use gpt_oss_encoder::{GptOssAttention, GptOssConfig, GptOssEncoder, GptOssLayer, GptOssMaskKit, GptOssMoE, LayerType, LoaderStats};
 pub mod gpt_oss_rope;
 pub use gpt_oss_rope::GptOssRotaryEmbedding;
+pub mod pid;
+pub use pid::{PidConfig, PidNet, PidSamplerConfig};
+
+pub mod ideogram4;
 
 pub mod boogu;

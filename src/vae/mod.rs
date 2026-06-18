@@ -25,6 +25,8 @@ pub mod ltx2_audio_vae;
 pub use ltx2_audio_vae::{LTX2AudioVaeDecoder, LTX2AudioVaeEncoder};
 pub mod ltx2_vocoder;
 pub use ltx2_vocoder::{LTX2Vocoder, LTX2VocoderWithBWE};
+pub mod nava_audio_wrap;
+pub use nava_audio_wrap::nava_decode_audio;
 pub mod hunyuan_vae;
 pub use hunyuan_vae::HunyuanVaeDecoder;
 pub mod qwenimage_encoder;

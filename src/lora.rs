@@ -82,7 +82,7 @@
 //!   require porting the existing fuse semantics.
 
 use flame_core::parameter::Parameter;
-use flame_core::{trim_cuda_mempool, DType, Error, Result, Tensor};
+use flame_core::{trim_cuda_mempool, DType, Error, Result, Shape, Tensor};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
@@ -415,7 +415,7 @@ impl LoraStack {
         let x_2d = if x_dims.len() == 2 {
             x.contiguous()?
         } else {
-            x.reshape(&[flat_rows, in_dim])?
+            x.reshape(&[flat_rows, in_dim])?.contiguous()?
         };
 
         // Flatten base_out to [B*..., out].
@@ -531,7 +531,7 @@ impl LoraStack {
         let x_2d = if x_dims.len() == 2 {
             x.contiguous()?
         } else {
-            x.reshape(&[flat_rows, in_dim])?
+            x.reshape(&[flat_rows, in_dim])?.contiguous()?
         };
 
         // Flatten base_out to [B*..., out].
@@ -600,19 +600,46 @@ fn add_at_col_range(base: &Tensor, delta: &Tensor, start: usize, len: usize) -> 
             "add_at_col_range out of range: start={start} len={len} total={total}"
         )));
     }
+    let delta_dims = delta.shape().dims();
+    if delta_dims != [dims[0], len] {
+        return Err(Error::InvalidInput(format!(
+            "add_at_col_range delta shape {:?} != [{}, {}]",
+            delta_dims, dims[0], len
+        )));
+    }
+
+    let delta = if delta.dtype() == base.dtype() {
+        delta.clone()
+    } else {
+        delta.to_dtype(base.dtype())?
+    };
+
+    if start == 0 && len == total {
+        return base.add(&delta);
+    }
+
+    let rows = dims[0];
     let head_len = start;
     let tail_len = total - start - len;
     let mut parts: Vec<Tensor> = Vec::with_capacity(3);
     if head_len > 0 {
-        parts.push(base.narrow(1, 0, head_len)?.contiguous()?);
+        parts.push(Tensor::zeros_dtype(
+            Shape::from_dims(&[rows, head_len]),
+            base.dtype(),
+            base.device().clone(),
+        )?);
     }
-    let mid = base.narrow(1, start, len)?.contiguous()?;
-    parts.push(mid.add(delta)?);
+    parts.push(delta);
     if tail_len > 0 {
-        parts.push(base.narrow(1, start + len, tail_len)?.contiguous()?);
+        parts.push(Tensor::zeros_dtype(
+            Shape::from_dims(&[rows, tail_len]),
+            base.dtype(),
+            base.device().clone(),
+        )?);
     }
     let part_refs: Vec<&Tensor> = parts.iter().collect();
-    Tensor::cat(&part_refs, 1)
+    let padded = Tensor::cat(&part_refs, 1)?;
+    base.add(&padded)
 }
 
 fn multiplier_note(m: f32) -> String {

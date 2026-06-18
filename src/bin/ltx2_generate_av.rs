@@ -165,6 +165,25 @@ fn main() -> anyhow::Result<()> {
     let fp8_stream = has_flag("--fp8-stream");
     let fp8_resident = has_flag("--fp8-resident");
     let pinned_offloader = has_flag("--pinned-offloader");
+    // Additive dump path: encode text only, write video+audio context (and the
+    // CFG negatives) to disk as a sidecar, then exit BEFORE the transformer is
+    // loaded. Lets the Mojo port consume the REAL feature_extract_and_project
+    // audio_context (not a slice). Output dir overridable via --dump-dir.
+    let dump_audio_context = has_flag("--dump-audio-context");
+    let dump_dir: String = {
+        let args: Vec<String> = std::env::args().collect();
+        let mut d = format!("{OUTPUT_DIR}/audio_context_dump");
+        let mut i = 1;
+        while i < args.len() {
+            if args[i] == "--dump-dir" {
+                if let Some(v) = args.get(i + 1) { d = v.clone(); }
+            } else if let Some(v) = args[i].strip_prefix("--dump-dir=") {
+                d = v.to_string();
+            }
+            i += 1;
+        }
+        d
+    };
     let width: usize = get_arg("--width").unwrap_or(WIDTH);
     let height: usize = get_arg("--height").unwrap_or(HEIGHT);
     let num_frames: usize = get_arg("--frames").unwrap_or(NUM_FRAMES);
@@ -426,6 +445,37 @@ fn main() -> anyhow::Result<()> {
             neg_mask_from_text,
         )
     };
+
+    // ========================================
+    // Additive dump: write the REAL contexts and exit before the transformer.
+    // ========================================
+    if dump_audio_context {
+        std::fs::create_dir_all(&dump_dir)?;
+        let out_path = format!("{dump_dir}/ltx2_audio_context.safetensors");
+        let mut td: HashMap<String, flame_core::Tensor> = HashMap::new();
+        td.insert("video_context".to_string(), video_context.to_dtype(DType::BF16)?);
+        td.insert("audio_context".to_string(), audio_context.to_dtype(DType::BF16)?);
+        td.insert("encoder_attention_mask".to_string(), text_mask.to_dtype(DType::BF16)?);
+        if let Some(ref v) = neg_video_context_from_text {
+            td.insert("neg_video_context".to_string(), v.to_dtype(DType::BF16)?);
+        }
+        if let Some(ref a) = neg_audio_context_from_text {
+            td.insert("neg_audio_context".to_string(), a.to_dtype(DType::BF16)?);
+        }
+        if let Some(ref m) = neg_mask_from_text {
+            td.insert("neg_encoder_attention_mask".to_string(), m.to_dtype(DType::BF16)?);
+        }
+        println!("\n--- DUMP: writing contexts to {out_path} ---");
+        println!("  video_context  = {:?}", video_context.dims());
+        println!("  audio_context  = {:?}", audio_context.dims());
+        println!("  encoder_attention_mask = {:?}", text_mask.dims());
+        flame_core::serialization::save_tensors(
+            &td, std::path::Path::new(&out_path),
+            flame_core::serialization::SerializationFormat::SafeTensors,
+        )?;
+        println!("  DUMP DONE — exiting (transformer not loaded).");
+        return Ok(());
+    }
 
     // ========================================
     // Stage 2: Load LTX-2 Transformer

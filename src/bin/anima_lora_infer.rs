@@ -37,7 +37,7 @@
 //!         [--multiplier 1.0] \
 //!         [--width 1024] [--height 1024] [--steps 30] [--cfg 4.5] [--seed 42]
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -89,6 +89,8 @@ struct Args {
     t5_tokenizer: Option<PathBuf>,
     lora: PathBuf,
     output: PathBuf,
+    save_embeddings: Option<PathBuf>,
+    encode_only: bool,
     width: usize,
     height: usize,
     steps: usize,
@@ -109,6 +111,8 @@ fn parse_args() -> anyhow::Result<Args> {
         t5_tokenizer: None,
         lora: PathBuf::new(),
         output: PathBuf::from(DEFAULT_OUTPUT),
+        save_embeddings: None,
+        encode_only: false,
         width: 1024,
         height: 1024,
         steps: 30,
@@ -137,6 +141,8 @@ fn parse_args() -> anyhow::Result<Args> {
             "--t5-tokenizer" => a.t5_tokenizer = Some(PathBuf::from(take(&mut i)?)),
             "--lora" => a.lora = PathBuf::from(take(&mut i)?),
             "--output" | "-o" => a.output = PathBuf::from(take(&mut i)?),
+            "--save-embeddings" => a.save_embeddings = Some(PathBuf::from(take(&mut i)?)),
+            "--encode-only" => a.encode_only = true,
             "--width" => a.width = take(&mut i)?.parse()?,
             "--height" => a.height = take(&mut i)?.parse()?,
             "--steps" => a.steps = take(&mut i)?.parse()?,
@@ -148,6 +154,7 @@ fn parse_args() -> anyhow::Result<Args> {
                     "anima_lora_infer --prompt P [--negative N] --lora LORA \
                      [--base PATH] [--qwen3 PATH] [--vae PATH] \
                      [--qwen3-tokenizer PATH] [--t5-tokenizer PATH] [--output PATH] \
+                     [--save-embeddings PATH] [--encode-only] \
                      [--width W] [--height H] [--steps N] [--cfg G] [--seed S] [--multiplier M]"
                 );
                 std::process::exit(0);
@@ -353,6 +360,17 @@ fn main() -> anyhow::Result<()> {
         context_uncond.shape().dims(),
         t0.elapsed().as_secs_f32()
     );
+    if let Some(path) = args.save_embeddings.as_ref() {
+        let mut tensors = HashMap::new();
+        tensors.insert("context_cond".to_string(), context_cond.clone());
+        tensors.insert("context_uncond".to_string(), context_uncond.clone());
+        flame_core::serialization::save_file(&tensors, path)?;
+        println!("  saved embeddings: {}", path.display());
+    }
+    if args.encode_only {
+        println!("  encode-only requested; stopping before LoRA/denoise/VAE");
+        return Ok(());
+    }
 
     // ------------------------------------------------------------------
     // Stage C: LoRA stack → set_lora.

@@ -531,11 +531,21 @@ fn main() -> Result<()> {
     // Probe key: "e0.sdpa_out" (output of `sdpa(&q, &k, &v, None)` in
     //             joint_attention)
     let dump_sdpa_inputs = std::env::var("L2P_DUMP_SDPA_INPUTS").as_deref() == Ok("1");
-    let mut sdpa_snapshot: Option<(flame_core::autograd::FlashAttentionSavedSnapshot, TensorId)> = None;
+    // 2026-05-29: flame-core removed `FlashAttentionSavedSnapshot` +
+    // `lookup_flash_attention_saved`. Local stub keeps this default-off SDPA
+    // dump probe compiling at HEAD; it never runs (lookup yields None). The
+    // grad-direction parity in Phase 5 below is unaffected.
+    #[allow(dead_code)]
+    struct FlashAttnSnapStub {
+        query: Tensor, key: Tensor, value: Tensor,
+        output: Option<Tensor>, stats: Option<Tensor>,
+        scale: f32, causal: bool, padding_lens: Option<(usize, usize)>,
+    }
+    let mut sdpa_snapshot: Option<(FlashAttnSnapStub, TensorId)> = None;
     let mut sdpa_out_fwd_clone: Option<Tensor> = None;
     if dump_sdpa_inputs {
         if let Some(&e0_id) = block_probes.get("e0.sdpa_out") {
-            match AutogradContext::lookup_flash_attention_saved(e0_id) {
+            match Option::<FlashAttnSnapStub>::None {
                 Some(snap) => {
                     eprintln!(
                         "[grad-rust] SDPA snapshot for e0.sdpa_out (id={:?}): q={:?} k={:?} v={:?} pad={:?} scale={:.6} causal={}",

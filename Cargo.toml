@@ -235,6 +235,22 @@ name = "gpt_oss_parity"
 path = "src/bin/gpt_oss_parity.rs"
 
 [[bin]]
+name = "parity_boogu_c6"
+path = "src/bin/parity_boogu_c6.rs"
+
+[[bin]]
+name = "boogu_encode"
+path = "src/bin/boogu_encode.rs"
+
+[[bin]]
+name = "boogu_infer"
+path = "src/bin/boogu_infer.rs"
+
+[[bin]]
+name = "boogu_rewrite"
+path = "src/bin/boogu_rewrite.rs"
+
+[[bin]]
 name = "klein_edit_infer"
 path = "src/bin/klein_edit_infer.rs"
 
@@ -502,6 +518,10 @@ name = "ltx2_generate_av"
 path = "src/bin/ltx2_generate_av.rs"
 
 [[bin]]
+name = "nava_generate_av"
+path = "src/bin/nava_generate_av.rs"
+
+[[bin]]
 name = "ltx2_generate_kf"
 path = "src/bin/ltx2_generate_kf.rs"
 
@@ -621,22 +641,6 @@ path = "src/bin/l2p_grad_chain_parity.rs"
 [[bin]]
 name = "hidream_o1_grad_chain_parity"
 path = "src/bin/hidream_o1_grad_chain_parity.rs"
-
-[[bin]]
-name = "boogu_encode"
-path = "src/bin/boogu_encode.rs"
-
-[[bin]]
-name = "boogu_infer"
-path = "src/bin/boogu_infer.rs"
-
-[[bin]]
-name = "boogu_rewrite"
-path = "src/bin/boogu_rewrite.rs"
-
-[[bin]]
-name = "parity_boogu_c6"
-path = "src/bin/parity_boogu_c6.rs"
 
 # ---------------------------------------------------------------------------
 # Integration tests (tests/*.rs) — enumerated manually because autotests=false.

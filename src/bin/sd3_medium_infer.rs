@@ -31,6 +31,7 @@ const MODEL_PATH: &str =
     "/home/alex/.serenity/models/checkpoints/stablediffusion35_medium.safetensors";
 
 const OUTPUT_PATH: &str = "/home/alex/EriDiffusion/inference-flame/output/sd3_medium_rust.png";
+const EMBEDDINGS_PATH: &str = "/home/alex/EriDiffusion/inference-flame/output/sd3_medium_embeddings.safetensors";
 
 // ---------------------------------------------------------------------------
 // Sampling parameters
@@ -261,6 +262,23 @@ fn main() -> anyhow::Result<()> {
     let (context, pooled, context_uncond, pooled_uncond) = encode_text_pair(&prompt, &device)?;
 
     println!("  Total encode: {:.1}s", t0.elapsed().as_secs_f32());
+
+    // ------------------------------------------------------------------
+    // Save embeddings sidecar for Mojo pipeline
+    // ------------------------------------------------------------------
+    {
+        use std::collections::HashMap;
+        let mut m: HashMap<String, Tensor> = HashMap::new();
+        m.insert("context_cond".to_string(), context.clone());
+        m.insert("context_uncond".to_string(), context_uncond.clone());
+        m.insert("pooled_cond".to_string(), pooled.clone());
+        m.insert("pooled_uncond".to_string(), pooled_uncond.clone());
+        if let Some(parent) = std::path::Path::new(EMBEDDINGS_PATH).parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        flame_core::serialization::save_file(&m, std::path::Path::new(EMBEDDINGS_PATH))?;
+        println!("  Embeddings saved: {}", EMBEDDINGS_PATH);
+    }
 
     // ------------------------------------------------------------------
     // Stage 2: Load SD3.5 Medium (all resident)

@@ -26,8 +26,11 @@
 
 use flame_core::{global_cuda_device, DType, Result, Shape, Tensor};
 use inference_flame::models::clip_encoder::{ClipConfig, ClipEncoder};
+use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::fs::File;
+use std::io::{BufWriter, Write};
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 struct Args {
@@ -108,6 +111,55 @@ fn tokenize(tokenizer: &tokenizers::Tokenizer, text: &str) -> anyhow::Result<Vec
     Ok(ids)
 }
 
+fn save_bf16_safetensors(tensors: &[(&str, &Tensor)], path: &Path) -> anyhow::Result<()> {
+    let mut header = serde_json::Map::new();
+    let mut payloads = Vec::with_capacity(tensors.len());
+    let mut offset = 0u64;
+
+    for (name, tensor) in tensors {
+        if tensor.dtype() != DType::BF16 {
+            anyhow::bail!("{} must be BF16 before SDXL sidecar serialization", name);
+        }
+
+        let bytes = tensor.to_bytes()?;
+        let end = offset + bytes.len() as u64;
+        header.insert(
+            (*name).to_string(),
+            json!({
+                "dtype": "BF16",
+                "shape": tensor.shape().dims(),
+                "data_offsets": [offset, end],
+            }),
+        );
+        payloads.push(bytes);
+        offset = end;
+    }
+
+    let header_bytes = serde_json::to_vec(&Value::Object(header))?;
+    let tmp_path = {
+        let mut s = path.as_os_str().to_owned();
+        s.push(".tmp");
+        PathBuf::from(s)
+    };
+
+    let file = File::create(&tmp_path)?;
+    let mut writer = BufWriter::new(file);
+    writer.write_all(&(header_bytes.len() as u64).to_le_bytes())?;
+    writer.write_all(&header_bytes)?;
+    for payload in payloads {
+        writer.write_all(&payload)?;
+    }
+    writer.flush()?;
+    drop(writer);
+
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e.into());
+    }
+
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
     env_logger::init();
     let args = parse_args()?;
@@ -136,7 +188,11 @@ fn main() -> anyhow::Result<()> {
     let clip_l_w: HashMap<String, Tensor> = clip_l_w_raw
         .into_iter()
         .map(|(k, v)| {
-            let t = if v.dtype() == DType::BF16 { v } else { v.to_dtype(DType::BF16)? };
+            let t = if v.dtype() == DType::BF16 {
+                v
+            } else {
+                v.to_dtype(DType::BF16)?
+            };
             Ok((k, t))
         })
         .collect::<Result<HashMap<_, _>>>()?;
@@ -157,7 +213,11 @@ fn main() -> anyhow::Result<()> {
     let mut clip_g_w: HashMap<String, Tensor> = clip_g_w_raw
         .into_iter()
         .map(|(k, v)| {
-            let t = if v.dtype() == DType::BF16 { v } else { v.to_dtype(DType::BF16)? };
+            let t = if v.dtype() == DType::BF16 {
+                v
+            } else {
+                v.to_dtype(DType::BF16)?
+            };
             Ok((k, t))
         })
         .collect::<Result<HashMap<_, _>>>()?;
@@ -186,34 +246,33 @@ fn main() -> anyhow::Result<()> {
 
     // SDXL `context`: cat(CLIP-L hidden [1,77,768], CLIP-G hidden [1,77,1280])
     //   along last dim → [1, 77, 2048].
-    let context = Tensor::cat(&[&pos_l_hidden, &pos_g_hidden], 2)?;
-    let context_uncond = Tensor::cat(&[&neg_l_hidden, &neg_g_hidden], 2)?;
+    let context = Tensor::cat(&[&pos_l_hidden, &pos_g_hidden], 2)?.to_dtype(DType::BF16)?;
+    let context_uncond = Tensor::cat(&[&neg_l_hidden, &neg_g_hidden], 2)?.to_dtype(DType::BF16)?;
 
     // SDXL `y`: cat(CLIP-L pool [1,768], CLIP-G text_embeds [1,1280],
     //   zeros [1,768]) → [1, 2816]. Last 768 is the size/crop time-id
     //   placeholder (matches `scripts/sdxl_encode.py`).
     let zeros_pad = Tensor::zeros_dtype(Shape::from_dims(&[1, 768]), DType::BF16, device.clone())?;
-    let y = Tensor::cat(&[&pos_l_pool, &pos_g_pool, &zeros_pad], 1)?;
-    let y_uncond = Tensor::cat(&[&neg_l_pool, &neg_g_pool, &zeros_pad], 1)?;
+    let y = Tensor::cat(&[&pos_l_pool, &pos_g_pool, &zeros_pad], 1)?.to_dtype(DType::BF16)?;
+    let y_uncond =
+        Tensor::cat(&[&neg_l_pool, &neg_g_pool, &zeros_pad], 1)?.to_dtype(DType::BF16)?;
 
     eprintln!("\ncontext        : {:?}", context.shape().dims());
     eprintln!("context_uncond : {:?}", context_uncond.shape().dims());
     eprintln!("y              : {:?}", y.shape().dims());
     eprintln!("y_uncond       : {:?}", y_uncond.shape().dims());
 
-    let mut out: HashMap<String, Tensor> = HashMap::new();
-    out.insert("context".to_string(), context);
-    out.insert("context_uncond".to_string(), context_uncond);
-    out.insert("y".to_string(), y);
-    out.insert("y_uncond".to_string(), y_uncond);
-
     if let Some(parent) = args.output.parent() {
         std::fs::create_dir_all(parent).ok();
     }
-    flame_core::serialization::save_tensors(
-        &out,
+    save_bf16_safetensors(
+        &[
+            ("context", &context),
+            ("context_uncond", &context_uncond),
+            ("y", &y),
+            ("y_uncond", &y_uncond),
+        ],
         &args.output,
-        flame_core::serialization::SerializationFormat::SafeTensors,
     )?;
     eprintln!(
         "\nSAVED: {} ({:.1}s)",

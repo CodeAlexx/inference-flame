@@ -37,8 +37,29 @@ fn main() {
 }
 
 fn run() -> anyhow::Result<()> {
-    let prompt = std::env::args().nth(1).unwrap_or_else(|| "a beautiful sunset over the ocean".to_string());
-    let output = std::env::args().nth(2).unwrap_or_else(|| "/home/alex/EriDiffusion/inference-flame/output/ernie_cat_1024.png".to_string());
+    // Parse args: [prompt] [output] [--save-embeddings PATH] [--encode-only]
+    let mut args_iter = std::env::args().skip(1).peekable();
+    let mut prompt = "a beautiful sunset over the ocean".to_string();
+    let mut output = "/home/alex/EriDiffusion/inference-flame/output/ernie_cat_1024.png".to_string();
+    let mut save_embeddings: Option<String> = None;
+    let mut encode_only = false;
+
+    // First two positional args
+    let mut positional = 0;
+    while let Some(arg) = args_iter.next() {
+        if arg == "--save-embeddings" {
+            save_embeddings = Some(args_iter.next()
+                .ok_or_else(|| anyhow::anyhow!("--save-embeddings requires a path"))?);
+        } else if arg == "--encode-only" {
+            encode_only = true;
+        } else if positional == 0 {
+            prompt = arg;
+            positional += 1;
+        } else if positional == 1 {
+            output = arg;
+            positional += 1;
+        }
+    }
 
     let device = global_cuda_device();
     let _no_grad = flame_core::autograd::AutogradContext::no_grad();
@@ -87,6 +108,23 @@ fn run() -> anyhow::Result<()> {
         // encoder dropped here — ~7GB freed
     };
     println!("  text encoding done in {:.1}s", t0.elapsed().as_secs_f32());
+
+    // Optionally dump embeddings as a safetensors sidecar for Mojo consumption.
+    if let Some(ref emb_path) = save_embeddings {
+        let mut tensors = std::collections::HashMap::new();
+        tensors.insert("context_cond".to_string(), text_embeds.clone());
+        tensors.insert("context_uncond".to_string(), uncond_embeds_real.clone());
+        // Save to <emb_path>/model.safetensors so ShardedSafeTensors.open(<emb_path>) finds it.
+        let dir = std::path::Path::new(emb_path);
+        std::fs::create_dir_all(dir)?;
+        let file_path = dir.join("model.safetensors");
+        flame_core::serialization::save_file(&tensors, &file_path)?;
+        println!("  saved embeddings to {}", file_path.display());
+    }
+    if encode_only {
+        println!("  --encode-only: stopping before DiT/VAE");
+        return Ok(());
+    }
 
     // ---------------------------------------------------------------
     // Stage 2: Load Transformer (all resident on GPU — ~15GB)

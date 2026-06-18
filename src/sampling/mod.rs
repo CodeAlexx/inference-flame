@@ -16,5 +16,6 @@ pub mod helios_pyramid;
 pub mod magihuman_unipc;
 pub mod cosmos_rf;
 pub mod cosmos_unipc;
+pub mod nava_sampling;
 pub mod l2p_sampling;
 pub mod boogu_sampling;
