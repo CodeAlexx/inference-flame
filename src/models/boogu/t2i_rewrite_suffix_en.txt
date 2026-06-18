@@ -1,0 +1,3 @@
+
+Original prompt: {prompt}
+(Make sure the output language matches the user's input language: if the input is in English, rewrite in English; if the input is in Chinese, rewrite in Chinese.) Output the rewritten prompt directly:

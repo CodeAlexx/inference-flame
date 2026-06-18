@@ -622,6 +622,22 @@ path = "src/bin/l2p_grad_chain_parity.rs"
 name = "hidream_o1_grad_chain_parity"
 path = "src/bin/hidream_o1_grad_chain_parity.rs"
 
+[[bin]]
+name = "boogu_encode"
+path = "src/bin/boogu_encode.rs"
+
+[[bin]]
+name = "boogu_infer"
+path = "src/bin/boogu_infer.rs"
+
+[[bin]]
+name = "boogu_rewrite"
+path = "src/bin/boogu_rewrite.rs"
+
+[[bin]]
+name = "parity_boogu_c6"
+path = "src/bin/parity_boogu_c6.rs"
+
 # ---------------------------------------------------------------------------
 # Integration tests (tests/*.rs) — enumerated manually because autotests=false.
 # ---------------------------------------------------------------------------

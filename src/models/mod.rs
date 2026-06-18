@@ -56,3 +56,5 @@ pub mod gpt_oss_encoder;
 pub use gpt_oss_encoder::{GptOssAttention, GptOssConfig, GptOssEncoder, GptOssLayer, GptOssMaskKit, GptOssMoE, LayerType, LoaderStats};
 pub mod gpt_oss_rope;
 pub use gpt_oss_rope::GptOssRotaryEmbedding;
+
+pub mod boogu;
