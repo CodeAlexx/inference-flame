@@ -251,6 +251,14 @@ name = "boogu_rewrite"
 path = "src/bin/boogu_rewrite.rs"
 
 [[bin]]
+name = "ideogram4_encode"
+path = "src/bin/ideogram4_encode.rs"
+
+[[bin]]
+name = "ideogram4_infer"
+path = "src/bin/ideogram4_infer.rs"
+
+[[bin]]
 name = "klein_edit_infer"
 path = "src/bin/klein_edit_infer.rs"
 

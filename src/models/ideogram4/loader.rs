@@ -58,8 +58,13 @@ use crate::models::ideogram4::Ideogram4Config;
 /// safetensors dtype string for weight-only e4m3 FP8 (matches
 /// `flame_core::serialization` line 529 + `eri_safetensors` dtype passthrough).
 const FP8_DTYPE: &str = "F8_E4M3";
-/// Per-output-row scale key suffix (`quantized_loading.py:22`).
-const FP8_SCALE_SUFFIX: &str = ".weight_scale";
+/// Per-output-row scale key suffix. The scale for FP8 weight `<name>.weight` is
+/// `<name>.weight_scale` — i.e. `_scale` APPENDED to the full weight key (the
+/// checkpoint keys are e.g. `layers.0.attention.o.weight` +
+/// `layers.0.attention.o.weight_scale`), NOT `<name>.weight.weight_scale`.
+/// (`quantized_loading.py:22`; verified against the shipped ideogram-4-fp8
+/// transformer index.)
+const FP8_SCALE_SUFFIX: &str = "_scale";
 
 /// Resolve the shard file paths for a component, mirroring
 /// `_load_indexed_or_single_state_dict`.

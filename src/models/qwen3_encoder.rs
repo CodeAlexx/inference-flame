@@ -528,6 +528,53 @@ impl Qwen3Encoder {
             .reshape(&[b, s, num_extracts * d])
     }
 
+    /// Run forward and return the per-tap hidden states **separately**, one
+    /// `[1, seq_len, hidden_size]` tensor per `extract_layers` entry, in
+    /// `extract_layers` order.
+    ///
+    /// Unlike [`encode`], this does NOT concatenate the taps — the caller
+    /// chooses the concat layout. Ideogram-4 needs an **H-major / tap-minor**
+    /// concat (`stack(taps).permute(1,2,3,0).reshape(B,L,H*taps)`), which is the
+    /// OPPOSITE element order of `encode`'s tap-major / H-minor concat
+    /// (`stack(.,1).permute(0,2,1,3)`). Returning the raw taps lets the bin build
+    /// the model-faithful order.
+    ///
+    /// Each tap is the output of decoder layer `idx` **before** the final
+    /// `model.norm` (matching the reference's per-decoder-layer `hidden_states`
+    /// capture in `_get_qwen3_vl_embeddings`).
+    pub fn encode_multi_taps(&self, token_ids: &[i32]) -> Result<Vec<Tensor>> {
+        let cfg = &self.config;
+        let seq_len = token_ids.len();
+
+        let pad_id = 151643i32;
+        let real_len = token_ids.iter().position(|&id| id == pad_id).unwrap_or(seq_len);
+
+        let mut hidden = self.embed_tokens(token_ids)?;
+        let (pe_cos, pe_sin) =
+            Self::build_rope_1d(seq_len, cfg.head_dim, cfg.rope_theta, &self.device)?;
+        let attn_mask = Self::build_causal_mask(seq_len, real_len, &self.device)?;
+
+        let mut collected: HashMap<usize, Tensor> = HashMap::new();
+        for i in 0..cfg.num_layers {
+            hidden = self.layer_forward(i, &hidden, &pe_cos, &pe_sin, &attn_mask)?;
+            if cfg.extract_layers.contains(&i) {
+                collected.insert(i, hidden.clone());
+            }
+        }
+
+        cfg.extract_layers
+            .iter()
+            .map(|&idx| {
+                collected.remove(&idx).ok_or_else(|| {
+                    flame_core::Error::InvalidInput(format!(
+                        "Extract layer {idx} not collected — model has {} layers",
+                        cfg.num_layers
+                    ))
+                })
+            })
+            .collect()
+    }
+
     /// Get the expected output hidden dimension.
     pub fn output_dim(&self) -> usize {
         self.config.extract_layers.len() * self.config.hidden_size

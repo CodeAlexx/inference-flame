@@ -505,6 +505,39 @@ impl KleinVaeDecoder {
         self.conv_out.forward(&h)
     }
 
+    /// Decode pre-unpatchified, pre-rescaled latents — the **decoder body only**.
+    ///
+    /// Input: `[B, 32, H, W]` latents that have ALREADY had their model-specific
+    /// latent normalization (rescale) and unpatchify applied by the caller.
+    /// Runs `post_quant_conv → conv_in → mid → up → conv_norm_out → silu →
+    /// conv_out` and returns `[B, 3, H*8, W*8]` RGB in `[-1, 1]`.
+    ///
+    /// This bypasses [`decode`]'s internal inverse-BatchNorm (which uses
+    /// `bn.running_mean/var`) and its 128→32 unpatchify. Models whose latent
+    /// normalization constants DIFFER from the checkpoint's BatchNorm running
+    /// stats (e.g. Ideogram-4, which carries precise f32 `LATENT_SHIFT`/
+    /// `LATENT_SCALE` constants distinct from its BF16-rounded `bn.*` stats, and
+    /// whose unpatchify operates in token space `[B, L, 128]` rather than NCHW)
+    /// MUST apply their own rescale + unpatchify and call THIS entrypoint.
+    pub fn decode_normalized(&self, z32: &Tensor) -> Result<Tensor> {
+        let dims = z32.shape().dims();
+        if dims.len() != 4 || dims[1] != LATENT_CH {
+            return Err(Error::InvalidOperation(format!(
+                "decode_normalized expects [B,{LATENT_CH},H,W], got {dims:?}"
+            )));
+        }
+        // post_quant_conv (1x1) on the already-normalized 32ch latent.
+        let z = self.post_quant_conv.forward(z32)?;
+        let mut h = self.conv_in.forward(&z)?;
+        h = self.mid_block.forward(&h)?;
+        for block in &self.up_blocks {
+            h = block.forward(&h)?;
+        }
+        h = self.conv_norm_out.forward_nchw(&h)?;
+        h = h.silu()?;
+        self.conv_out.forward(&h)
+    }
+
     /// Number of weight keys expected for the decoder (for validation).
     pub fn expected_key_count() -> usize {
         // post_quant_conv: 2 (weight + bias)
